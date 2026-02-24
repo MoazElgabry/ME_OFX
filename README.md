@@ -22,6 +22,7 @@ Current build target:
 
 Automated build available:
 - **macOS Apple Silicon (arm64)** via GitHub Actions
+- **macOS Intel (x86_64)** via GitHub Actions
 
 ## Installation
 ### Installer (recommended)
@@ -54,10 +55,18 @@ Source used by CI is in:
 
 To build macOS artifact:
 1. Push this repository to GitHub.
-2. Go to `Actions` -> `Build ME_OpenDRT macOS (arm64)`.
+2. Go to `Actions` -> `Build ME_OpenDRT macOS (arm64 + x86_64)`.
 3. Click `Run workflow`.
-4. Download artifact `ME_OpenDRT-macos-arm64`.
+4. Download the artifact matching your Mac architecture.
 
 The artifact includes:
 - `ME_OpenDRT_macOS_arm64_portable.zip`
+- `ME_OpenDRT_macOS_x86_64_portable.zip`
 - built bundle `ME_OpenDRT.ofx.bundle` (with `.metallib` in `Contents/Resources`)
+
+Architecture mapping:
+- Apple Silicon (M1/M2/M3/M4): `ME_OpenDRT-macos-arm64`
+- Intel Mac: `ME_OpenDRT-macos-x86_64`
+
+macOS install path:
+- `/Library/OFX/Plugins/ME_OpenDRT.ofx.bundle`

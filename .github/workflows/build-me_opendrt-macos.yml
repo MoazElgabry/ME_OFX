@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT macOS (arm64)
+name: Build ME_OpenDRT macOS (arm64 + x86_64)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,21 @@ on:
       - "v*"
 
 jobs:
-  build-macos-arm64:
-    runs-on: macos-14
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            zip_name: ME_OpenDRT_macOS_arm64_portable.zip
+            artifact_name: ME_OpenDRT-macos-arm64
+          - arch: x86_64
+            runner: macos-13
+            zip_name: ME_OpenDRT_macOS_x86_64_portable.zip
+            artifact_name: ME_OpenDRT-macos-x86_64
+
+    runs-on: ${{ matrix.runner }}
 
     defaults:
       run:
@@ -23,7 +36,7 @@ jobs:
         run: brew install ninja
 
       - name: Configure
-        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
 
       - name: Build
         run: cmake --build build-mac --config Release
@@ -37,12 +50,12 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/ME_OpenDRT.ofx.bundle \
-            ../../ME_OpenDRT_macOS_arm64_portable.zip
+            ../../${{ matrix.zip_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ME_OpenDRT-macos-arm64
+          name: ${{ matrix.artifact_name }}
           path: |
-            ME_OpenDRT_macOS_arm64_portable.zip
+            ${{ matrix.zip_name }}
             ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
