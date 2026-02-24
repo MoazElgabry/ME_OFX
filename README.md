@@ -1,24 +1,15 @@
-﻿# ME_OFX
+﻿# ME_OpenDRT OFX
 
-ME_OFX is a DaVinci Resolve OFX port of **OpenDRT v1.1.0**.
+ME_OpenDRT OFX is a DaVinci Resolve OFX port of **OpenDRT v1.1.0**.
 
 Current plugin in this repo:
 - **ME_OpenDRT OFX v1.0** (based on OpenDRT 1.1.0)
 
-## Credits
-- Original OpenDRT: **Jed Smith**
-- OFX port: **Moaz ELgabry**
-
-Website: https://moazelgabry.com  
-GitHub: https://github.com/moazelgabry
 
 ## Upstream Project and License
 This project is based on OpenDRT and is distributed under **GNU GPL v3**.
 
 - Upstream OpenDRT project: https://github.com/jedypod/open-display-transform
-- License in this repo: [LICENSE](./LICENSE)
-
-If you distribute binaries, make sure corresponding source is also made available under GPLv3 terms.
 
 ## Versioning
 Two version identifiers are used:
@@ -35,7 +26,7 @@ Automated build available:
 ## Installation
 ### Installer (recommended)
 Use the generated installer from this project.
-
+https://github.com/MoazElgabry/ME_OFX/blob/main/ME_OpenDRT/ME_OpenDRT_OFX_v1.0_Installer.exe
 ### Manual / Portable
 Copy this bundle:
 - `ME_OpenDRT.ofx.bundle`
