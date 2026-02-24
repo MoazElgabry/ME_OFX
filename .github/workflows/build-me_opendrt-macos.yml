@@ -17,7 +17,7 @@ jobs:
             zip_name: ME_OpenDRT_macOS_arm64_portable.zip
             artifact_name: ME_OpenDRT-macos-arm64
           - arch: x86_64
-            runner: macos-13
+            runner: macos-15-intel
             zip_name: ME_OpenDRT_macOS_x86_64_portable.zip
             artifact_name: ME_OpenDRT-macos-x86_64
 
