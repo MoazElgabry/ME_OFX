@@ -206,7 +206,7 @@ inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int 
 }
 
 // Full OpenDRT transform port is implemented here for CUDA.
-inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, const OpenDRTParams& p) {
+inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, constant OpenDRTParams& p) {
   int in_gamut = p.in_gamut, in_oetf = p.in_oetf, crv_enable = p.crv_enable, tn_hcon_enable = p.tn_hcon_enable, tn_lcon_enable = p.tn_lcon_enable;
   int pt_enable = p.pt_enable, ptl_enable = p.ptl_enable, ptm_enable = p.ptm_enable, brl_enable = p.brl_enable, brlp_enable = p.brlp_enable, hc_enable = p.hc_enable, hs_rgb_enable = p.hs_rgb_enable, hs_cmy_enable = p.hs_cmy_enable;
   int cwp = p.cwp, tn_su = p.tn_su, clamp = p.clamp, display_gamut = p.display_gamut, eotf = p.eotf;
