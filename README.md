@@ -23,7 +23,7 @@ Current build target:
 ## Installation
 ### Installer (recommended)
 Use the generated installer from this project.
-
+https://github.com/MoazElgabry/ME_OFX/blob/main/ME_OpenDRT/ME_OpenDRT_OFX_v1.0_Installer.exe
 ### Manual / Portable
 Copy this bundle:
 - `ME_OpenDRT.ofx.bundle`
