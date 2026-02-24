@@ -12,6 +12,7 @@ typedef struct {
   float3 x, y, z;
 } drt_float3x3;
 
+// Small custom 3x3 to keep math semantics aligned with CUDA port.
 inline drt_float3x3 make_float3x3(float3 a, float3 b, float3 c) {
   drt_float3x3 d;
   d.x = a; d.y = b; d.z = c;
@@ -205,7 +206,7 @@ inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int 
   return rgb;
 }
 
-// Full OpenDRT transform port is implemented here for CUDA.
+// Core OpenDRT per-pixel transform. Input/output are display-agnostic RGB ratios + tonescale.
 inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, constant OpenDRTParams& p) {
   int in_gamut = p.in_gamut, in_oetf = p.in_oetf, crv_enable = p.crv_enable, tn_hcon_enable = p.tn_hcon_enable, tn_lcon_enable = p.tn_lcon_enable;
   int pt_enable = p.pt_enable, ptl_enable = p.ptl_enable, ptm_enable = p.ptm_enable, brl_enable = p.brl_enable, brlp_enable = p.brlp_enable, hc_enable = p.hc_enable, hs_rgb_enable = p.hs_rgb_enable, hs_cmy_enable = p.hs_cmy_enable;
@@ -380,6 +381,7 @@ kernel void OpenDRTKernel(device const float* src [[buffer(0)]],
                           constant int& width [[buffer(3)]],
                           constant int& height [[buffer(4)]],
                           uint2 gid [[thread_position_in_grid]]) {
+  // Flat interleaved RGBA layout: one thread computes one destination pixel.
   const int x = static_cast<int>(gid.x);
   const int y = static_cast<int>(gid.y);
   if (x >= width || y >= height) return;

@@ -29,6 +29,7 @@ MetalContext& context() {
 }
 
 std::string moduleDirectory() {
+  // Resolve bundle-relative paths from the loaded plugin binary location.
   Dl_info info{};
   if (dladdr(reinterpret_cast<const void*>(&context), &info) == 0 || info.dli_fname == nullptr) {
     return std::string();
@@ -58,6 +59,7 @@ bool initialize() {
   ctx.queue = [ctx.device newCommandQueue];
   if (ctx.queue == nil) return false;
 
+  // Metallib is packaged into Contents/Resources during CMake build.
   NSString* libPath = [NSString stringWithUTF8String:metallibPath().c_str()];
   NSError* error = nil;
   id<MTLLibrary> library = [ctx.device newLibraryWithFile:libPath error:&error];
@@ -91,6 +93,7 @@ namespace OpenDRTMetal {
 
 bool render(const float* src, float* dst, int width, int height, const OpenDRTParams& params) {
   static std::mutex m;
+  // Keep this path serialized for stability while iterating on host integration.
   std::lock_guard<std::mutex> lock(m);
 
   if (src == nullptr || dst == nullptr || width <= 0 || height <= 0) return false;
@@ -122,6 +125,7 @@ bool render(const float* src, float* dst, int width, int height, const OpenDRTPa
   [enc setBuffer:widthBuffer offset:0 atIndex:3];
   [enc setBuffer:heightBuffer offset:0 atIndex:4];
 
+  // Mirrors CUDA-style 2D launch: one thread per output pixel.
   const MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
   const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
   [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];

@@ -25,6 +25,7 @@ class OpenDRTProcessor {
   explicit OpenDRTProcessor(const OpenDRTParams& params) : params_(params) {}
 
   bool render(const float* src, float* dst, int width, int height, bool preferCuda, bool hostSupportsOpenCL) {
+    // Platform-first dispatch: Metal on macOS, CUDA on Windows, then fallbacks.
 #if defined(__APPLE__)
     if (renderMetal(src, dst, width, height)) {
       return true;
@@ -64,6 +65,7 @@ class OpenDRTProcessor {
       return false;
     }
 
+    // Kernel reads flat RGBA float pixels and resolved scalar params.
     launchOpenDRTKernel(dSrc, dDst, width, height, &params_, nullptr);
 
     const cudaError_t launchStatus = cudaGetLastError();
@@ -99,6 +101,7 @@ class OpenDRTProcessor {
 #endif
 
   bool renderOpenCL(const float* src, float* dst, int width, int height) {
+    // OpenCL path is reserved for future parity work.
     (void)src;
     (void)dst;
     (void)width;
@@ -107,6 +110,7 @@ class OpenDRTProcessor {
   }
 
   bool renderCPU(const float* src, float* dst, int width, int height) {
+    // Safety fallback used when no GPU path is available.
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
     std::memcpy(dst, src, bytes);
     return true;

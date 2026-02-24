@@ -158,6 +158,7 @@ static constexpr std::array<const char*, 14> kTonescalePresetNames = {
 static constexpr const char* kOpenDRTPortVersion = "1.1.0";
 static constexpr int kOpenDRTBuildNumber = 13;
 
+// Look preset table order must match kLookPresetNames and UI choice indices.
 static constexpr std::array<LookPresetValues, 7> kLookPresets = {{
   {1.66f,0.5f,0.003f,0.005f,0,0.0f,1.0f,4.0f,0,0.0f,0.5f,2,0.25f,0.35f,0.25f,0.55f,1,0.25f,0.5f,0.0f,0.1f,0.25f,0.5f,0.0f,1,0.06f,0.08f,0.06f,1,0.4f,0.25f,0.5f,-0.8f,0.35f,0.4f,1,0.0f,-2.5f,-1.5f,-1.5f,0.5f,0.35f,1,-0.5f,-1.25f,-1.25f,-0.25f,1,1.0f,0.3f,1,0.6f,0.6f,0.35f,1.0f,0.66f,1.0f,1,0.25f,1.0f,0.0f,1.0f,0.0f,1.0f},
   {1.05f,0.5f,0.1f,0.01f,0,0.0f,1.0f,4.0f,1,1.5f,0.2f,2,0.25f,0.35f,0.25f,0.55f,1,0.25f,0.45f,0.0f,0.1f,0.25f,0.25f,0.0f,1,0.06f,0.08f,0.06f,1,1.0f,0.4f,0.5f,-0.8f,0.66f,0.6f,1,0.0f,-2.5f,-1.5f,-1.5f,0.5f,0.35f,1,0.0f,-1.7f,-2.0f,-0.5f,1,1.0f,0.3f,1,0.6f,0.8f,0.35f,1.0f,0.66f,1.0f,1,0.15f,1.0f,0.0f,1.0f,0.0f,1.0f},
@@ -168,6 +169,7 @@ static constexpr std::array<LookPresetValues, 7> kLookPresets = {{
   {1.8f,0.5f,0.001f,0.015f,0,0.0f,1.0f,4.0f,1,1.0f,1.0f,5,0.25f,0.35f,0.25f,0.55f,1,0.0f,0.5f,0.0f,0.15f,0.25f,0.25f,0.0f,1,0.05f,0.06f,0.05f,1,0.4f,0.35f,0.66f,-0.6f,0.45f,0.45f,1,-2.0f,-4.5f,-3.0f,-4.0f,0.35f,0.3f,1,0.0f,-2.0f,-1.0f,-0.5f,1,1.0f,0.35f,1,0.66f,1.0f,0.5f,2.0f,0.85f,2.0f,1,0.0f,1.0f,0.25f,1.0f,0.66f,0.66f}
 }};
 
+// Tonescale preset table excludes index 0 ("USE LOOK PRESET"), so callers offset by -1.
 static constexpr std::array<TonescalePresetValues, 13> kTonescalePresets = {{
   {1.4f,0.5f,0.003f,0.005f,0,0.0f,1.0f,4.0f,0,0.0f,0.5f},
   {1.66f,0.5f,0.003f,0.005f,0,0.0f,1.0f,4.0f,0,0.0f,0.5f},
@@ -184,6 +186,7 @@ static constexpr std::array<TonescalePresetValues, 13> kTonescalePresets = {{
   {1.2f,0.5f,0.02f,0.0f,0,0.0f,1.0f,1.0f,0,0.0f,0.6f}
 }};
 
+// Label/metadata helpers for read-only UI state.
 inline const char* currentPresetName(int presetIndex) {
   if (presetIndex < 0 || presetIndex >= static_cast<int>(kLookPresetNames.size())) {
     return "Standard";
@@ -251,6 +254,7 @@ inline const char* surroundNameFromIndex(int tn_su) {
   }
 }
 
+// Resolved-params mutators used by resolveParams() and paramChanged() paths.
 inline void applyLookPresetToResolved(OpenDRTParams& p, int lookPresetIndex) {
   const int idx = (lookPresetIndex < 0 || lookPresetIndex >= 7) ? 0 : lookPresetIndex;
   const LookPresetValues& s = kLookPresets[static_cast<size_t>(idx)];
@@ -297,6 +301,7 @@ inline void applyDisplayEncodingPreset(OpenDRTParams& p, int preset) {
   }
 }
 
+// OFX-param writers used when a preset is explicitly chosen in the UI.
 inline void writeTonescalePresetToParams(int tonescalePresetIndex, OFX::ImageEffect& fx) {
   if (tonescalePresetIndex <= 0 || tonescalePresetIndex > 13) return;
   const TonescalePresetValues& t = kTonescalePresets[static_cast<size_t>(tonescalePresetIndex - 1)];
@@ -319,6 +324,7 @@ inline void writeCreativeWhitePresetToParams(int creativeWhitePresetIndex, OFX::
 }
 
 inline void writeDisplayPresetToParams(int presetIndex, OFX::ImageEffect& fx) {
+  // Display encoding presets are translated into explicit override params.
   OpenDRTParams p{};
   applyDisplayEncodingPreset(p, presetIndex);
   try {
@@ -331,6 +337,7 @@ inline void writeDisplayPresetToParams(int presetIndex, OFX::ImageEffect& fx) {
 }
 
 inline OpenDRTParams resolveParams(const OpenDRTRawValues& r) {
+  // Resolve host/UI state into the flat kernel contract.
   OpenDRTParams p{};
 
   p.in_gamut = r.in_gamut;
@@ -417,6 +424,7 @@ inline OpenDRTParams resolveParams(const OpenDRTRawValues& r) {
   p.eotf = r.eotf;
 
   if (r.creativeWhitePreset > 0) {
+    // Creative White preset overrides the base/look whitepoint index.
     p.cwp = r.creativeWhitePreset - 1;
   }
 
@@ -424,6 +432,7 @@ inline OpenDRTParams resolveParams(const OpenDRTRawValues& r) {
 }
 
 inline void setIntIfPresent(OFX::ImageEffect& fx, const char* name, int v) {
+  // Param lookup is host-dependent; missing params are ignored intentionally.
   try {
     if (auto* p = fx.fetchIntParam(name)) { p->setValue(v); }
   } catch (...) {
@@ -452,6 +461,7 @@ inline void setStringIfPresent(OFX::ImageEffect& fx, const char* name, const std
 }
 
 inline void writePresetToParams(int presetIndex, OFX::ImageEffect& fx) {
+  // Preset selection is authoritative: overwrite all affected controls.
   const int idx = (presetIndex < 0 || presetIndex >= 7) ? 0 : presetIndex;
   const LookPresetValues& s = kLookPresets[static_cast<size_t>(idx)];
 
