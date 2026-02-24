@@ -29,6 +29,9 @@ Two version identifiers are used:
 Current build target:
 - **Windows (x64)**
 
+Automated build available:
+- **macOS Apple Silicon (arm64)** via GitHub Actions
+
 ## Installation
 ### Installer (recommended)
 Use the generated installer from this project.
@@ -50,3 +53,20 @@ Remove:
 - `C:\Program Files\Common Files\OFX\Plugins\ME_OpenDRT.ofx.bundle`
 
 Then restart Resolve.
+
+## GitHub Actions macOS Build
+This repo includes a workflow at:
+- `.github/workflows/build-me_opendrt-macos.yml`
+
+Source used by CI is in:
+- `ME_OpenDRT/source/`
+
+To build macOS artifact:
+1. Push this repository to GitHub.
+2. Go to `Actions` -> `Build ME_OpenDRT macOS (arm64)`.
+3. Click `Run workflow`.
+4. Download artifact `ME_OpenDRT-macos-arm64`.
+
+The artifact includes:
+- `ME_OpenDRT_macOS_arm64_portable.zip`
+- built bundle `ME_OpenDRT.ofx.bundle` (with `.metallib` in `Contents/Resources`)

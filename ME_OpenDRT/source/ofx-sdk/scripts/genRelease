@@ -1,0 +1,63 @@
+#! /bin/sh
+
+die()
+{
+  echo '*** ERROR ***' $*
+  exit 1
+}
+
+if [ $# -lt 1 ] ; then
+  echo 'USAGE : genRelease LABEL'
+  echo '   LABEL is the label for the release, e.g. 1.4'
+  exit 1
+fi
+
+allow_dirty_git=0
+if [ $1 = "--dirty" ] ; then
+    allow_dirty_git=1; shift
+fi
+
+LABEL=$1; shift
+
+echo "CHECK VERSION NUMBER in include/ofx.doxy; fix and rerun if needed."
+grep PROJECT_NUMBER include/ofx.doxy
+
+set -v
+
+if [ $allow_dirty_git -eq 0 ]; then
+  if [ `git ls-files --modified | wc -l` -ne 0 ]; then
+    die "You have modified files; commit to git first before building release!"
+  fi
+  git clean -f	   # start clean; remove everything not managed by git
+else
+  echo Allowing dirty git working dir... do not build release like this.
+fi
+
+rm -r doc
+cd include
+rm -r doc
+# delete Emacs backups, else they could end up in the release.
+find . -name '*~' -exec rm {} +
+
+# Build the doxygen docs
+doxygen ofx.doxy  || die "building doxygen docs"
+
+rm -rf ../doc/html
+mv doc/html ../doc || die "Moving doxygen docs"
+
+cd ..
+
+# Build the ProgrammingGuide and ProgrammingReference
+cd Documentation
+make || die "building Programming Guide and Reference"
+
+# Copy style assets to Ref and Guide directories
+cp ../include/ofxStyle.css Reference/
+cp ../include/ofxStyle.css Guide/
+cd ..
+
+(tar cf - doc | gzip > openfx-doc-$LABEL.tar.gz)  || die "Tarring docs"
+(tar cf - Examples | gzip > openfx-examples-$LABEL.tar.gz) || die "Tarring examples"
+(tar cf - include | gzip > openfx-include-$LABEL.tar.gz) || die "Tarring include"
+
+echo YOU NOW NEED TO COPY THIS TO frs.sourceforge.net and ADD THE RELEASE VIA THE SF WEB INTERFACE

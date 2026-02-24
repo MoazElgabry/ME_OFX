@@ -1,0 +1,48 @@
+name: Build ME_OpenDRT macOS (arm64)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja
+
+      - name: Configure
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64
+
+      - name: Build
+        run: cmake --build build-mac --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+
+      - name: Package macOS portable bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            bundle/ME_OpenDRT.ofx.bundle \
+            ../../ME_OpenDRT_macOS_arm64_portable.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ME_OpenDRT-macos-arm64
+          path: |
+            ME_OpenDRT_macOS_arm64_portable.zip
+            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle

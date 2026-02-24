@@ -1,0 +1,495 @@
+name: Build OpenFX libs and examples
+
+permissions:
+  id-token: write  
+  contents: write
+  actions: write
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types:
+      - published
+
+jobs:
+  build:
+    name: '${{ matrix.name_prefix }} <config=${{ matrix.buildtype }}>'
+    # Avoid duplicated checks when a pull_request is opened from a local branch.
+    if: |
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ${{ matrix.os }}
+    container:
+      image: ${{ matrix.container }}
+      volumes: ${{ matrix.need_node20_vol && fromJSON('["/node20217:/node20217:rw,rshared", "/node20217:/__e/node20:ro,rshared"]') || fromJSON('[]') }}
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: 'true'
+      ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node16
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name_prefix: Linux CentOS 7 VFX CY2021
+            release_prefix: linux-vfx2021
+            ostype: linux
+            aswfdockerbuild: true
+            os: ubuntu-latest
+            container: aswf/ci-base:2021
+            vfx-cy: 2021
+            need_node20_vol: true
+            has_cmake_presets: false
+            buildtype: Release
+            # use old conan version for CentOS 7
+            conan_version: 2.10.3
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: false
+            opencl: true
+          - name_prefix: Linux CentOS 7 VFX CY2022
+            release_prefix: linux-vfx2022
+            ostype: linux
+            aswfdockerbuild: true
+            os: ubuntu-latest
+            container: aswf/ci-base:2022
+            vfx-cy: 2022
+            need_node20_vol: true
+            has_cmake_presets: false
+            buildtype: Release
+            # use old conan version for CentOS 7
+            conan_version: 2.10.3
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: false
+            opencl: true
+          - name_prefix: Linux Rocky 8 VFX CY2023
+            release_prefix: linux-vfx2023
+            ostype: linux
+            aswfdockerbuild: true
+            os: ubuntu-latest
+            container: aswf/ci-base:2023
+            vfx-cy: 2023
+            has_cmake_presets: false
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: false
+            opencl: true
+          - name_prefix: Linux Rocky 8 VFX CY2023 No OpenGL
+            release_prefix: linux-vfx2023-no-ogl
+            ostype: linux
+            aswfdockerbuild: true
+            os: ubuntu-latest
+            container: aswf/ci-base:2023
+            vfx-cy: 2023
+            has_cmake_presets: false
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            opengl: false
+          - name_prefix: Linux Ubuntu
+            release_prefix: linux-ubuntu
+            ostype: linux
+            aswfdockerbuild: false
+            os: ubuntu-latest
+            has_cmake_presets: true
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: true
+            opencl: true
+          - name_prefix: MacOS
+            release_prefix: mac
+            ostype: mac
+            os: macos-latest
+            has_cmake_presets: true
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: false
+            opencl: true
+          - name_prefix: Windows
+            release_prefix: windows
+            ostype: windows
+            os: windows-latest
+            has_cmake_presets: true
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: true
+            opencl: true
+          - name_prefix: Windows no CUDA
+            release_prefix: windows-no-cuda
+            ostype: windows
+            os: windows-latest
+            has_cmake_presets: true
+            buildtype: Release
+            conan_version: 2.20.1
+            cxx-standard: 17
+            cxx-compiler: clang++
+            cc-compiler: clang
+            compiler-desc: Clang
+            cuda: false
+            opencl: false
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: install nodejs20glibc2.17
+        if: matrix.need_node20_vol == true
+        run: |
+          curl --silent https://unofficial-builds.nodejs.org/download/release/v20.18.1/node-v20.18.1-linux-x64-glibc-217.tar.xz | \
+            tar -xJ --strip-components 1 -C /node20217 -f -
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 0
+
+      - name: setup env vars
+        run: |
+          git config --global --add safe.directory $PWD # needed for checkout v3, doesn't hurt anyway
+          BUILDTYPE_LC=$(echo '${{ matrix.buildtype }}'|tr [:upper:] [:lower:])
+          echo "BUILDTYPE_LC=$BUILDTYPE_LC" >> $GITHUB_ENV
+          echo "OSNAME=$(echo '${{ matrix.os }}'|sed 's/-.*//')" >> $GITHUB_ENV
+          echo "GIT_COMMIT_ID=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          echo "CONAN_PRESET=conan-$BUILDTYPE_LC" >> $GITHUB_ENV
+          echo "BUILD_DIR=build/${{ matrix.buildtype }}" >> $GITHUB_ENV
+
+      - name: Set RELEASE_NAME
+        # this looks like "linux-vfx2022-1.5[-no-opengl]"; used in filenames
+        run: |
+          RELEASE_PREFIX=${{ matrix.release_prefix }}
+          OPENGL_BUILD=${{ env.OPENGL_BUILD }}
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            REF_SUFFIX=$(echo "${{ github.ref_name }}" | sed 's/OFX_Release_//')
+          else
+            REF_SUFFIX=$(echo ${{ github.sha }} | cut -c1-8)
+          fi
+          echo "RELEASE_NAME=${RELEASE_PREFIX}-${REF_SUFFIX}${OPENGL_BUILD}" >> $GITHUB_ENV
+
+      # Ensure ~/.local/bin is first in PATH for all local tools (uv, python, pip, conan)
+      # This is especially important for old CentOS 7 containers with old system versions
+      - name: Fix PATH for local tools
+        run: |
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Set up python 3.11
+        uses: actions/setup-python@v5
+        if: matrix.ostype == 'mac'
+        with:
+          python-version: '3.11'
+
+      # Q: should we use uv everywhere?
+      # Unfortunately astral-sh/setup-uv action doesn't work on CentOS 7, its GLIBC is too old.
+
+      - name: Set up uv manually
+        if: matrix.vfx-cy == 2021 || matrix.vfx-cy == 2022
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          # No need to source env - we already added ~/.local/bin to PATH above
+
+          # Use --default to create python/python3 symlinks in ~/.local/bin
+          # This ensures the sigstore action can find 'python' (not just 'python3')
+          ~/.local/bin/uv python install --default 3.11
+
+      - name: Check python, uv paths
+        run: |
+          echo "PATH=$PATH"
+          echo -n 'which python: ' && which python && python --version
+          echo -n 'which python3: ' && which python3 && python3 --version
+          echo -n 'python symlink target: ' && (readlink -f $(which python) || echo "not a symlink")
+          echo -n 'which uv: ' && (which uv || echo "No uv; continuing")
+
+      # Install Conan manually for old CentOS 7 using uv-installed Python
+      # The get-conan action doesn't know about uv Python and would use system Python
+      - name: Install Conan manually (CentOS 7)
+        if: matrix.vfx-cy == 2021 || matrix.vfx-cy == 2022
+        run: |
+          python3.11 -m pip install --user conan==${{ matrix.conan_version }}
+
+      # Use get-conan action for other platforms
+      - name: Install Conan
+        id: conan
+        if: matrix.vfx-cy != 2021 && matrix.vfx-cy != 2022
+        uses: turtlebrowser/get-conan@main
+        with:
+          version: ${{ matrix.conan_version }}
+
+      - name: Set up conan
+        run: |
+          which conan
+          conan --version
+          conan profile detect
+
+      - name: Install system dependencies if needed
+        uses: ConorMacBride/install-package@v1
+        if: ${{ matrix.aswfdockerbuild == false }}
+        with:
+          apt: libgl-dev libgl1-mesa-dev
+
+      - name: Install gh cli if needed
+        if: ${{ matrix.aswfdockerbuild == true }}
+        run: |
+          if command -v dnf; then
+            dnf -y install 'dnf-command(config-manager)'
+            dnf -y config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.repo
+            dnf -y install gh --repo gh-cli
+          else
+            # older CentOS
+            wget https://github.com/cli/cli/releases/download/v2.63.2/gh_2.63.2_linux_amd64.rpm
+            yum install -y gh_2.63.2_linux_amd64.rpm
+            rm gh_2.63.2_linux_amd64.rpm
+          fi
+          gh --version
+
+      - name: Setup MSVC
+        if: startsWith(matrix.os, 'windows')
+        uses: ilammy/msvc-dev-cmd@v1.13.0 # use cl, not msbuild
+        # We use cl.exe because it can find CUDA without the CUDA visual studio integration,
+        # which is extremely slow to install (see Jimver/cuda-toolkit below)
+        # See comments at https://github.com/Jimver/cuda-toolkit/issues/253
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v4
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.19
+        id: cuda-toolkit-linux
+        if: matrix.ostype == 'linux' && matrix.cuda == true
+        with:
+          cuda: '12.6.2'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+          linux-local-args: '["--toolkit"]'
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.16
+        id: cuda-toolkit-win
+        if: matrix.ostype == 'windows' && matrix.cuda == true
+        with:
+          # Need CUDA >= 12.4 to support recent VS2022 (17.10 and later, MSVC 19.40)
+          cuda: '12.4.1'
+          method: 'network'
+          sub-packages: '["nvcc", "cudart"]'
+
+      # - name: Install system dependencies (CentOS)
+      #   run: |
+      #     rpm install libglvnd-devel
+
+      - name: Install dependencies
+        run: |
+          [[ "${{ matrix.opengl }}" != false && "${{ matrix.opencl }}" = true ]] && USE_OPENCL="-o use_opencl=True"
+          conan install -s build_type=${{ matrix.buildtype }} -pr:b=default --build=missing . -c tools.cmake.cmaketoolchain:generator=Ninja $USE_OPENCL
+
+      - name: Configure project with cmake
+        run: |
+          CMAKE_DEFINES=(-DBUILD_EXAMPLE_PLUGINS=TRUE \
+              -DPLUGIN_INSTALLDIR=$(pwd)/build/Install)
+          if [[ "${{ matrix.opengl }}" != false ]] ; then
+             echo "OPENGL_BUILD=" >> $GITHUB_ENV
+             CMAKE_DEFINES+=(-DOFX_SUPPORTS_OPENGLRENDER=TRUE)
+             [[ "${{ matrix.opencl }}" = true ]] && CMAKE_DEFINES+=(-DOFX_SUPPORTS_OPENCLRENDER=TRUE)
+             [[ "${{ matrix.cuda }}"   = true ]] && CMAKE_DEFINES+=(-DOFX_SUPPORTS_CUDARENDER=TRUE)
+          else
+             echo "OPENGL_BUILD=-no-ogl" >> $GITHUB_ENV
+          fi
+          CMAKE_GENERATOR=(-G Ninja)
+          if [[ ${{ matrix.has_cmake_presets }} = true ]]; then
+            # Sets up to build in e.g. build/Release
+            cmake --preset $CONAN_PRESET ${CMAKE_GENERATOR[@]} ${CMAKE_DEFINES[@]} .
+          else
+            # VFX ref platforms 2022 & earlier have only cmake 3.19.
+            # Older cmake (<3.23) does not support presets, so invoke with explicit args.
+            cmake -S . -B $BUILD_DIR -G "Unix Makefiles" \
+              -DCMAKE_TOOLCHAIN_FILE=$(pwd)/$BUILD_DIR/generators/conan_toolchain.cmake \
+              -DCMAKE_POLICY_DEFAULT_CMP0091=NEW \
+              -DCMAKE_BUILD_TYPE=Release \
+              ${CMAKE_DEFINES[@]}
+          fi
+
+      - name: Build with cmake
+        run: |
+          if [[ ${{ matrix.ostype }} = windows ]]; then
+            cmake --build $BUILD_DIR --target install --config Release --parallel
+          else
+            cmake --build $BUILD_DIR --target install --parallel
+          fi
+
+      - name: Install with cmake
+        run: |
+          if [[ ${{ matrix.ostype }} = windows ]]; then
+            cmake --install $BUILD_DIR --config Release
+          else
+            cmake --install $BUILD_DIR
+          fi
+
+      # This isn't used for release; just checks that makefiles still work.
+      - name: Build old stuff with make
+        run: |
+          if [[ ${{ matrix.ostype }} = windows ]]; then
+            echo No Windows nmake build yet
+          else
+            (cd Examples; make -j)
+            # should build Support/Plugins too, but those need work            
+          fi
+
+      ############################################################
+      # Installation: produce release artifacts
+      ############################################################
+
+
+      - name: Copy includes and libs into release folder for installation
+        # Dir structure:
+        #  Install/OpenFX
+        #   lib
+        #     *.a or *.lib
+        #   include/
+        #     openfx/*.h
+        #      Support/*.h
+        #      HostSupport/*.h
+        #   so e.g `#include <openfx/Support/foo.h>` works with `-I.../OpenFX/include`
+        run: |
+          mkdir -p Install/OpenFX/include/openfx
+          tar -C include \
+              --exclude='*.png' --exclude='*.doxy' --exclude='*.dtd' \
+              --exclude='DocSrc' \
+            -cf - . \
+          | tar -xf - -C Install/OpenFX/include/openfx
+
+          mkdir -p Install/OpenFX/include/openfx/Support
+          tar -C Support/include/ --exclude='*.png' --exclude='*.doxy' --exclude='*.dtd' \
+              --exclude='DocSrc' \
+            -cf - . \
+           | tar -xf - -C Install/OpenFX/include/openfx/Support/
+
+          mkdir -p Install/OpenFX/include/openfx/HostSupport
+          tar -C HostSupport/include/ --exclude='*.png' --exclude='*.doxy' --exclude='*.dtd' \
+              --exclude='DocSrc' \
+            -cf - . \
+           | tar -xf - -C Install/OpenFX/include/openfx/HostSupport/
+
+          mkdir -p Install/OpenFX/lib
+          find build -name 'lib*' -type f -exec cp {} Install/OpenFX/lib/ \;
+
+      # Artifacts for build & release:
+      # - Header files, doc, and support libs, for use when developing hosts & plugins
+      # - Built/installed example plugins, for testing in a host
+
+      # Create and sign headers/libs tarball
+      - name: Create headers/libs tarball
+        run: |
+          tar -czf openfx-$RELEASE_NAME.tar.gz -C Install OpenFX
+
+      # Install and run sigstore manually for CentOS 7 (sigstore action doesn't work with uv Python)
+      - name: Install sigstore manually (CentOS 7)
+        if: github.event_name == 'release' && (matrix.vfx-cy == 2021 || matrix.vfx-cy == 2022)
+        run: |
+          # Conan installed urllib3 1.26.x, but tuf (required by sigstore) needs urllib3 2.x for BaseHTTPResponse
+          # Explicitly upgrade urllib3 first, then install sigstore
+          python3.11 -m pip install --user --upgrade 'urllib3>=2.0'
+          python3.11 -m pip install --user sigstore
+
+      - name: Sign header/libs tarball with Sigstore manually (CentOS 7)
+        if: github.event_name == 'release' && (matrix.vfx-cy == 2021 || matrix.vfx-cy == 2022)
+        run: |
+          # uv Python needs SSL_CERT_FILE to use certifi's CA bundle instead of outdated system certs
+          export SSL_CERT_FILE=$(python3.11 -c "import certifi; print(certifi.where())")
+          python3.11 -m sigstore sign openfx-${{ env.RELEASE_NAME }}.tar.gz
+
+      - name: Sign header/libs tarball with Sigstore (action for other platforms)
+        if: github.event_name == 'release' && matrix.vfx-cy != 2021 && matrix.vfx-cy != 2022
+        uses: sigstore/gh-action-sigstore-python@f514d46b907ebcd5bedc05145c03b69c1edd8b46 # v3.0.0
+        with:
+          inputs: openfx-${{ env.RELEASE_NAME }}.tar.gz
+          upload-signing-artifacts: false
+          release-signing-artifacts: false
+
+      - name: Upload header/libs tarball and signatures
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "openfx-${{ env.RELEASE_NAME }}"
+          path: |
+            openfx-${{ env.RELEASE_NAME }}.tar.gz
+            openfx-${{ env.RELEASE_NAME }}.tar.gz.sigstore.json
+
+      - name: Upload header/libs tarball (no signatures)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "openfx-${{ env.RELEASE_NAME }}"
+          path: |
+            openfx-${{ env.RELEASE_NAME }}.tar.gz
+
+      # Now the same, for the plugins
+      
+      - name: Create built/installed plugins tarball
+        run: |
+          tar -czf openfx_plugins-$RELEASE_NAME.tar.gz -C build/Install .
+
+      # Sign plugins manually for CentOS 7 (sigstore already installed above)
+      - name: Sign plugins tarball with Sigstore manually (CentOS 7)
+        if: github.event_name == 'release' && (matrix.vfx-cy == 2021 || matrix.vfx-cy == 2022)
+        run: |
+          # uv Python needs SSL_CERT_FILE to use certifi's CA bundle instead of outdated system certs
+          export SSL_CERT_FILE=$(python3.11 -c "import certifi; print(certifi.where())")
+          python3.11 -m sigstore sign openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz
+
+      - name: Sign plugins tarball with Sigstore (action for other platforms)
+        if: github.event_name == 'release' && matrix.vfx-cy != 2021 && matrix.vfx-cy != 2022
+        uses: sigstore/gh-action-sigstore-python@f514d46b907ebcd5bedc05145c03b69c1edd8b46 # v3.0.0
+        with:
+          inputs: openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz
+          upload-signing-artifacts: false
+          release-signing-artifacts: false
+
+      - name: Upload plugins tarball and signatures
+        if: github.event_name == 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "openfx_plugins-${{ env.RELEASE_NAME }}"
+          path: |
+            openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz
+            openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz.sigstore.json
+
+      - name: Upload plugins tarball (no signatures)
+        if: github.event_name != 'release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: "openfx_plugins-${{ env.RELEASE_NAME }}"
+          path: |
+            openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz
+
+      - name: Upload artifacts to release 
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release upload ${TAG} \
+            openfx-${{ env.RELEASE_NAME }}.tar.gz \
+            openfx-${{ env.RELEASE_NAME }}.tar.gz.sigstore.json \
+            openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz \
+            openfx_plugins-${{ env.RELEASE_NAME }}.tar.gz.sigstore.json

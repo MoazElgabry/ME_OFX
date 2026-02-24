@@ -1,0 +1,21 @@
+.DS_Store
+Thumbs.db
+
+# Local IDE/cache
+.vs/
+**/.vs/
+*.suo
+*.user
+*.sdf
+*.opensdf
+
+# Build output
+**/build/
+**/build-*/
+**/build-ninja/
+**/out/
+**/cmake-build-*/
+
+# macOS metadata
+**/.AppleDouble
+**/._*
