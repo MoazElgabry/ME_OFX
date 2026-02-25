@@ -1,4 +1,4 @@
-﻿#include <cmath>
+#include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -19,7 +19,7 @@
 #include "OpenDRTProcessor.h"
 
 #define kPluginName "ME_OpenDRT"
-#define kPluginGrouping "Color"
+#define kPluginGrouping "Moaz Elgabry"
 #define kPluginDescription "OpenDRT v1.1.0 by Jed Smith, ported to OFX by Moaz ELgabry"
 #define kPluginIdentifier "com.moazelgabry.me_opendrt"
 #define kPluginVersionMajor 1
