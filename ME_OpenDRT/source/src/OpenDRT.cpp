@@ -1,5 +1,6 @@
-#include <cmath>
+﻿#include <cmath>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -52,30 +53,28 @@ void perfLog(const char* stage, const std::chrono::steady_clock::time_point& sta
 }
 
 constexpr int kBuiltInLookPresetCount = static_cast<int>(kLookPresetNames.size());
-// User preset slot count (look + tonescale). Update this value to add/remove slots.
-// If changed, only UI loops below should need adjustment automatically.
-constexpr int kUserLookPresetSlotCount = 4;
 constexpr int kBuiltInTonescalePresetCount = static_cast<int>(kTonescalePresetNames.size());
-constexpr int kUserTonescalePresetSlotCount = 4;
 
-struct UserLookSlot {
-  bool used = false;
+struct UserLookPreset {
+  std::string id;
   std::string name;
+  std::string createdAtUtc;
+  std::string updatedAtUtc;
   LookPresetValues values{};
 };
 
-struct UserTonescaleSlot {
-  bool used = false;
+struct UserTonescalePreset {
+  std::string id;
   std::string name;
+  std::string createdAtUtc;
+  std::string updatedAtUtc;
   TonescalePresetValues values{};
 };
 
 struct UserPresetStore {
   bool loaded = false;
-  std::array<UserLookSlot, kUserLookPresetSlotCount> lookSlots{};
-  std::array<UserTonescaleSlot, kUserTonescalePresetSlotCount> tonescaleSlots{};
-  std::vector<int> visibleLookSlots;
-  std::vector<int> visibleTonescaleSlots;
+  std::vector<UserLookPreset> lookPresets;
+  std::vector<UserTonescalePreset> tonescalePresets;
 };
 
 UserPresetStore& userPresetStore() {
@@ -88,35 +87,232 @@ std::mutex& userPresetMutex() {
   return m;
 }
 
-std::filesystem::path userPresetFilePath() {
-#ifdef _WIN32
-  const char* base = std::getenv("APPDATA");
-  if (!base || !*base) base = std::getenv("LOCALAPPDATA");
-  if (base && *base) {
-    return std::filesystem::path(base) / "ME_OpenDRT" / "user_presets_v1.txt";
+void ensureUserPresetStoreLoadedLocked();
+
+std::string toLowerCopy(const std::string& s) {
+  std::string out = s;
+  for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return out;
+}
+
+std::string normalizePresetNameKey(const std::string& s) {
+  std::string out;
+  out.reserve(s.size());
+  bool inSpace = false;
+  for (char c : s) {
+    const unsigned char uc = static_cast<unsigned char>(c);
+    if (std::isspace(uc)) {
+      inSpace = true;
+      continue;
+    }
+    if (inSpace && !out.empty()) out.push_back(' ');
+    inSpace = false;
+    out.push_back(static_cast<char>(std::tolower(uc)));
   }
-#else
-  const char* home = std::getenv("HOME");
-  if (home && *home) {
-    return std::filesystem::path(home) / "Library" / "Application Support" / "ME_OpenDRT" / "user_presets_v1.txt";
-  }
-#endif
-  return std::filesystem::path("ME_OpenDRT_user_presets_v1.txt");
+  while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  return out;
 }
 
 std::string sanitizePresetName(const std::string& s, const char* fallback) {
   std::string out;
   out.reserve(s.size());
   for (char c : s) {
-    if (c == '\n' || c == '\r' || c == '\t' || c == '|') continue;
+    if (c == '\n' || c == '\r' || c == '\t') continue;
     out.push_back(c);
   }
   while (!out.empty() && out.front() == ' ') out.erase(out.begin());
   while (!out.empty() && out.back() == ' ') out.pop_back();
   if (out.empty()) out = fallback;
-  if (out.size() > 64) out.resize(64);
+  if (out.size() > 96) out.resize(96);
   return out;
 }
+
+std::string nowUtcIso8601() {
+  std::time_t t = std::time(nullptr);
+  std::tm tm{};
+#if defined(_WIN32)
+  gmtime_s(&tm, &t);
+#else
+  gmtime_r(&t, &tm);
+#endif
+  char buf[32] = {0};
+  std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
+  return std::string(buf);
+}
+
+std::string makePresetId(const std::string& prefix) {
+  static unsigned long counter = 1;
+  std::ostringstream os;
+  os << prefix << '_' << std::time(nullptr) << '_' << counter++;
+  return os.str();
+}
+
+std::string jsonEscape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size() + 16);
+  for (char c : in) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '"': out += "\\\""; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+std::string jsonUnescape(const std::string& in) {
+  std::string out;
+  out.reserve(in.size());
+  for (size_t i = 0; i < in.size(); ++i) {
+    char c = in[i];
+    if (c == '\\' && i + 1 < in.size()) {
+      char n = in[++i];
+      if (n == 'n') out.push_back('\n');
+      else if (n == 'r') out.push_back('\r');
+      else if (n == 't') out.push_back('\t');
+      else out.push_back(n);
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+std::filesystem::path userPresetDirPath() {
+#ifdef _WIN32
+  const char* base = std::getenv("APPDATA");
+  if (!base || !*base) base = std::getenv("LOCALAPPDATA");
+  if (base && *base) return std::filesystem::path(base) / "ME_OpenDRT";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::filesystem::path(home) / "Library" / "Application Support" / "ME_OpenDRT";
+#endif
+  return std::filesystem::path(".");
+}
+
+std::filesystem::path userPresetFilePathV2() {
+  return userPresetDirPath() / "presets_v2.json";
+}
+
+std::filesystem::path userPresetFilePathV1Legacy() {
+  return userPresetDirPath() / "user_presets_v1.txt";
+}
+
+enum class DeleteTarget {
+  Cancel = 0,
+  Look,
+  Tonescale
+};
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <commdlg.h>
+
+std::string pickOpenJsonFilePath() {
+  char filePath[MAX_PATH] = {0};
+  OPENFILENAMEA ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+  ofn.lpstrFile = filePath;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+  ofn.lpstrDefExt = "json";
+  if (GetOpenFileNameA(&ofn) == TRUE) return std::string(filePath);
+  return std::string();
+}
+
+std::string pickSaveJsonFilePath(const std::string& defaultName) {
+  char filePath[MAX_PATH] = {0};
+  std::snprintf(filePath, MAX_PATH, "%s", defaultName.c_str());
+  OPENFILENAMEA ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.lpstrFilter = "JSON Files (*.json)\0*.json\0All Files (*.*)\0*.*\0";
+  ofn.lpstrFile = filePath;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT;
+  ofn.lpstrDefExt = "json";
+  if (GetSaveFileNameA(&ofn) == TRUE) return std::string(filePath);
+  return std::string();
+}
+
+bool confirmOverwriteDialog(const std::string& presetName) {
+  std::string msg = "Preset '" + presetName + "' already exists. Overwrite?";
+  return MessageBoxA(nullptr, msg.c_str(), "ME_OpenDRT", MB_ICONQUESTION | MB_YESNO) == IDYES;
+}
+
+void showInfoDialog(const std::string& text) {
+  MessageBoxA(nullptr, text.c_str(), "ME_OpenDRT", MB_ICONINFORMATION | MB_OK);
+}
+
+bool confirmDeleteDialog(const std::string& presetName) {
+  std::string msg = "Delete preset '" + presetName + "'? This cannot be undone.";
+  return MessageBoxA(nullptr, msg.c_str(), "ME_OpenDRT", MB_ICONWARNING | MB_YESNO) == IDYES;
+}
+
+DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
+  std::string msg = "Both selected Look and Tonescale are user presets.\n\nYes = " + std::string(actionVerb) + " Look\nNo = " + std::string(actionVerb) + " Tonescale\nCancel = Cancel";
+  const int result = MessageBoxA(
+    nullptr,
+    msg.c_str(),
+    "ME_OpenDRT",
+    MB_ICONQUESTION | MB_YESNOCANCEL
+  );
+  if (result == IDYES) return DeleteTarget::Look;
+  if (result == IDNO) return DeleteTarget::Tonescale;
+  return DeleteTarget::Cancel;
+}
+#else
+std::string execAndRead(const std::string& cmd) {
+  std::string out;
+  FILE* f = popen(cmd.c_str(), "r");
+  if (!f) return out;
+  char buf[512];
+  while (fgets(buf, sizeof(buf), f)) out += buf;
+  pclose(f);
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+  return out;
+}
+
+std::string pickOpenJsonFilePath() {
+  return execAndRead("osascript -e 'POSIX path of (choose file with prompt \"Import ME_OpenDRT preset\" of type {\"public.json\"})' 2>/dev/null");
+}
+
+std::string pickSaveJsonFilePath(const std::string& defaultName) {
+  std::string cmd = "osascript -e 'POSIX path of (choose file name with prompt \"Export ME_OpenDRT preset\" default name \"" + defaultName + "\")' 2>/dev/null";
+  return execAndRead(cmd);
+}
+
+bool confirmOverwriteDialog(const std::string& presetName) {
+  std::string cmd = "osascript -e 'button returned of (display dialog \"Preset \\\"" + presetName + "\\\" already exists. Overwrite?\" buttons {\"Cancel\",\"Overwrite\"} default button \"Overwrite\")' 2>/dev/null";
+  return execAndRead(cmd) == "Overwrite";
+}
+
+void showInfoDialog(const std::string& text) {
+  std::string esc = text;
+  for (char& c : esc) if (c == '"') c = '\'';
+  std::string cmd = "osascript -e 'display dialog \"" + esc + "\" buttons {\"OK\"} default button \"OK\"' 2>/dev/null";
+  (void)execAndRead(cmd);
+}
+
+bool confirmDeleteDialog(const std::string& presetName) {
+  std::string cmd = "osascript -e 'button returned of (display dialog \"Delete preset \\\"" + presetName + "\\\"? This cannot be undone.\" buttons {\"Cancel\",\"Delete\"} default button \"Delete\")' 2>/dev/null";
+  return execAndRead(cmd) == "Delete";
+}
+
+DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
+  std::string action = actionVerb ? actionVerb : "Apply";
+  std::string cmd = "osascript -e 'button returned of (display dialog \"Both selected Look and Tonescale are user presets.\" buttons {\"Cancel\",\"" + action + " Tonescale\",\"" + action + " Look\"} default button \"" + action + " Look\")' 2>/dev/null";
+  const std::string out = execAndRead(cmd);
+  if (out == (action + " Look")) return DeleteTarget::Look;
+  if (out == (action + " Tonescale")) return DeleteTarget::Tonescale;
+  return DeleteTarget::Cancel;
+}
+#endif
 
 bool serializeLookValues(const LookPresetValues& v, std::string& out) {
   std::ostringstream os;
@@ -192,44 +388,81 @@ bool parseTonescaleValues(const std::string& in, TonescalePresetValues* v) {
   );
 }
 
+std::string jsonField(const std::string& line, const std::string& key) {
+  const std::string token = "\"" + key + "\":\"";
+  const size_t p = line.find(token);
+  if (p == std::string::npos) return std::string();
+  size_t i = p + token.size();
+  std::string out;
+  bool esc = false;
+  for (; i < line.size(); ++i) {
+    char c = line[i];
+    if (esc) {
+      out.push_back('\\');
+      out.push_back(c);
+      esc = false;
+      continue;
+    }
+    if (c == '\\') { esc = true; continue; }
+    if (c == '"') break;
+    out.push_back(c);
+  }
+  return jsonUnescape(out);
+}
+
 void saveUserPresetStoreLocked() {
-  const auto path = userPresetFilePath();
+  const auto path = userPresetFilePathV2();
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
   std::ofstream os(path, std::ios::binary | std::ios::trunc);
   if (!os.is_open()) return;
-  os << "ME_OPENDRT_USER_PRESETS_V1\n";
 
   UserPresetStore& s = userPresetStore();
-  for (int i : s.visibleLookSlots) {
-    if (i < 0 || i >= kUserLookPresetSlotCount) continue;
-    if (!s.lookSlots[static_cast<size_t>(i)].used) continue;
-    std::string values;
-    serializeLookValues(s.lookSlots[static_cast<size_t>(i)].values, values);
-    os << "LOOK\t" << i << '\t' << sanitizePresetName(s.lookSlots[static_cast<size_t>(i)].name, "User Look") << '\t' << values << '\n';
+  os << "{\n";
+  os << "  \"schemaVersion\":2,\n";
+  os << "  \"updatedAtUtc\":\"" << jsonEscape(nowUtcIso8601()) << "\",\n";
+  os << "  \"lookPresets\":[\n";
+  for (size_t i = 0; i < s.lookPresets.size(); ++i) {
+    std::string payload;
+    serializeLookValues(s.lookPresets[i].values, payload);
+    os << "    {\"id\":\"" << jsonEscape(s.lookPresets[i].id)
+       << "\",\"name\":\"" << jsonEscape(s.lookPresets[i].name)
+       << "\",\"createdAtUtc\":\"" << jsonEscape(s.lookPresets[i].createdAtUtc)
+       << "\",\"updatedAtUtc\":\"" << jsonEscape(s.lookPresets[i].updatedAtUtc)
+       << "\",\"payload\":\"" << jsonEscape(payload) << "\"}";
+    os << (i + 1 < s.lookPresets.size() ? ",\n" : "\n");
   }
-  for (int i : s.visibleTonescaleSlots) {
-    if (i < 0 || i >= kUserTonescalePresetSlotCount) continue;
-    if (!s.tonescaleSlots[static_cast<size_t>(i)].used) continue;
-    std::string values;
-    serializeTonescaleValues(s.tonescaleSlots[static_cast<size_t>(i)].values, values);
-    os << "TONE\t" << i << '\t' << sanitizePresetName(s.tonescaleSlots[static_cast<size_t>(i)].name, "User Tonescale") << '\t' << values << '\n';
+  os << "  ],\n";
+  os << "  \"tonescalePresets\":[\n";
+  for (size_t i = 0; i < s.tonescalePresets.size(); ++i) {
+    std::string payload;
+    serializeTonescaleValues(s.tonescalePresets[i].values, payload);
+    os << "    {\"id\":\"" << jsonEscape(s.tonescalePresets[i].id)
+       << "\",\"name\":\"" << jsonEscape(s.tonescalePresets[i].name)
+       << "\",\"createdAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].createdAtUtc)
+       << "\",\"updatedAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].updatedAtUtc)
+       << "\",\"payload\":\"" << jsonEscape(payload) << "\"}";
+    os << (i + 1 < s.tonescalePresets.size() ? ",\n" : "\n");
   }
+  os << "  ]\n";
+  os << "}\n";
 }
 
-void ensureUserPresetStoreLoadedLocked() {
-  UserPresetStore& s = userPresetStore();
-  if (s.loaded) return;
-  s = UserPresetStore{};
-  s.loaded = true;
-
-  std::ifstream is(userPresetFilePath(), std::ios::binary);
+void migrateLegacyV1IfNeededLocked() {
+  const auto v2 = userPresetFilePathV2();
+  if (std::filesystem::exists(v2)) return;
+  std::ifstream is(userPresetFilePathV1Legacy(), std::ios::binary);
   if (!is.is_open()) return;
 
   std::string header;
   std::getline(is, header);
   if (header != "ME_OPENDRT_USER_PRESETS_V1") return;
 
+  UserPresetStore& s = userPresetStore();
+  std::unordered_map<std::string, bool> seenLookNames;
+  std::unordered_map<std::string, bool> seenToneNames;
+  for (const char* n : kLookPresetNames) seenLookNames[normalizePresetNameKey(n)] = true;
+  for (const char* n : kTonescalePresetNames) seenToneNames[normalizePresetNameKey(n)] = true;
   std::string line;
   while (std::getline(is, line)) {
     if (line.empty()) continue;
@@ -239,125 +472,187 @@ void ensureUserPresetStoreLoadedLocked() {
     if (p2 == std::string::npos) continue;
     const size_t p3 = line.find('\t', p2 + 1);
     if (p3 == std::string::npos) continue;
-
     const std::string kind = line.substr(0, p1);
-    const int slot = std::atoi(line.substr(p1 + 1, p2 - p1 - 1).c_str());
     const std::string name = sanitizePresetName(line.substr(p2 + 1, p3 - p2 - 1), "User Preset");
     const std::string values = line.substr(p3 + 1);
-
-    if (kind == "LOOK" && slot >= 0 && slot < kUserLookPresetSlotCount) {
+    const std::string now = nowUtcIso8601();
+    if (kind == "LOOK") {
+      const std::string key = normalizePresetNameKey(name);
+      if (seenLookNames.find(key) != seenLookNames.end()) continue;
       LookPresetValues parsed{};
       if (parseLookValues(values, &parsed)) {
-        auto& dst = s.lookSlots[static_cast<size_t>(slot)];
-        dst.used = true;
-        dst.name = name;
-        dst.values = parsed;
-        bool exists = false;
-        for (int v : s.visibleLookSlots) if (v == slot) { exists = true; break; }
-        if (!exists) s.visibleLookSlots.push_back(slot);
+        UserLookPreset p{};
+        p.id = makePresetId("look"); p.name = name; p.createdAtUtc = now; p.updatedAtUtc = now; p.values = parsed;
+        s.lookPresets.push_back(p);
+        seenLookNames[key] = true;
       }
-    } else if (kind == "TONE" && slot >= 0 && slot < kUserTonescalePresetSlotCount) {
+    } else if (kind == "TONE") {
+      const std::string key = normalizePresetNameKey(name);
+      if (seenToneNames.find(key) != seenToneNames.end()) continue;
       TonescalePresetValues parsed{};
       if (parseTonescaleValues(values, &parsed)) {
-        auto& dst = s.tonescaleSlots[static_cast<size_t>(slot)];
-        dst.used = true;
-        dst.name = name;
-        dst.values = parsed;
-        bool exists = false;
-        for (int v : s.visibleTonescaleSlots) if (v == slot) { exists = true; break; }
-        if (!exists) s.visibleTonescaleSlots.push_back(slot);
+        UserTonescalePreset p{};
+        p.id = makePresetId("tone"); p.name = name; p.createdAtUtc = now; p.updatedAtUtc = now; p.values = parsed;
+        s.tonescalePresets.push_back(p);
+        seenToneNames[key] = true;
       }
+    }
+  }
+  saveUserPresetStoreLocked();
+}
+
+void ensureUserPresetStoreLoadedLocked() {
+  UserPresetStore& s = userPresetStore();
+  if (s.loaded) return;
+  s = UserPresetStore{};
+  s.loaded = true;
+
+  migrateLegacyV1IfNeededLocked();
+
+  std::ifstream is(userPresetFilePathV2(), std::ios::binary);
+  if (!is.is_open()) return;
+
+  enum class Section { None, Look, Tone };
+  Section sec = Section::None;
+  std::unordered_map<std::string, bool> seenLookNames;
+  std::unordered_map<std::string, bool> seenToneNames;
+  for (const char* n : kLookPresetNames) seenLookNames[normalizePresetNameKey(n)] = true;
+  for (const char* n : kTonescalePresetNames) seenToneNames[normalizePresetNameKey(n)] = true;
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.find("\"lookPresets\"") != std::string::npos) { sec = Section::Look; continue; }
+    if (line.find("\"tonescalePresets\"") != std::string::npos) { sec = Section::Tone; continue; }
+    if (line.find(']') != std::string::npos) { sec = Section::None; continue; }
+    if (line.find('{') == std::string::npos || line.find("\"id\"") == std::string::npos) continue;
+
+    const std::string id = jsonField(line, "id");
+    const std::string name = sanitizePresetName(jsonField(line, "name"), "User Preset");
+    const std::string created = jsonField(line, "createdAtUtc");
+    const std::string updated = jsonField(line, "updatedAtUtc");
+    const std::string payload = jsonField(line, "payload");
+    if (id.empty() || payload.empty()) continue;
+
+    if (sec == Section::Look) {
+      const std::string key = normalizePresetNameKey(name);
+      if (seenLookNames.find(key) != seenLookNames.end()) continue;
+      LookPresetValues parsed{};
+      if (!parseLookValues(payload, &parsed)) continue;
+      UserLookPreset p{};
+      p.id = id; p.name = name; p.createdAtUtc = created.empty() ? nowUtcIso8601() : created; p.updatedAtUtc = updated.empty() ? p.createdAtUtc : updated; p.values = parsed;
+      s.lookPresets.push_back(p);
+      seenLookNames[key] = true;
+    } else if (sec == Section::Tone) {
+      const std::string key = normalizePresetNameKey(name);
+      if (seenToneNames.find(key) != seenToneNames.end()) continue;
+      TonescalePresetValues parsed{};
+      if (!parseTonescaleValues(payload, &parsed)) continue;
+      UserTonescalePreset p{};
+      p.id = id; p.name = name; p.createdAtUtc = created.empty() ? nowUtcIso8601() : created; p.updatedAtUtc = updated.empty() ? p.createdAtUtc : updated; p.values = parsed;
+      s.tonescalePresets.push_back(p);
+      seenToneNames[key] = true;
     }
   }
 }
 
-void rebuildVisiblePresetMapsLocked() {
-  UserPresetStore& s = userPresetStore();
-  std::vector<int> look;
-  for (int v : s.visibleLookSlots) {
-    if (v >= 0 && v < kUserLookPresetSlotCount && s.lookSlots[static_cast<size_t>(v)].used) look.push_back(v);
+int findUserLookIndexByNameLocked(const std::string& name) {
+  const std::string n = normalizePresetNameKey(name);
+  auto& v = userPresetStore().lookPresets;
+  for (int i = 0; i < static_cast<int>(v.size()); ++i) {
+    if (normalizePresetNameKey(v[static_cast<size_t>(i)].name) == n) return i;
   }
-  for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
-    if (!s.lookSlots[static_cast<size_t>(i)].used) continue;
-    bool exists = false;
-    for (int v : look) if (v == i) { exists = true; break; }
-    if (!exists) look.push_back(i);
-  }
-  s.visibleLookSlots = look;
-
-  std::vector<int> tone;
-  for (int v : s.visibleTonescaleSlots) {
-    if (v >= 0 && v < kUserTonescalePresetSlotCount && s.tonescaleSlots[static_cast<size_t>(v)].used) tone.push_back(v);
-  }
-  for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
-    if (!s.tonescaleSlots[static_cast<size_t>(i)].used) continue;
-    bool exists = false;
-    for (int v : tone) if (v == i) { exists = true; break; }
-    if (!exists) tone.push_back(i);
-  }
-  s.visibleTonescaleSlots = tone;
+  return -1;
 }
 
-bool userLookSlotFromPresetIndex(int idx, int* slotOut) {
-  if (!slotOut) return false;
+int findUserTonescaleIndexByNameLocked(const std::string& name) {
+  const std::string n = normalizePresetNameKey(name);
+  auto& v = userPresetStore().tonescalePresets;
+  for (int i = 0; i < static_cast<int>(v.size()); ++i) {
+    if (normalizePresetNameKey(v[static_cast<size_t>(i)].name) == n) return i;
+  }
+  return -1;
+}
+
+bool lookNameExistsLocked(const std::string& name, const std::string* ignoreId = nullptr) {
+  const std::string key = normalizePresetNameKey(name);
+  for (const char* builtIn : kLookPresetNames) {
+    if (normalizePresetNameKey(builtIn) == key) return true;
+  }
+  for (const auto& p : userPresetStore().lookPresets) {
+    if (ignoreId && !ignoreId->empty() && p.id == *ignoreId) continue;
+    if (normalizePresetNameKey(p.name) == key) return true;
+  }
+  return false;
+}
+
+bool tonescaleNameExistsLocked(const std::string& name, const std::string* ignoreId = nullptr) {
+  const std::string key = normalizePresetNameKey(name);
+  for (const char* builtIn : kTonescalePresetNames) {
+    if (normalizePresetNameKey(builtIn) == key) return true;
+  }
+  for (const auto& p : userPresetStore().tonescalePresets) {
+    if (ignoreId && !ignoreId->empty() && p.id == *ignoreId) continue;
+    if (normalizePresetNameKey(p.name) == key) return true;
+  }
+  return false;
+}
+
+void reloadUserPresetStoreFromDiskLocked() {
+  UserPresetStore& s = userPresetStore();
+  s = UserPresetStore{};
+  ensureUserPresetStoreLoadedLocked();
+}
+
+bool userLookIndexFromPresetIndex(int idx, int* out) {
+  if (!out) return false;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
   const int rel = idx - kBuiltInLookPresetCount;
-  const auto& map = userPresetStore().visibleLookSlots;
-  if (rel < 0 || rel >= static_cast<int>(map.size())) return false;
-  *slotOut = map[static_cast<size_t>(rel)];
+  if (rel < 0 || rel >= static_cast<int>(userPresetStore().lookPresets.size())) return false;
+  *out = rel;
   return true;
 }
 
-int presetIndexFromUserLookSlot(int slot) {
+int presetIndexFromUserLookIndex(int i) {
+  if (i < 0) return -1;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
-  const auto& map = userPresetStore().visibleLookSlots;
-  for (int i = 0; i < static_cast<int>(map.size()); ++i) {
-    if (map[static_cast<size_t>(i)] == slot) return kBuiltInLookPresetCount + i;
-  }
-  return -1;
+  if (i >= static_cast<int>(userPresetStore().lookPresets.size())) return -1;
+  return kBuiltInLookPresetCount + i;
 }
 
 bool isUserLookPresetIndex(int idx) {
-  int slot = -1;
-  return userLookSlotFromPresetIndex(idx, &slot);
+  int i = -1;
+  return userLookIndexFromPresetIndex(idx, &i);
 }
 
-bool userTonescaleSlotFromPresetIndex(int idx, int* slotOut) {
-  if (!slotOut) return false;
+bool userTonescaleIndexFromPresetIndex(int idx, int* out) {
+  if (!out) return false;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
   const int rel = idx - kBuiltInTonescalePresetCount;
-  const auto& map = userPresetStore().visibleTonescaleSlots;
-  if (rel < 0 || rel >= static_cast<int>(map.size())) return false;
-  *slotOut = map[static_cast<size_t>(rel)];
+  if (rel < 0 || rel >= static_cast<int>(userPresetStore().tonescalePresets.size())) return false;
+  *out = rel;
   return true;
 }
 
-int presetIndexFromUserTonescaleSlot(int slot) {
+int presetIndexFromUserTonescaleIndex(int i) {
+  if (i < 0) return -1;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
-  const auto& map = userPresetStore().visibleTonescaleSlots;
-  for (int i = 0; i < static_cast<int>(map.size()); ++i) {
-    if (map[static_cast<size_t>(i)] == slot) return kBuiltInTonescalePresetCount + i;
-  }
-  return -1;
+  if (i >= static_cast<int>(userPresetStore().tonescalePresets.size())) return -1;
+  return kBuiltInTonescalePresetCount + i;
 }
 
 bool isUserTonescalePresetIndex(int idx) {
-  int slot = -1;
-  return userTonescaleSlotFromPresetIndex(idx, &slot);
+  int i = -1;
+  return userTonescaleIndexFromPresetIndex(idx, &i);
 }
 
 std::vector<std::string> visibleUserLookNames() {
   std::vector<std::string> out;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
-  for (int slot : userPresetStore().visibleLookSlots) {
-    const auto& s = userPresetStore().lookSlots[static_cast<size_t>(slot)];
-    out.push_back(s.used ? s.name : ("User Look Slot " + std::to_string(slot + 1)));
-  }
+  for (const auto& p : userPresetStore().lookPresets) out.push_back(p.name);
   return out;
 }
 
@@ -365,10 +660,7 @@ std::vector<std::string> visibleUserTonescaleNames() {
   std::vector<std::string> out;
   std::lock_guard<std::mutex> lock(userPresetMutex());
   ensureUserPresetStoreLoadedLocked();
-  for (int slot : userPresetStore().visibleTonescaleSlots) {
-    const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
-    out.push_back(s.used ? s.name : ("User Tonescale Slot " + std::to_string(slot + 1)));
-  }
+  for (const auto& p : userPresetStore().tonescalePresets) out.push_back(p.name);
   return out;
 }
 
@@ -566,8 +858,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
       : ImageEffect(handle) {
     dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
-    refreshUserSlotLabels();
+    suppressParamChanged_ = true;
+    syncPresetMenusFromDisk(0.0, getChoice("lookPreset", 0.0, 0), getChoice("tonescalePreset", 0.0, 0));
+    suppressParamChanged_ = false;
     updateToggleVisibility(0.0);
+    updatePresetManagerActionState(0.0);
+    updateReadonlyDisplayLabels(0.0);
   }
 
   void render(const OFX::RenderArguments& args) override {
@@ -707,14 +1003,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
-      if (paramName == "presetState" || paramName == "baseWhitepointLabel") {
+      if (paramName == "presetState") {
         return;
       }
-      const bool isUserLabel =
-        ((paramName.rfind("userLookSlot", 0) == 0 || paramName.rfind("userToneSlot", 0) == 0) &&
-         paramName.find("Label") != std::string::npos);
-      if (paramName == "surroundLabel" ||
-          paramName == "activeUserLookSlot" || paramName == "activeUserToneSlot" || isUserLabel) {
+      if (paramName == "activeUserLookSlot" || paramName == "activeUserToneSlot") {
         return;
       }
 
@@ -726,55 +1018,58 @@ class OpenDRTEffect : public OFX::ImageEffect {
         setInt("activeUserLookSlot", -1);
         setInt("activeUserToneSlot", -1);
         if (isUserLookPresetIndex(look)) {
-          int slot = -1;
-          if (!userLookSlotFromPresetIndex(look, &slot)) return;
+          int userIdx = -1;
+          if (!userLookIndexFromPresetIndex(look, &userIdx)) return;
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
-          const auto& userSlot = userPresetStore().lookSlots[static_cast<size_t>(slot)];
-          if (userSlot.used) {
-            writeLookValuesToParams(userSlot.values, *this);
-            setString("baseWhitepointLabel", whitepointNameFromCwp(userSlot.values.cwp));
-          } else {
-            setString("baseWhitepointLabel", "D65");
-          }
+          const auto& userPreset = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
+          writeLookValuesToParams(userPreset.values, *this);
+          setInt("activeUserLookSlot", userIdx);
         } else {
           writePresetToParams(look, *this);
         }
         updateToggleVisibility(args.time);
-        setInt("presetState", 0);
-        setString("baseWhitepointLabel", effectiveWhitepointLabel(look, 0));
+        updatePresetManagerActionState(args.time);
+        updateReadonlyDisplayLabels(args.time);
+        updatePresetStateFromCurrent(args.time);
         return;
       }
 
       if (paramName == "tonescalePreset") {
-        const int look = getChoice("lookPreset", args.time, 0);
         const int tsPreset = getChoice("tonescalePreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
         setInt("activeUserToneSlot", -1);
         if (isUserTonescalePresetIndex(tsPreset)) {
-          int slot = -1;
-          if (!userTonescaleSlotFromPresetIndex(tsPreset, &slot)) return;
+          int userIdx = -1;
+          if (!userTonescaleIndexFromPresetIndex(tsPreset, &userIdx)) return;
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
-          const auto& userSlot = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
-          if (userSlot.used) {
-            writeTonescaleValuesToParams(userSlot.values, *this);
-          }
+          const auto& userPreset = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
+          writeTonescaleValuesToParams(userPreset.values, *this);
+          setInt("activeUserToneSlot", userIdx);
+        } else if (tsPreset == 0) {
+          const TonescalePresetValues fromLook = selectedLookBaseTonescale(args.time);
+          writeTonescaleValuesToParams(fromLook, *this);
         } else {
           writeTonescalePresetToParams(tsPreset, *this);
         }
         updateToggleVisibility(args.time);
+        updatePresetManagerActionState(args.time);
         updatePresetStateFromCurrent(args.time);
+        updateReadonlyDisplayLabels(args.time);
         return;
       }
 
       if (paramName == "creativeWhitePreset") {
-        const int look = getChoice("lookPreset", args.time, 0);
         const int cwpPreset = getChoice("creativeWhitePreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
-        writeCreativeWhitePresetToParams(cwpPreset, *this);
-        setString("baseWhitepointLabel", effectiveWhitepointLabel(look, cwpPreset));
+        if (cwpPreset <= 0) {
+          setInt("cwp", selectedLookBaseCwp(args.time));
+        } else {
+          writeCreativeWhitePresetToParams(cwpPreset, *this);
+        }
         updatePresetStateFromCurrent(args.time);
+        updateReadonlyDisplayLabels(args.time);
         return;
       }
 
@@ -783,120 +1078,357 @@ class OpenDRTEffect : public OFX::ImageEffect {
         FlagScope scope(suppressParamChanged_);
         writeDisplayPresetToParams(preset, *this);
         updatePresetStateFromCurrent(args.time);
+        updateReadonlyDisplayLabels(args.time);
         return;
       }
 
       if (paramName == "userLookSave") {
-        const int slot = getChoice("userLookSlotSelect", args.time, 0);
-        const std::string typedName = getString("userPresetName", "User Look");
-        const std::string name = sanitizePresetName(typedName, "User Look");
+        const std::string name = sanitizePresetName(getString("userPresetName", "User Look"), "User Look");
         const LookPresetValues values = captureCurrentLookValues(args.time);
-        bool existed = false;
+        int targetIndex = -1;
         {
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
-          auto& dst = userPresetStore().lookSlots[static_cast<size_t>(slot)];
-          existed = dst.used;
-          dst.used = true;
-          dst.name = name;
-          dst.values = values;
-          rebuildVisiblePresetMapsLocked();
+          if (lookNameExistsLocked(name)) {
+            showInfoDialog("A Look preset with this name already exists.");
+            return;
+          }
+          UserLookPreset p{};
+          p.id = makePresetId("look");
+          p.name = name;
+          p.createdAtUtc = nowUtcIso8601();
+          p.updatedAtUtc = p.createdAtUtc;
+          p.values = values;
+          userPresetStore().lookPresets.push_back(p);
+          targetIndex = static_cast<int>(userPresetStore().lookPresets.size()) - 1;
           saveUserPresetStoreLocked();
         }
         FlagScope scope(suppressParamChanged_);
-        setInt("activeUserLookSlot", slot);
-        ensureLookSlotMenuVisible(slot, name, existed);
-        refreshUserSlotLabels();
-        const int idx = presetIndexFromUserLookSlot(slot);
+        setInt("activeUserLookSlot", targetIndex);
+        const int idx = presetIndexFromUserLookIndex(targetIndex);
+        syncPresetMenusFromDisk(args.time, idx >= 0 ? idx : 0, getChoice("tonescalePreset", args.time, 0));
         if (idx >= 0) setChoice("lookPreset", idx);
         writeLookValuesToParams(values, *this);
         updateToggleVisibility(args.time);
-        updatePresetStateFromCurrent(args.time);
-        return;
-      }
-
-      if (paramName == "userLookLoad") {
-        const int slot = getChoice("userLookSlotSelect", args.time, 0);
-        bool used = false;
-        LookPresetValues values{};
-        std::string name;
-        {
-          std::lock_guard<std::mutex> lock(userPresetMutex());
-          ensureUserPresetStoreLoadedLocked();
-          const auto& src = userPresetStore().lookSlots[static_cast<size_t>(slot)];
-          used = src.used;
-          if (used) {
-            values = src.values;
-            name = src.name;
-          }
-        }
-        if (used) {
-          FlagScope scope(suppressParamChanged_);
-          setInt("activeUserLookSlot", slot);
-          ensureLookSlotMenuVisible(slot, name, true);
-          const int idx = presetIndexFromUserLookSlot(slot);
-          if (idx >= 0) setChoice("lookPreset", idx);
-          writeLookValuesToParams(values, *this);
-          updateToggleVisibility(args.time);
-          updatePresetStateFromCurrent(args.time);
-        }
         return;
       }
 
       if (paramName == "userTonescaleSave") {
-        const int slot = getChoice("userToneSlotSelect", args.time, 0);
-        const std::string typedName = getString("userPresetName", "User Tonescale");
-        const std::string name = sanitizePresetName(typedName, "User Tonescale");
+        const std::string name = sanitizePresetName(getString("userPresetName", "User Tonescale"), "User Tonescale");
         const TonescalePresetValues values = captureCurrentTonescaleValues(args.time);
-        bool existed = false;
+        int targetIndex = -1;
         {
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
-          auto& dst = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
-          existed = dst.used;
-          dst.used = true;
-          dst.name = name;
-          dst.values = values;
-          rebuildVisiblePresetMapsLocked();
+          if (tonescaleNameExistsLocked(name)) {
+            showInfoDialog("A Tonescale preset with this name already exists.");
+            return;
+          }
+          UserTonescalePreset p{};
+          p.id = makePresetId("tone");
+          p.name = name;
+          p.createdAtUtc = nowUtcIso8601();
+          p.updatedAtUtc = p.createdAtUtc;
+          p.values = values;
+          userPresetStore().tonescalePresets.push_back(p);
+          targetIndex = static_cast<int>(userPresetStore().tonescalePresets.size()) - 1;
           saveUserPresetStoreLocked();
         }
         FlagScope scope(suppressParamChanged_);
-        setInt("activeUserToneSlot", slot);
-        ensureTonescaleSlotMenuVisible(slot, name, existed);
-        refreshUserSlotLabels();
-        const int idx = presetIndexFromUserTonescaleSlot(slot);
+        setInt("activeUserToneSlot", targetIndex);
+        const int idx = presetIndexFromUserTonescaleIndex(targetIndex);
+        syncPresetMenusFromDisk(args.time, getChoice("lookPreset", args.time, 0), idx >= 0 ? idx : 0);
         if (idx >= 0) setChoice("tonescalePreset", idx);
         writeTonescaleValuesToParams(values, *this);
         updateToggleVisibility(args.time);
-        updatePresetStateFromCurrent(args.time);
         return;
       }
 
-      if (paramName == "userTonescaleLoad") {
-        const int slot = getChoice("userToneSlotSelect", args.time, 0);
-        bool used = false;
-        TonescalePresetValues values{};
+      if (paramName == "userPresetImport") {
+        const std::string path = pickOpenJsonFilePath();
+        if (path.empty()) return;
+        std::ifstream is(path, std::ios::binary);
+        if (!is.is_open()) return;
+        std::string content((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
+        const std::string type = jsonField(content, "presetType");
+        const std::string name = sanitizePresetName(jsonField(content, "name"), "Imported Preset");
+        const std::string payload = jsonField(content, "payload");
+        if (type.empty() || payload.empty()) return;
+
+        FlagScope scope(suppressParamChanged_);
+        if (type == "look") {
+          LookPresetValues values{};
+          if (!parseLookValues(payload, &values)) return;
+          int index = -1;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (lookNameExistsLocked(name)) {
+              showInfoDialog("A Look preset with this name already exists.");
+              return;
+            }
+            UserLookPreset p{};
+            p.id = makePresetId("look"); p.name = name; p.createdAtUtc = nowUtcIso8601(); p.updatedAtUtc = p.createdAtUtc; p.values = values;
+            userPresetStore().lookPresets.push_back(p);
+            index = static_cast<int>(userPresetStore().lookPresets.size()) - 1;
+            saveUserPresetStoreLocked();
+          }
+          const int idx = presetIndexFromUserLookIndex(index);
+          syncPresetMenusFromDisk(args.time, idx >= 0 ? idx : 0, getChoice("tonescalePreset", args.time, 0));
+          if (idx >= 0) setChoice("lookPreset", idx);
+          setInt("activeUserLookSlot", index);
+          writeLookValuesToParams(values, *this);
+        } else if (type == "tonescale") {
+          TonescalePresetValues values{};
+          if (!parseTonescaleValues(payload, &values)) return;
+          int index = -1;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (tonescaleNameExistsLocked(name)) {
+              showInfoDialog("A Tonescale preset with this name already exists.");
+              return;
+            }
+            UserTonescalePreset p{};
+            p.id = makePresetId("tone"); p.name = name; p.createdAtUtc = nowUtcIso8601(); p.updatedAtUtc = p.createdAtUtc; p.values = values;
+            userPresetStore().tonescalePresets.push_back(p);
+            index = static_cast<int>(userPresetStore().tonescalePresets.size()) - 1;
+            saveUserPresetStoreLocked();
+          }
+          const int idx = presetIndexFromUserTonescaleIndex(index);
+          syncPresetMenusFromDisk(args.time, getChoice("lookPreset", args.time, 0), idx >= 0 ? idx : 0);
+          if (idx >= 0) setChoice("tonescalePreset", idx);
+          setInt("activeUserToneSlot", index);
+          writeTonescaleValuesToParams(values, *this);
+        }
+        updateToggleVisibility(args.time);
+        return;
+      }
+
+      if (paramName == "userPresetUpdateCurrent") {
+        const int lookIdx = getChoice("lookPreset", args.time, 0);
+        const int toneIdx = getChoice("tonescalePreset", args.time, 0);
+        FlagScope scope(suppressParamChanged_);
+        if (isUserLookPresetIndex(lookIdx)) {
+          int userIdx = -1;
+          if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return;
+          const LookPresetValues values = captureCurrentLookValues(args.time);
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
+            auto& dst = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
+            dst.values = values;
+            dst.updatedAtUtc = nowUtcIso8601();
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
+          writeLookValuesToParams(values, *this);
+          updatePresetStateFromCurrent(args.time);
+          updateReadonlyDisplayLabels(args.time);
+          return;
+        }
+        if (isUserTonescalePresetIndex(toneIdx)) {
+          int userIdx = -1;
+          if (!userTonescaleIndexFromPresetIndex(toneIdx, &userIdx)) return;
+          const TonescalePresetValues values = captureCurrentTonescaleValues(args.time);
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
+            auto& dst = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
+            dst.values = values;
+            dst.updatedAtUtc = nowUtcIso8601();
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
+          writeTonescaleValuesToParams(values, *this);
+          updatePresetStateFromCurrent(args.time);
+          updateReadonlyDisplayLabels(args.time);
+          return;
+        }
+        updatePresetManagerActionState(args.time);
+        return;
+      }
+
+      if (paramName == "userPresetDeleteCurrent") {
+        const int lookIdx = getChoice("lookPreset", args.time, 0);
+        const int toneIdx = getChoice("tonescalePreset", args.time, 0);
+        FlagScope scope(suppressParamChanged_);
+        const bool hasLookUser = isUserLookPresetIndex(lookIdx);
+        const bool hasToneUser = isUserTonescalePresetIndex(toneIdx);
+        if (!hasLookUser && !hasToneUser) {
+          showInfoDialog("Select a user preset before deleting.");
+          updatePresetManagerActionState(args.time);
+          return;
+        }
+
+        DeleteTarget target = DeleteTarget::Cancel;
+        if (hasLookUser && hasToneUser) {
+          target = choosePresetTargetDialog("Delete");
+          if (target == DeleteTarget::Cancel) return;
+        } else {
+          target = hasLookUser ? DeleteTarget::Look : DeleteTarget::Tonescale;
+        }
+
+        if (target == DeleteTarget::Look) {
+          int userIdx = -1;
+          if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return;
+          std::string presetName;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
+            presetName = userPresetStore().lookPresets[static_cast<size_t>(userIdx)].name;
+          }
+          if (!confirmDeleteDialog(presetName)) return;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
+            userPresetStore().lookPresets.erase(userPresetStore().lookPresets.begin() + userIdx);
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, 0, toneIdx);
+          setChoice("lookPreset", 0);
+          setInt("activeUserLookSlot", -1);
+          return;
+        }
+        if (target == DeleteTarget::Tonescale) {
+          int userIdx = -1;
+          if (!userTonescaleIndexFromPresetIndex(toneIdx, &userIdx)) return;
+          std::string presetName;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
+            presetName = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)].name;
+          }
+          if (!confirmDeleteDialog(presetName)) return;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
+            userPresetStore().tonescalePresets.erase(userPresetStore().tonescalePresets.begin() + userIdx);
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, lookIdx, 0);
+          setChoice("tonescalePreset", 0);
+          setInt("activeUserToneSlot", -1);
+          return;
+        }
+        return;
+      }
+
+      if (paramName == "userPresetRefresh") {
+        FlagScope scope(suppressParamChanged_);
+        syncPresetMenusFromDisk(args.time, getChoice("lookPreset", args.time, 0), getChoice("tonescalePreset", args.time, 0));
+        return;
+      }
+
+      if (paramName == "userPresetRenameCurrent") {
+        const std::string newName = sanitizePresetName(getString("userPresetName", "User Preset"), "User Preset");
+        const int lookIdx = getChoice("lookPreset", args.time, 0);
+        const int toneIdx = getChoice("tonescalePreset", args.time, 0);
+        const bool hasLookUser = isUserLookPresetIndex(lookIdx);
+        const bool hasToneUser = isUserTonescalePresetIndex(toneIdx);
+        FlagScope scope(suppressParamChanged_);
+        if (!hasLookUser && !hasToneUser) {
+          showInfoDialog("Select a user preset before renaming.");
+          return;
+        }
+
+        DeleteTarget target = DeleteTarget::Cancel;
+        if (hasLookUser && hasToneUser) {
+          target = choosePresetTargetDialog("Rename");
+          if (target == DeleteTarget::Cancel) return;
+        } else {
+          target = hasLookUser ? DeleteTarget::Look : DeleteTarget::Tonescale;
+        }
+
+        if (target == DeleteTarget::Look) {
+          int userIdx = -1;
+          if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
+            std::string ignoreId = userPresetStore().lookPresets[static_cast<size_t>(userIdx)].id;
+            if (lookNameExistsLocked(newName, &ignoreId)) {
+              showInfoDialog("A Look preset with this name already exists.");
+              return;
+            }
+            auto& dst = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
+            dst.name = newName;
+            dst.updatedAtUtc = nowUtcIso8601();
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
+          setChoice("lookPreset", lookIdx);
+          updateReadonlyDisplayLabels(args.time);
+          return;
+        }
+        if (target == DeleteTarget::Tonescale) {
+          int userIdx = -1;
+          if (!userTonescaleIndexFromPresetIndex(toneIdx, &userIdx)) return;
+          {
+            std::lock_guard<std::mutex> lock(userPresetMutex());
+            ensureUserPresetStoreLoadedLocked();
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
+            std::string ignoreId = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)].id;
+            if (tonescaleNameExistsLocked(newName, &ignoreId)) {
+              showInfoDialog("A Tonescale preset with this name already exists.");
+              return;
+            }
+            auto& dst = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
+            dst.name = newName;
+            dst.updatedAtUtc = nowUtcIso8601();
+            saveUserPresetStoreLocked();
+          }
+          syncPresetMenusFromDisk(args.time, lookIdx, toneIdx);
+          setChoice("tonescalePreset", toneIdx);
+          updateReadonlyDisplayLabels(args.time);
+          return;
+        }
+        return;
+      }
+
+      if (paramName == "userPresetExportLook" || paramName == "userPresetExportTonescale") {
+        const bool exportLook = (paramName == "userPresetExportLook");
+        const int lookIdx = getChoice("lookPreset", args.time, 0);
+        const int toneIdx = getChoice("tonescalePreset", args.time, 0);
         std::string name;
+        std::string type;
+        std::string payload;
         {
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
-          const auto& src = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
-          used = src.used;
-          if (used) {
-            values = src.values;
-            name = src.name;
+          if (exportLook) {
+            const int userIdx = lookIdx - kBuiltInLookPresetCount;
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
+            const auto& p = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
+            name = p.name;
+            type = "look";
+            serializeLookValues(p.values, payload);
+          } else {
+            const int userIdx = toneIdx - kBuiltInTonescalePresetCount;
+            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
+            const auto& p = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
+            name = p.name;
+            type = "tonescale";
+            serializeTonescaleValues(p.values, payload);
           }
         }
-        if (used) {
-          FlagScope scope(suppressParamChanged_);
-          setInt("activeUserToneSlot", slot);
-          ensureTonescaleSlotMenuVisible(slot, name, true);
-          const int idx = presetIndexFromUserTonescaleSlot(slot);
-          if (idx >= 0) setChoice("tonescalePreset", idx);
-          writeTonescaleValuesToParams(values, *this);
-          updateToggleVisibility(args.time);
-          updatePresetStateFromCurrent(args.time);
-        }
+        const std::string file = pickSaveJsonFilePath(name + ".json");
+        if (file.empty()) return;
+        std::ofstream os(file, std::ios::binary | std::ios::trunc);
+        if (!os.is_open()) return;
+        os << "{\n";
+        os << "  \"schemaVersion\":2,\n";
+        os << "  \"presetType\":\"" << jsonEscape(type) << "\",\n";
+        os << "  \"name\":\"" << jsonEscape(name) << "\",\n";
+        os << "  \"payload\":\"" << jsonEscape(payload) << "\"\n";
+        os << "}\n";
         return;
       }
 
@@ -905,8 +1437,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
         if (isVisibilityToggleParam(paramName)) {
           updateToggleVisibility(args.time);
         }
-        if (paramName == "tn_su") setString("surroundLabel", surroundNameFromIndex(getChoice("tn_su", args.time, 1)));
         updatePresetStateFromCurrent(args.time);
+        updateReadonlyDisplayLabels(args.time);
       }
     } catch (...) {
       // Swallow callback exceptions to avoid host crashes while stabilizing.
@@ -967,12 +1499,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
       return currentPresetName(lookPresetIndex);
     }
     int slot = -1;
-    if (!userLookSlotFromPresetIndex(lookPresetIndex, &slot)) return std::string("Unknown User Look");
+    if (!userLookIndexFromPresetIndex(lookPresetIndex, &slot)) return std::string("Unknown User Look");
     std::lock_guard<std::mutex> lock(userPresetMutex());
     ensureUserPresetStoreLoadedLocked();
-    const auto& s = userPresetStore().lookSlots[static_cast<size_t>(slot)];
-    if (s.used && !s.name.empty()) return s.name;
-    return std::string("User Look Slot ") + std::to_string(slot + 1);
+    const auto& s = userPresetStore().lookPresets[static_cast<size_t>(slot)];
+    if (!s.name.empty()) return s.name;
+    return std::string("User Look");
   }
 
   std::string presetLabelCleanForLook(int lookPresetIndex) const {
@@ -1068,51 +1600,44 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return v;
   }
 
-  void refreshUserSlotLabels() {
-    std::lock_guard<std::mutex> lock(userPresetMutex());
-    ensureUserPresetStoreLoadedLocked();
-    for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
-      const auto& s = userPresetStore().lookSlots[static_cast<size_t>(i)];
-      const std::string fallback = std::string("Empty");
-      setString(("userLookSlot" + std::to_string(i + 1) + "Label").c_str(), s.used ? s.name : fallback);
-    }
-    for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
-      const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(i)];
-      const std::string fallback = std::string("Empty");
-      setString(("userToneSlot" + std::to_string(i + 1) + "Label").c_str(), s.used ? s.name : fallback);
-    }
-  }
-
   bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
     const int look = getChoice("lookPreset", time, 0);
     const int tsPreset = getChoice("tonescalePreset", time, 0);
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
     const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
-    const int activeUserLookSlot = getInt("activeUserLookSlot", time, -1);
-    const int activeUserToneSlot = getInt("activeUserToneSlot", time, -1);
-
     OpenDRTParams expected{};
-    if (activeUserLookSlot >= 0 && activeUserLookSlot < kUserLookPresetSlotCount) {
+    if (isUserLookPresetIndex(look)) {
+      int userIdx = -1;
+      if (!userLookIndexFromPresetIndex(look, &userIdx)) return false;
       std::lock_guard<std::mutex> lock(userPresetMutex());
       ensureUserPresetStoreLoadedLocked();
-      const auto& s = userPresetStore().lookSlots[static_cast<size_t>(activeUserLookSlot)];
-      if (!s.used) return false;
+      if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return false;
+      const auto& s = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
       applyLookValuesToResolved(expected, s.values);
     } else {
       applyLookPresetToResolved(expected, look);
     }
 
-    if (activeUserToneSlot >= 0 && activeUserToneSlot < kUserTonescalePresetSlotCount) {
+    if (isUserTonescalePresetIndex(tsPreset)) {
+      int userIdx = -1;
+      if (!userTonescaleIndexFromPresetIndex(tsPreset, &userIdx)) return false;
       std::lock_guard<std::mutex> lock(userPresetMutex());
       ensureUserPresetStoreLoadedLocked();
-      const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(activeUserToneSlot)];
-      if (!s.used) return false;
+      if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return false;
+      const auto& s = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
       applyTonescaleValuesToResolved(expected, s.values);
+    } else if (tsPreset == 0) {
+      // "USE LOOK PRESET" must compare against the selected look's baseline tonescale
+      // (built-in or user look), otherwise this path always appears modified.
+      const TonescalePresetValues fromLook = selectedLookBaseTonescale(time);
+      applyTonescaleValuesToResolved(expected, fromLook);
     } else {
       applyTonescalePresetToResolved(expected, tsPreset);
     }
 
     applyDisplayEncodingPreset(expected, displayPreset);
+    // Preset-mode baseline uses clamp enabled by default.
+    expected.clamp = 1;
     if (cwpPreset > 0) expected.cwp = cwpPreset - 1;
 
     const bool tonescaleClean =
@@ -1192,26 +1717,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
   }
 
   void updatePresetStateFromCurrent(double time) {
-    const int look = getChoice("lookPreset", time, 0);
-    const int tsPreset = getChoice("tonescalePreset", time, 0);
-    const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
-    const int activeUserLookSlot = getInt("activeUserLookSlot", time, -1);
-    const int activeUserToneSlot = getInt("activeUserToneSlot", time, -1);
     bool tonescaleClean = true;
     const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean);
     setInt("presetState", clean ? 0 : 1);
-    (void)activeUserToneSlot;
-    (void)tonescaleClean;
-    if (activeUserLookSlot >= 0 && activeUserLookSlot < kUserLookPresetSlotCount) {
-      {
-        std::lock_guard<std::mutex> lock(userPresetMutex());
-        ensureUserPresetStoreLoadedLocked();
-        const auto& s = userPresetStore().lookSlots[static_cast<size_t>(activeUserLookSlot)];
-        if (s.used) setString("baseWhitepointLabel", whitepointNameFromCwp(s.values.cwp));
-      }
-    } else {
-      setString("baseWhitepointLabel", effectiveWhitepointLabel(look, cwpPreset));
-    }
+    applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean);
   }
 
   int getChoice(const char* name, double t, int def) const {
@@ -1245,22 +1754,203 @@ class OpenDRTEffect : public OFX::ImageEffect {
   void setChoice(const char* name, int v) {
     if (auto* p = fetchChoiceParam(name)) p->setValue(v);
   }
-  void ensureLookSlotMenuVisible(int slot, const std::string& name, bool existed) {
-    if (slot < 0 || slot >= kUserLookPresetSlotCount) return;
-    const int idx = presetIndexFromUserLookSlot(slot);
-    if (auto* p = fetchChoiceParam("lookPreset")) {
-      if (idx >= 0 && existed) p->setOption(idx, name);
-      else p->appendOption(name);
+
+  int selectedLookBaseCwp(double t) const {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    if (isUserLookPresetIndex(lookIdx)) {
+      int userIdx = -1;
+      if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return 2;
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return 2;
+      return userPresetStore().lookPresets[static_cast<size_t>(userIdx)].values.cwp;
     }
+    if (lookIdx < 0 || lookIdx >= static_cast<int>(kLookPresets.size())) return 2;
+    return kLookPresets[static_cast<size_t>(lookIdx)].cwp;
   }
-  void ensureTonescaleSlotMenuVisible(int slot, const std::string& name, bool existed) {
-    if (slot < 0 || slot >= kUserTonescalePresetSlotCount) return;
-    const int idx = presetIndexFromUserTonescaleSlot(slot);
-    if (auto* p = fetchChoiceParam("tonescalePreset")) {
-      if (idx >= 0 && existed) p->setOption(idx, name);
-      else p->appendOption(name);
+
+  TonescalePresetValues selectedLookBaseTonescale(double t) const {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    TonescalePresetValues out{};
+    if (isUserLookPresetIndex(lookIdx)) {
+      int userIdx = -1;
+      if (!userLookIndexFromPresetIndex(lookIdx, &userIdx)) return captureCurrentTonescaleValues(t);
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return captureCurrentTonescaleValues(t);
+      const auto& lv = userPresetStore().lookPresets[static_cast<size_t>(userIdx)].values;
+      out.tn_con = lv.tn_con;
+      out.tn_sh = lv.tn_sh;
+      out.tn_toe = lv.tn_toe;
+      out.tn_off = lv.tn_off;
+      out.tn_hcon_enable = lv.tn_hcon_enable;
+      out.tn_hcon = lv.tn_hcon;
+      out.tn_hcon_pv = lv.tn_hcon_pv;
+      out.tn_hcon_st = lv.tn_hcon_st;
+      out.tn_lcon_enable = lv.tn_lcon_enable;
+      out.tn_lcon = lv.tn_lcon;
+      out.tn_lcon_w = lv.tn_lcon_w;
+      return out;
     }
+    const int idx = (lookIdx < 0 || lookIdx >= static_cast<int>(kLookPresets.size())) ? 0 : lookIdx;
+    const auto& lv = kLookPresets[static_cast<size_t>(idx)];
+    out.tn_con = lv.tn_con;
+    out.tn_sh = lv.tn_sh;
+    out.tn_toe = lv.tn_toe;
+    out.tn_off = lv.tn_off;
+    out.tn_hcon_enable = lv.tn_hcon_enable;
+    out.tn_hcon = lv.tn_hcon;
+    out.tn_hcon_pv = lv.tn_hcon_pv;
+    out.tn_hcon_st = lv.tn_hcon_st;
+    out.tn_lcon_enable = lv.tn_lcon_enable;
+    out.tn_lcon = lv.tn_lcon;
+    out.tn_lcon_w = lv.tn_lcon_w;
+    return out;
   }
+
+  std::string lookBaseMenuName(int idx) const {
+    if (idx >= 0 && idx < kBuiltInLookPresetCount) return std::string(kLookPresetNames[static_cast<size_t>(idx)]);
+    if (!isUserLookPresetIndex(idx)) return std::string();
+    int userIdx = -1;
+    if (!userLookIndexFromPresetIndex(idx, &userIdx)) return std::string();
+    std::lock_guard<std::mutex> lock(userPresetMutex());
+    ensureUserPresetStoreLoadedLocked();
+    if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return std::string();
+    return userPresetStore().lookPresets[static_cast<size_t>(userIdx)].name;
+  }
+
+  std::string tonescaleBaseMenuName(int idx) const {
+    if (idx >= 0 && idx < kBuiltInTonescalePresetCount) return std::string(kTonescalePresetNames[static_cast<size_t>(idx)]);
+    if (!isUserTonescalePresetIndex(idx)) return std::string();
+    int userIdx = -1;
+    if (!userTonescaleIndexFromPresetIndex(idx, &userIdx)) return std::string();
+    std::lock_guard<std::mutex> lock(userPresetMutex());
+    ensureUserPresetStoreLoadedLocked();
+    if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return std::string();
+    return userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)].name;
+  }
+
+  void applyPresetMenuModifiedLabels(double t, bool lookModified, bool tonescaleModified) {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    const int toneIdx = getChoice("tonescalePreset", t, 0);
+    if (menuLabelCacheInit_ &&
+        lookIdx == menuLabelLookIdx_ &&
+        toneIdx == menuLabelToneIdx_ &&
+        lookModified == menuLabelLookModified_ &&
+        tonescaleModified == menuLabelToneModified_) {
+      return;
+    }
+    auto* lookParam = fetchChoiceParam("lookPreset");
+    auto* toneParam = fetchChoiceParam("tonescalePreset");
+
+    if (lookParam && menuLabelCacheInit_ && menuLabelLookIdx_ >= 0) {
+      const std::string basePrev = lookBaseMenuName(menuLabelLookIdx_);
+      if (!basePrev.empty()) lookParam->setOption(menuLabelLookIdx_, basePrev);
+    }
+    if (toneParam && menuLabelCacheInit_ && menuLabelToneIdx_ >= 0) {
+      const std::string basePrev = tonescaleBaseMenuName(menuLabelToneIdx_);
+      if (!basePrev.empty()) toneParam->setOption(menuLabelToneIdx_, basePrev);
+    }
+
+    if (lookParam) {
+      const std::string base = lookBaseMenuName(lookIdx);
+      if (!base.empty() && lookModified) lookParam->setOption(lookIdx, base + " (Modified)");
+    }
+    if (toneParam) {
+      const std::string base = tonescaleBaseMenuName(toneIdx);
+      if (!base.empty() && tonescaleModified) toneParam->setOption(toneIdx, base + " (Modified)");
+    }
+
+    menuLabelLookIdx_ = lookIdx;
+    menuLabelToneIdx_ = toneIdx;
+    menuLabelLookModified_ = lookModified;
+    menuLabelToneModified_ = tonescaleModified;
+    menuLabelCacheInit_ = true;
+  }
+
+  void updateReadonlyDisplayLabels(double t) {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    const int cwpPreset = getChoice("creativeWhitePreset", t, 0);
+    const int tnSu = getChoice("tn_su", t, 1);
+    const int cwp = (cwpPreset <= 0) ? selectedLookBaseCwp(t) : (cwpPreset - 1);
+    std::string baseWp = std::string(whitepointNameFromCwp(cwp));
+    if (isUserLookPresetIndex(lookIdx) && cwpPreset <= 0) {
+      baseWp += " (User)";
+    }
+    setString("baseWhitepointLabel", baseWp);
+    setString("surroundLabel", surroundNameFromIndex(tnSu));
+  }
+
+  void rebuildLookPresetMenuOptions(int preferredIndex) {
+    auto* p = fetchChoiceParam("lookPreset");
+    if (!p) return;
+    p->resetOptions();
+    for (const char* n : kLookPresetNames) p->appendOption(n);
+    int userCount = 0;
+    {
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      for (const auto& u : userPresetStore().lookPresets) p->appendOption(u.name);
+      userCount = static_cast<int>(userPresetStore().lookPresets.size());
+    }
+    const int maxIndex = kBuiltInLookPresetCount + userCount - 1;
+    const int clamped = preferredIndex < 0 ? 0 : (preferredIndex > maxIndex ? maxIndex : preferredIndex);
+    p->setValue(clamped);
+  }
+
+  void rebuildTonescalePresetMenuOptions(int preferredIndex) {
+    auto* p = fetchChoiceParam("tonescalePreset");
+    if (!p) return;
+    p->resetOptions();
+    for (const char* n : kTonescalePresetNames) p->appendOption(n);
+    int userCount = 0;
+    {
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      for (const auto& u : userPresetStore().tonescalePresets) p->appendOption(u.name);
+      userCount = static_cast<int>(userPresetStore().tonescalePresets.size());
+    }
+    const int maxIndex = kBuiltInTonescalePresetCount + userCount - 1;
+    const int clamped = preferredIndex < 0 ? 0 : (preferredIndex > maxIndex ? maxIndex : preferredIndex);
+    p->setValue(clamped);
+  }
+
+  void rebuildAllPresetMenus(int preferredLookIndex, int preferredToneIndex) {
+    menuLabelCacheInit_ = false;
+    menuLabelLookIdx_ = -1;
+    menuLabelToneIdx_ = -1;
+    menuLabelLookModified_ = false;
+    menuLabelToneModified_ = false;
+    rebuildLookPresetMenuOptions(preferredLookIndex);
+    rebuildTonescalePresetMenuOptions(preferredToneIndex);
+  }
+
+  void syncPresetMenusFromDisk(double t, int preferredLookIndex, int preferredToneIndex) {
+    int lookPreferred = preferredLookIndex;
+    int tonePreferred = preferredToneIndex;
+    {
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      reloadUserPresetStoreFromDiskLocked();
+      const int maxLook = kBuiltInLookPresetCount + static_cast<int>(userPresetStore().lookPresets.size()) - 1;
+      const int maxTone = kBuiltInTonescalePresetCount + static_cast<int>(userPresetStore().tonescalePresets.size()) - 1;
+      if (lookPreferred < 0 || lookPreferred > maxLook) lookPreferred = 0;
+      if (tonePreferred < 0 || tonePreferred > maxTone) tonePreferred = 0;
+    }
+    rebuildAllPresetMenus(lookPreferred, tonePreferred);
+    updatePresetManagerActionState(t);
+    updatePresetStateFromCurrent(t);
+    updateReadonlyDisplayLabels(t);
+  }
+
+  void updatePresetManagerActionState(double t) {
+    const int lookIdx = getChoice("lookPreset", t, 0);
+    const int toneIdx = getChoice("tonescalePreset", t, 0);
+    const bool enable = isUserLookPresetIndex(lookIdx) || isUserTonescalePresetIndex(toneIdx);
+    if (auto* p = fetchPushButtonParam("userPresetUpdateCurrent")) p->setEnabled(enable);
+    if (auto* p = fetchPushButtonParam("userPresetDeleteCurrent")) p->setEnabled(enable);
+    if (auto* p = fetchPushButtonParam("userPresetRenameCurrent")) p->setEnabled(enable);
+  }
+
   void setParamVisible(const char* name, bool visible) {
     try {
       if (auto* p = fetchDoubleParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
@@ -1487,6 +2177,11 @@ class OpenDRTEffect : public OFX::ImageEffect {
   bool vis_hc_ = false;
   bool vis_hsRgb_ = false;
   bool vis_hsCmy_ = false;
+  bool menuLabelCacheInit_ = false;
+  int menuLabelLookIdx_ = -1;
+  int menuLabelToneIdx_ = -1;
+  bool menuLabelLookModified_ = false;
+  bool menuLabelToneModified_ = false;
 };
 
 class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
@@ -1497,7 +2192,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   void unload() override {}
 
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT 1.1.0 v1.0";
+    static const std::string nameWithVersion = "ME_OpenDRT (1.1.0) v1.1";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -1524,12 +2219,11 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
 
     auto* pInput = d.definePageParam("Input");
     auto* pLook = d.definePageParam("Look");
-    auto* pTonescale = d.definePageParam("Tonescale");
     auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pOverlay = d.definePageParam("Overlay");
-    auto* pUserPresets = d.definePageParam("User Presets");
+    auto* pUserPresets = d.definePageParam("User Preset Manager");
     auto* grpUserPresetsRoot = d.defineGroupParam("grp_user_presets_root");
-    grpUserPresetsRoot->setLabel("User Presets");
+    grpUserPresetsRoot->setLabel("User Preset Manager");
     grpUserPresetsRoot->setOpen(false);
 
     auto addChoice = [&d](const char* name, const char* label, int def, const std::vector<const char*>& opts) {
@@ -1557,8 +2251,6 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
     auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
     for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
-    auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel"); baseWpLabel->setLabel("Base Whitepoint"); baseWpLabel->setDefault(baseWhitepointLabelForLook(0)); baseWpLabel->setEnabled(false);
-    auto* surroundLabel = d.defineStringParam("surroundLabel"); surroundLabel->setLabel("Selected Surround"); surroundLabel->setDefault("Dim"); surroundLabel->setEnabled(false);
     auto* presetState = d.defineIntParam("presetState"); presetState->setIsSecret(true); presetState->setDefault(0);
     auto* cwpHidden = d.defineIntParam("cwp"); cwpHidden->setIsSecret(true); cwpHidden->setDefault(2);
     auto* activeUserLookSlot = d.defineIntParam("activeUserLookSlot"); activeUserLookSlot->setIsSecret(true); activeUserLookSlot->setDefault(-1);
@@ -1567,14 +2259,18 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
     auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", 0, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
     auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", 0.25, 0.0, 1.0);
-    pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm);
+    auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel");
+    baseWpLabel->setLabel("Base Whitepoint");
+    baseWpLabel->setDefault("D65");
+    baseWpLabel->setEnabled(false);
+    auto* surroundLabel = d.defineStringParam("surroundLabel");
+    surroundLabel->setLabel("Selected Surround");
+    surroundLabel->setDefault("Dim");
+    surroundLabel->setEnabled(false);
+    pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel);
 
-    pTonescale->addChild(*addDouble("tn_Lp", "Display Peak Luminance", 100.0, 100.0, 1000.0));
-    pTonescale->addChild(*addDouble("tn_Lg", "Display Grey Luminance", 10.0, 3.0, 25.0));
-    pTonescale->addChild(*addDouble("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0));
-    pTonescale->addChild(*addDouble("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0));
-
-    auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced"); grpAdvancedRoot->setOpen(false);
+    auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
+    auto* grpDisplayMapping = d.defineGroupParam("grp_display_mapping"); grpDisplayMapping->setLabel("Display mapping"); grpDisplayMapping->setOpen(false); grpDisplayMapping->setParent(*grpAdvancedRoot);
     auto* grpTone = d.defineGroupParam("grp_tonescale"); grpTone->setLabel("Tonescale"); grpTone->setOpen(false); grpTone->setParent(*grpAdvancedRoot);
     auto* grpRender = d.defineGroupParam("grp_render"); grpRender->setLabel("Render Space"); grpRender->setOpen(false); grpRender->setParent(*grpAdvancedRoot);
     auto* grpPurity = d.defineGroupParam("grp_purity"); grpPurity->setLabel("Purity"); grpPurity->setOpen(false); grpPurity->setParent(*grpAdvancedRoot);
@@ -1587,6 +2283,10 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     auto addAdvC = [&d](const char* n, const char* l, int df, const std::vector<const char*>& o, OFX::GroupParamDescriptor* g){ auto* p=d.defineChoiceParam(n); p->setLabel(l); for(auto* s:o)p->appendOption(s); p->setDefault(df); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
 
     pAdvanced->addChild(*grpAdvancedRoot);
+    addAdvD("tn_Lp", "Display Peak Luminance", 100.0, 100.0, 1000.0, grpDisplayMapping);
+    addAdvD("tn_Lg", "Display Grey Luminance", 10.0, 3.0, 25.0, grpDisplayMapping);
+    addAdvD("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0, grpDisplayMapping);
+    addAdvD("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0, grpDisplayMapping);
 
     addAdvD("tn_con","Contrast",1.66,1.0,2.0,grpTone);
     addAdvD("tn_sh","Shoulder Clip",0.5,0.0,1.0,grpTone);
@@ -1674,69 +2374,53 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     pUserPresets->addChild(*grpUserPresetsRoot);
     pUserPresets->addChild(*userPresetName);
 
-    auto* userLookSlotSelect = d.defineChoiceParam("userLookSlotSelect");
-    userLookSlotSelect->setLabel("Look Slot");
-    userLookSlotSelect->appendOption("Slot 1");
-    userLookSlotSelect->appendOption("Slot 2");
-    userLookSlotSelect->appendOption("Slot 3");
-    userLookSlotSelect->appendOption("Slot 4");
-    userLookSlotSelect->setDefault(0);
-    userLookSlotSelect->setParent(*grpUserPresetsRoot);
-    pUserPresets->addChild(*userLookSlotSelect);
-
     auto* userLookSave = d.definePushButtonParam("userLookSave");
-    userLookSave->setLabel("Save Look To Slot");
+    userLookSave->setLabel("Save Look Preset");
     userLookSave->setParent(*grpUserPresetsRoot);
     pUserPresets->addChild(*userLookSave);
 
-    auto* userLookLoad = d.definePushButtonParam("userLookLoad");
-    userLookLoad->setLabel("Load Look From Slot");
-    userLookLoad->setParent(*grpUserPresetsRoot);
-    pUserPresets->addChild(*userLookLoad);
-
-    // Slot label params are generated from kUserLookPresetSlotCount. Increase that constant to add slots.
-    for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
-      const std::string id = "userLookSlot" + std::to_string(i + 1) + "Label";
-      const std::string label = "Look Slot " + std::to_string(i + 1) + " Name";
-      auto* p = d.defineStringParam(id);
-      p->setLabel(label);
-      p->setDefault("Empty");
-      p->setEnabled(false);
-      p->setParent(*grpUserPresetsRoot);
-      pUserPresets->addChild(*p);
-    }
-
-    auto* userToneSlotSelect = d.defineChoiceParam("userToneSlotSelect");
-    userToneSlotSelect->setLabel("Tonescale Slot");
-    userToneSlotSelect->appendOption("Slot 1");
-    userToneSlotSelect->appendOption("Slot 2");
-    userToneSlotSelect->appendOption("Slot 3");
-    userToneSlotSelect->appendOption("Slot 4");
-    userToneSlotSelect->setDefault(0);
-    userToneSlotSelect->setParent(*grpUserPresetsRoot);
-    pUserPresets->addChild(*userToneSlotSelect);
-
     auto* userTonescaleSave = d.definePushButtonParam("userTonescaleSave");
-    userTonescaleSave->setLabel("Save Tonescale To Slot");
+    userTonescaleSave->setLabel("Save Tonescale Preset");
     userTonescaleSave->setParent(*grpUserPresetsRoot);
     pUserPresets->addChild(*userTonescaleSave);
 
-    auto* userTonescaleLoad = d.definePushButtonParam("userTonescaleLoad");
-    userTonescaleLoad->setLabel("Load Tonescale From Slot");
-    userTonescaleLoad->setParent(*grpUserPresetsRoot);
-    pUserPresets->addChild(*userTonescaleLoad);
+    auto* userPresetImport = d.definePushButtonParam("userPresetImport");
+    userPresetImport->setLabel("Import Preset...");
+    userPresetImport->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetImport);
 
-    // Slot label params are generated from kUserTonescalePresetSlotCount. Increase that constant to add slots.
-    for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
-      const std::string id = "userToneSlot" + std::to_string(i + 1) + "Label";
-      const std::string label = "Tonescale Slot " + std::to_string(i + 1) + " Name";
-      auto* p = d.defineStringParam(id);
-      p->setLabel(label);
-      p->setDefault("Empty");
-      p->setEnabled(false);
-      p->setParent(*grpUserPresetsRoot);
-      pUserPresets->addChild(*p);
-    }
+    auto* userPresetExportLook = d.definePushButtonParam("userPresetExportLook");
+    userPresetExportLook->setLabel("Export Selected Look...");
+    userPresetExportLook->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetExportLook);
+
+    auto* userPresetExportTonescale = d.definePushButtonParam("userPresetExportTonescale");
+    userPresetExportTonescale->setLabel("Export Selected Tonescale...");
+    userPresetExportTonescale->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetExportTonescale);
+
+    auto* userPresetUpdateCurrent = d.definePushButtonParam("userPresetUpdateCurrent");
+    userPresetUpdateCurrent->setLabel("Update Current Preset");
+    userPresetUpdateCurrent->setEnabled(false);
+    userPresetUpdateCurrent->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetUpdateCurrent);
+
+    auto* userPresetDeleteCurrent = d.definePushButtonParam("userPresetDeleteCurrent");
+    userPresetDeleteCurrent->setLabel("Delete Current Preset");
+    userPresetDeleteCurrent->setEnabled(false);
+    userPresetDeleteCurrent->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetDeleteCurrent);
+
+    auto* userPresetRenameCurrent = d.definePushButtonParam("userPresetRenameCurrent");
+    userPresetRenameCurrent->setLabel("Rename Current Preset");
+    userPresetRenameCurrent->setEnabled(false);
+    userPresetRenameCurrent->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetRenameCurrent);
+
+    auto* userPresetRefresh = d.definePushButtonParam("userPresetRefresh");
+    userPresetRefresh->setLabel("Refresh Presets");
+    userPresetRefresh->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetRefresh);
   }
 
   OFX::ImageEffect* createInstance(OfxImageEffectHandle h, OFX::ContextEnum) override {
@@ -1750,5 +2434,20 @@ void OFX::Plugin::getPluginIDs(OFX::PluginFactoryArray& ids) {
   static OpenDRTFactory p;
   ids.push_back(&p);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
