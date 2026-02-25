@@ -138,13 +138,13 @@ inline void setBoolIfPresent(OFX::ImageEffect& fx, const char* name, bool v);
 inline void setDoubleIfPresent(OFX::ImageEffect& fx, const char* name, double v);
 inline void setStringIfPresent(OFX::ImageEffect& fx, const char* name, const std::string& v);
 
-static constexpr std::array<const char*, 7> kLookPresetNames = {
-  "Standard", "Arriba", "Sylvan", "Colorful", "Aery", "Dystopic", "Umbra"
+static constexpr std::array<const char*, 8> kLookPresetNames = {
+  "Standard", "Arriba", "Sylvan", "Colorful", "Aery", "Dystopic", "Umbra", "Base"
 };
 
-static constexpr std::array<const char*, 7> kLookBaseTonescaleNames = {
+static constexpr std::array<const char*, 8> kLookBaseTonescaleNames = {
   "Standard Tonescale", "Arriba Tonescale", "Sylvan Tonescale", "Colorful Tonescale",
-  "Aery Tonescale", "Dystopic Tonescale", "Umbra Tonescale"
+  "Aery Tonescale", "Dystopic Tonescale", "Umbra Tonescale", "Base Tonescale"
 };
 
 static constexpr std::array<const char*, 14> kTonescalePresetNames = {
@@ -159,14 +159,15 @@ static constexpr const char* kOpenDRTPortVersion = "1.1.0";
 static constexpr int kOpenDRTBuildNumber = 13;
 
 // Look preset table order must match kLookPresetNames and UI choice indices.
-static constexpr std::array<LookPresetValues, 7> kLookPresets = {{
+static constexpr std::array<LookPresetValues, 8> kLookPresets = {{
   {1.66f,0.5f,0.003f,0.005f,0,0.0f,1.0f,4.0f,0,0.0f,0.5f,2,0.25f,0.35f,0.25f,0.55f,1,0.25f,0.5f,0.0f,0.1f,0.25f,0.5f,0.0f,1,0.06f,0.08f,0.06f,1,0.4f,0.25f,0.5f,-0.8f,0.35f,0.4f,1,0.0f,-2.5f,-1.5f,-1.5f,0.5f,0.35f,1,-0.5f,-1.25f,-1.25f,-0.25f,1,1.0f,0.3f,1,0.6f,0.6f,0.35f,1.0f,0.66f,1.0f,1,0.25f,1.0f,0.0f,1.0f,0.0f,1.0f},
   {1.05f,0.5f,0.1f,0.01f,0,0.0f,1.0f,4.0f,1,1.5f,0.2f,2,0.25f,0.35f,0.25f,0.55f,1,0.25f,0.45f,0.0f,0.1f,0.25f,0.25f,0.0f,1,0.06f,0.08f,0.06f,1,1.0f,0.4f,0.5f,-0.8f,0.66f,0.6f,1,0.0f,-2.5f,-1.5f,-1.5f,0.5f,0.35f,1,0.0f,-1.7f,-2.0f,-0.5f,1,1.0f,0.3f,1,0.6f,0.8f,0.35f,1.0f,0.66f,1.0f,1,0.15f,1.0f,0.0f,1.0f,0.0f,1.0f},
   {1.6f,0.5f,0.01f,0.01f,0,0.0f,1.0f,4.0f,1,0.25f,0.75f,2,0.25f,0.25f,0.25f,0.55f,1,0.15f,0.5f,0.15f,0.1f,0.25f,0.15f,0.15f,1,0.05f,0.08f,0.05f,1,0.5f,0.5f,0.5f,-0.8f,0.5f,0.5f,1,-1.0f,-2.0f,-2.0f,0.0f,0.25f,0.25f,1,-1.0f,-0.5f,-0.25f,-0.25f,1,1.0f,0.4f,1,0.6f,1.15f,0.8f,1.25f,0.6f,1.0f,1,0.25f,0.25f,0.25f,0.5f,0.35f,0.5f},
   {1.5f,0.5f,0.003f,0.003f,0,0.0f,1.0f,4.0f,1,0.4f,0.5f,2,0.25f,0.35f,0.25f,0.55f,1,0.5f,1.0f,0.0f,0.5f,0.15f,0.15f,0.15f,1,0.05f,0.06f,0.05f,1,0.8f,0.5f,0.4f,-0.8f,0.4f,0.4f,1,0.0f,-1.25f,-1.25f,-0.25f,0.3f,0.5f,1,-0.5f,-1.25f,-1.25f,-0.5f,1,1.0f,0.4f,1,0.5f,0.8f,0.35f,1.0f,0.5f,1.0f,1,0.25f,1.0f,0.0f,1.0f,0.25f,1.0f},
   {1.15f,0.5f,0.04f,0.006f,0,0.0f,0.0f,0.5f,1,0.5f,2.0f,1,0.25f,0.25f,0.2f,0.5f,1,0.0f,0.5f,0.15f,0.1f,0.0f,0.1f,0.0f,1,0.05f,0.08f,0.05f,1,0.8f,0.35f,0.5f,-0.9f,0.5f,0.3f,1,-3.0f,0.0f,0.0f,1.0f,0.8f,0.15f,1,-1.0f,-1.0f,-1.0f,0.0f,1,0.5f,0.25f,1,0.6f,1.0f,0.35f,2.0f,0.5f,1.5f,1,0.35f,1.0f,0.25f,1.0f,0.35f,0.5f},
   {1.6f,0.5f,0.01f,0.008f,1,0.25f,0.0f,1.0f,1,1.0f,0.75f,3,0.25f,0.2f,0.25f,0.55f,1,0.15f,0.0f,0.0f,0.0f,0.0f,0.0f,0.0f,1,0.05f,0.08f,0.05f,1,0.25f,0.25f,0.8f,-0.8f,0.6f,0.25f,1,-2.0f,-2.0f,-2.0f,0.0f,0.35f,0.35f,1,0.0f,-1.0f,-1.0f,-1.0f,1,1.0f,0.25f,1,0.7f,1.33f,1.0f,2.0f,0.75f,2.0f,1,1.0f,0.5f,1.0f,1.0f,1.0f,0.765f},
-  {1.8f,0.5f,0.001f,0.015f,0,0.0f,1.0f,4.0f,1,1.0f,1.0f,5,0.25f,0.35f,0.25f,0.55f,1,0.0f,0.5f,0.0f,0.15f,0.25f,0.25f,0.0f,1,0.05f,0.06f,0.05f,1,0.4f,0.35f,0.66f,-0.6f,0.45f,0.45f,1,-2.0f,-4.5f,-3.0f,-4.0f,0.35f,0.3f,1,0.0f,-2.0f,-1.0f,-0.5f,1,1.0f,0.35f,1,0.66f,1.0f,0.5f,2.0f,0.85f,2.0f,1,0.0f,1.0f,0.25f,1.0f,0.66f,0.66f}
+  {1.8f,0.5f,0.001f,0.015f,0,0.0f,1.0f,4.0f,1,1.0f,1.0f,5,0.25f,0.35f,0.25f,0.55f,1,0.0f,0.5f,0.0f,0.15f,0.25f,0.25f,0.0f,1,0.05f,0.06f,0.05f,1,0.4f,0.35f,0.66f,-0.6f,0.45f,0.45f,1,-2.0f,-4.5f,-3.0f,-4.0f,0.35f,0.3f,1,0.0f,-2.0f,-1.0f,-0.5f,1,1.0f,0.35f,1,0.66f,1.0f,0.5f,2.0f,0.85f,2.0f,1,0.0f,1.0f,0.25f,1.0f,0.66f,0.66f},
+  {1.66f,0.5f,0.003f,0.005f,0,0.0f,1.0f,4.0f,0,0.0f,0.5f,2,0.25f,0.35f,0.25f,0.55f,1,0.5f,0.5f,0.15f,0.15f,0.8f,0.5f,0.0f,1,0.05f,0.06f,0.05f,0,0.0f,0.5f,0.5f,0.0f,0.5f,0.5f,0,0.0f,0.0f,0.0f,0.0f,0.5f,0.35f,1,-0.5f,-1.6f,-1.6f,-0.8f,0,0.0f,0.25f,0,0.0f,1.0f,0.0f,1.0f,0.0f,1.0f,0,0.0f,1.0f,0.0f,1.0f,0.0f,1.0f}
 }};
 
 // Tonescale preset table excludes index 0 ("USE LOOK PRESET"), so callers offset by -1.
@@ -226,7 +227,7 @@ inline std::string baseTonescaleLabelForLook(int presetIndex) {
 }
 
 inline std::string baseWhitepointLabelForLook(int presetIndex) {
-  const int idx = (presetIndex < 0 || presetIndex >= 7) ? 0 : presetIndex;
+  const int idx = (presetIndex < 0 || presetIndex >= static_cast<int>(kLookPresets.size())) ? 0 : presetIndex;
   const int cwp = kLookPresets[static_cast<size_t>(idx)].cwp;
   return std::string(whitepointNameFromCwp(cwp));
 }
@@ -256,7 +257,7 @@ inline const char* surroundNameFromIndex(int tn_su) {
 
 // Resolved-params mutators used by resolveParams() and paramChanged() paths.
 inline void applyLookPresetToResolved(OpenDRTParams& p, int lookPresetIndex) {
-  const int idx = (lookPresetIndex < 0 || lookPresetIndex >= 7) ? 0 : lookPresetIndex;
+  const int idx = (lookPresetIndex < 0 || lookPresetIndex >= static_cast<int>(kLookPresets.size())) ? 0 : lookPresetIndex;
   const LookPresetValues& s = kLookPresets[static_cast<size_t>(idx)];
 
   p.tn_con = s.tn_con; p.tn_sh = s.tn_sh; p.tn_toe = s.tn_toe; p.tn_off = s.tn_off;
@@ -462,7 +463,7 @@ inline void setStringIfPresent(OFX::ImageEffect& fx, const char* name, const std
 
 inline void writePresetToParams(int presetIndex, OFX::ImageEffect& fx) {
   // Preset selection is authoritative: overwrite all affected controls.
-  const int idx = (presetIndex < 0 || presetIndex >= 7) ? 0 : presetIndex;
+  const int idx = (presetIndex < 0 || presetIndex >= static_cast<int>(kLookPresets.size())) ? 0 : presetIndex;
   const LookPresetValues& s = kLookPresets[static_cast<size_t>(idx)];
 
   setDoubleIfPresent(fx, "tn_con", s.tn_con);

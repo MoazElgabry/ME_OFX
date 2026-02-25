@@ -548,7 +548,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     pInput->addChild(*inGamut); pInput->addChild(*inOetf);
 
     auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
-    auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra"});
+    auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
     auto* presetLabel = d.defineStringParam("presetLabel"); presetLabel->setLabel("Preset Label"); presetLabel->setDefault(presetLabelForClean(0)); presetLabel->setEnabled(false);
     auto* baseTsLabel = d.defineStringParam("baseTonescaleLabel"); baseTsLabel->setLabel("Base Tonescale"); baseTsLabel->setDefault(baseTonescaleLabelForLook(0)); baseTsLabel->setEnabled(false);
     auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel"); baseWpLabel->setLabel("Base Whitepoint"); baseWpLabel->setDefault(baseWhitepointLabelForLook(0)); baseWpLabel->setEnabled(false);
@@ -595,7 +595,8 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     addAdvD("rs_rw","Render Space Weight R",0.25,0.0,0.8,grpRender);
     addAdvD("rs_bw","Render Space Weight B",0.55,0.0,0.8,grpRender);
 
-    addAdvBool("pt_enable","Enable Purity Compress High",true,grpPurity);
+    auto* ptEnable = addAdvBool("pt_enable","Purity Compress High (Always On)",true,grpPurity);
+    ptEnable->setEnabled(false);
     addAdvD("pt_lml","Purity Limit Low",0.25,0.0,1.0,grpPurity);
     addAdvD("pt_lml_r","Purity Limit Low R",0.5,0.0,1.0,grpPurity);
     addAdvD("pt_lml_g","Purity Limit Low G",0.0,0.0,1.0,grpPurity);
