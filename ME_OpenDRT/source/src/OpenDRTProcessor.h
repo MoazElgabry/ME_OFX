@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <mutex>
 
 #include "OpenDRTParams.h"
 
@@ -23,6 +24,11 @@ extern "C" void launchOpenDRTKernel(
 class OpenDRTProcessor {
  public:
   explicit OpenDRTProcessor(const OpenDRTParams& params) : params_(params) {}
+  ~OpenDRTProcessor() {
+#if defined(_WIN32)
+    releaseCudaBuffers();
+#endif
+  }
 
   bool render(const float* src, float* dst, int width, int height, bool preferCuda, bool hostSupportsOpenCL) {
     // Platform-first dispatch: Metal on macOS, CUDA on Windows, then fallbacks.
@@ -44,52 +50,38 @@ class OpenDRTProcessor {
 
 #if defined(_WIN32)
   bool renderCUDA(const float* src, float* dst, int width, int height) {
+    std::lock_guard<std::mutex> lock(cudaMutex_);
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
 
     if (cudaSetDevice(0) != cudaSuccess) {
       return false;
     }
 
-    float* dSrc = nullptr;
-    float* dDst = nullptr;
-
-    if (cudaMalloc(&dSrc, bytes) != cudaSuccess) return false;
-    if (cudaMalloc(&dDst, bytes) != cudaSuccess) {
-      cudaFree(dSrc);
+    if (!ensureCudaBuffers(bytes)) {
       return false;
     }
 
-    if (cudaMemcpy(dSrc, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-      cudaFree(dSrc);
-      cudaFree(dDst);
+    if (cudaMemcpy(cudaSrc_, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
       return false;
     }
 
     // Kernel reads flat RGBA float pixels and resolved scalar params.
-    launchOpenDRTKernel(dSrc, dDst, width, height, &params_, nullptr);
+    launchOpenDRTKernel(cudaSrc_, cudaDst_, width, height, &params_, nullptr);
 
     const cudaError_t launchStatus = cudaGetLastError();
     if (launchStatus != cudaSuccess) {
-      cudaFree(dSrc);
-      cudaFree(dDst);
       return false;
     }
 
     const cudaError_t syncStatus = cudaDeviceSynchronize();
     if (syncStatus != cudaSuccess) {
-      cudaFree(dSrc);
-      cudaFree(dDst);
       return false;
     }
 
-    if (cudaMemcpy(dst, dDst, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
-      cudaFree(dSrc);
-      cudaFree(dDst);
+    if (cudaMemcpy(dst, cudaDst_, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
       return false;
     }
 
-    cudaFree(dSrc);
-    cudaFree(dDst);
     return true;
   }
 #endif
@@ -123,7 +115,44 @@ class OpenDRTProcessor {
     const cudaError_t st = cudaGetDeviceCount(&count);
     return st == cudaSuccess && count > 0;
   }
+
+  bool ensureCudaBuffers(size_t bytes) {
+    if (cudaSrc_ != nullptr && cudaDst_ != nullptr && cudaBytes_ == bytes) {
+      return true;
+    }
+    releaseCudaBuffers();
+    if (cudaMalloc(&cudaSrc_, bytes) != cudaSuccess) {
+      cudaSrc_ = nullptr;
+      return false;
+    }
+    if (cudaMalloc(&cudaDst_, bytes) != cudaSuccess) {
+      cudaFree(cudaSrc_);
+      cudaSrc_ = nullptr;
+      cudaDst_ = nullptr;
+      return false;
+    }
+    cudaBytes_ = bytes;
+    return true;
+  }
+
+  void releaseCudaBuffers() {
+    if (cudaSrc_ != nullptr) {
+      cudaFree(cudaSrc_);
+      cudaSrc_ = nullptr;
+    }
+    if (cudaDst_ != nullptr) {
+      cudaFree(cudaDst_);
+      cudaDst_ = nullptr;
+    }
+    cudaBytes_ = 0;
+  }
 #endif
 
   OpenDRTParams params_;
+#if defined(_WIN32)
+  float* cudaSrc_ = nullptr;
+  float* cudaDst_ = nullptr;
+  size_t cudaBytes_ = 0;
+  std::mutex cudaMutex_;
+#endif
 };

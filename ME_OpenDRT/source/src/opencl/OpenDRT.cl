@@ -86,7 +86,7 @@ typedef struct {
   float3 x, y, z;
 } float3x3;
 
-inline float exp10f_ocl(float x) { return pow((float)10.0f, x); }
+inline float exp10f_ocl(float x) { return exp2(x * 3.3219280948873626f); }
 inline float3x3 make_float3x3(float3 a, float3 b, float3 c) { float3x3 d; d.x=a; d.y=b; d.z=c; return d; }
 inline float3x3 identity() { return make_float3x3((float3)(1,0,0),(float3)(0,1,0),(float3)(0,0,1)); }
 inline float3 vdot(float3x3 m, float3 v) { return (float3)(dot(m.x,v), dot(m.y,v), dot(m.z,v)); }
@@ -167,7 +167,10 @@ inline float compress_toe_cubic(float x, float m, float w, int inv) {
   float x2 = x*x;
   if (inv == 0) return x*(x2 + m*w)/(x2 + w);
   float p0 = x2 - 3.0f*m*w, p1 = 2.0f*x2 + 27.0f*w - 9.0f*m*w;
-  float p2 = pow(sqrt(x2*p1*p1 - 4*p0*p0*p0)/2.0f + x*p1/2.0f, 1.0f/3.0f);
+  float radicand = fmax((float)0.0f, x2*p1*p1 - 4.0f*p0*p0*p0);
+  float base = sqrt(radicand)/2.0f + x*p1/2.0f;
+  float p2 = base <= 0.0f ? 0.0f : pow(base, 1.0f/3.0f);
+  if (p2 == 0.0f) return x;
   return p0/(3.0f*p2) + p2/3.0f + x/3.0f;
 }
 inline float softplus(float x, float s) { if (x > 10.0f*s || s < 1e-4f) return x; return s*log(fmax((float)0.0f, 1.0f + exp(x/s))); }
@@ -179,7 +182,11 @@ inline float contrast_high(float x, float p, float pv, float pv_lx, int inv) {
   if (x < x0 || p == 1.0f) return x;
   const float o = x0 - x0/p, s0 = pow(x0, 1.0f - p)/p, x1 = x0*pow(2.0f, pv_lx);
   const float k1 = p*s0*pow(x1,p)/x1, y1 = s0*pow(x1,p) + o;
-  if (inv == 1) return x > y1 ? (x - y1)/k1 + x1 : pow((x - o)/s0, 1.0f/p);
+  if (inv == 1) {
+    if (x > y1) return (x - y1)/k1 + x1;
+    float base = (x - o)/s0;
+    return base <= 0.0f ? 0.0f : pow(base, 1.0f/p);
+  }
   return x > x1 ? k1*(x - x1) + y1 : s0*pow(x,p) + o;
 }
 
@@ -304,9 +311,12 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
   }
 
   float pt_lml_p = 1.0f + 4.0f * (1.0f - tsn_pt) * (p->pt_lml + p->pt_lml_r*ha_rgb_hs.x + p->pt_lml_g*ha_rgb_hs.y + p->pt_lml_b*ha_rgb_hs.z);
-  float ptf = 1.0f - pow(tsn_pt, pt_lml_p);
-  float pt_lmh_p = (1.0f - ach_d * (p->pt_lmh_r * ha_rgb_hs.x + p->pt_lmh_b * ha_rgb_hs.z)) * (1.0f - p->pt_lmh * ach_d);
-  ptf = pow(ptf, pt_lmh_p);
+  float ptf = 1.0f;
+  if (p->pt_enable) {
+    ptf = 1.0f - pow(tsn_pt, pt_lml_p);
+    float pt_lmh_p = (1.0f - ach_d * (p->pt_lmh_r * ha_rgb_hs.x + p->pt_lmh_b * ha_rgb_hs.z)) * (1.0f - p->pt_lmh * ach_d);
+    ptf = pow(ptf, pt_lmh_p);
+  }
   if (p->ptm_enable) {
     float low = (p->ptm_low_st == 0.0f || p->ptm_low_rng == 0.0f) ? 1.0f : 1.0f + p->ptm_low * exp(-2.0f*ach_d*ach_d/p->ptm_low_st) * pow(1.0f - tsn_const, 1.0f/p->ptm_low_rng);
     float high = (p->ptm_high_st == 0.0f || p->ptm_high_rng == 0.0f) ? 1.0f : 1.0f + p->ptm_high * exp(-2.0f*ach_d*ach_d/p->ptm_high_st) * pow(tsn_pt, 1.0f/(4.0f*p->ptm_high_rng));
@@ -315,7 +325,9 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
 
   rgb = rgb * ptf + 1.0f - ptf;
   sat_L = dot(rgb, rs_w);
-  rgb = (sat_L*p->rs_sa - rgb)/(p->rs_sa - 1.0f);
+  float inv_rs_denom = p->rs_sa - 1.0f;
+  if (fabs(inv_rs_denom) < 1e-6f) inv_rs_denom = inv_rs_denom < 0.0f ? -1e-6f : 1e-6f;
+  rgb = (sat_L*p->rs_sa - rgb)/inv_rs_denom;
   rgb = display_gamut_whitepoint(rgb, tsn_const, p->cwp_lm, p->display_gamut, p->cwp);
 
   if (p->brlp_enable) {

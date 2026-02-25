@@ -20,7 +20,11 @@ struct MetalContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
+  id<MTLBuffer> srcBuffer = nil;
+  id<MTLBuffer> dstBuffer = nil;
+  size_t bufferBytes = 0;
   bool initialized = false;
+  bool initAttempted = false;
 };
 
 MetalContext& context() {
@@ -48,10 +52,10 @@ std::string metallibPath() {
 
 bool initialize() {
   auto& ctx = context();
-  if (ctx.initialized) {
+  if (ctx.initialized || ctx.initAttempted) {
     return ctx.device != nil && ctx.queue != nil && ctx.pipeline != nil;
   }
-  ctx.initialized = true;
+  ctx.initAttempted = true;
 
   ctx.device = MTLCreateSystemDefaultDevice();
   if (ctx.device == nil) return false;
@@ -60,9 +64,13 @@ bool initialize() {
   if (ctx.queue == nil) return false;
 
   // Metallib is packaged into Contents/Resources during CMake build.
-  NSString* libPath = [NSString stringWithUTF8String:metallibPath().c_str()];
+  const std::string libPathStr = metallibPath();
+  if (libPathStr.empty()) return false;
+  NSString* libPath = [NSString stringWithUTF8String:libPathStr.c_str()];
+  if (libPath == nil) return false;
   NSError* error = nil;
-  id<MTLLibrary> library = [ctx.device newLibraryWithFile:libPath error:&error];
+  NSURL* libURL = [NSURL fileURLWithPath:libPath];
+  id<MTLLibrary> library = [ctx.device newLibraryWithURL:libURL error:&error];
   if (library == nil) {
     if (error != nil) {
       NSLog(@"ME_OpenDRT Metal: failed to load metallib: %@", error.localizedDescription);
@@ -84,6 +92,7 @@ bool initialize() {
     return false;
   }
 
+  ctx.initialized = true;
   return true;
 }
 
@@ -101,16 +110,15 @@ bool render(const float* src, float* dst, int width, int height, const OpenDRTPa
 
   auto& ctx = context();
   const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
-
-  id<MTLBuffer> srcBuffer = [ctx.device newBufferWithBytes:src length:bytes options:MTLResourceStorageModeShared];
-  id<MTLBuffer> dstBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-  id<MTLBuffer> paramsBuffer = [ctx.device newBufferWithBytes:&params length:sizeof(OpenDRTParams) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> widthBuffer = [ctx.device newBufferWithBytes:&width length:sizeof(int) options:MTLResourceStorageModeShared];
-  id<MTLBuffer> heightBuffer = [ctx.device newBufferWithBytes:&height length:sizeof(int) options:MTLResourceStorageModeShared];
-
-  if (srcBuffer == nil || dstBuffer == nil || paramsBuffer == nil || widthBuffer == nil || heightBuffer == nil) {
+  if (ctx.srcBuffer == nil || ctx.dstBuffer == nil || ctx.bufferBytes != bytes) {
+    ctx.srcBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    ctx.dstBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    ctx.bufferBytes = bytes;
+  }
+  if (ctx.srcBuffer == nil || ctx.dstBuffer == nil) {
     return false;
   }
+  std::memcpy(ctx.srcBuffer.contents, src, bytes);
 
   id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
   if (cmd == nil) return false;
@@ -119,14 +127,20 @@ bool render(const float* src, float* dst, int width, int height, const OpenDRTPa
   if (enc == nil) return false;
 
   [enc setComputePipelineState:ctx.pipeline];
-  [enc setBuffer:srcBuffer offset:0 atIndex:0];
-  [enc setBuffer:dstBuffer offset:0 atIndex:1];
-  [enc setBuffer:paramsBuffer offset:0 atIndex:2];
-  [enc setBuffer:widthBuffer offset:0 atIndex:3];
-  [enc setBuffer:heightBuffer offset:0 atIndex:4];
+  [enc setBuffer:ctx.srcBuffer offset:0 atIndex:0];
+  [enc setBuffer:ctx.dstBuffer offset:0 atIndex:1];
+  [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
+  [enc setBytes:&width length:sizeof(int) atIndex:3];
+  [enc setBytes:&height length:sizeof(int) atIndex:4];
 
   // Mirrors CUDA-style 2D launch: one thread per output pixel.
-  const MTLSize threadsPerThreadgroup = MTLSizeMake(16, 16, 1);
+  NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+  NSUInteger side = 1;
+  while ((side + 1) * (side + 1) <= maxThreads) {
+    ++side;
+  }
+  side = side > 16 ? 16 : side;
+  const MTLSize threadsPerThreadgroup = MTLSizeMake(side, side, 1);
   const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
   [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
   [enc endEncoding];
@@ -141,7 +155,7 @@ bool render(const float* src, float* dst, int width, int height, const OpenDRTPa
     return false;
   }
 
-  std::memcpy(dst, dstBuffer.contents, bytes);
+  std::memcpy(dst, ctx.dstBuffer.contents, bytes);
   return true;
 }
 

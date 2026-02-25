@@ -85,16 +85,17 @@ __device__ float hypotf2(float2 v) { return sqrtf(fmaxf(0.0f, v.x * v.x + v.y * 
 __device__ float hypotf3(float3 v) { return sqrtf(fmaxf(0.0f, v.x * v.x + v.y * v.y + v.z * v.z)); }
 __device__ float3 clampf3(float3 a, float mn, float mx) { return make_float3(fminf(fmaxf(a.x, mn), mx), fminf(fmaxf(a.y, mn), mx), fminf(fmaxf(a.z, mn), mx)); }
 __device__ float3 clampminf3(float3 a, float mn) { return make_float3(fmaxf(a.x, mn), fmaxf(a.y, mn), fmaxf(a.z, mn)); }
+__device__ float exp10f_compat(float x) { return exp2f(x * 3.3219280948873626f); }
 
 __device__ float oetf_davinci_intermediate(float x) { return x <= 0.02740668f ? x / 10.44426855f : exp2f(x / 0.07329248f - 7.0f) - 0.0075f; }
 __device__ float oetf_filmlight_tlog(float x) { return x < 0.075f ? (x - 0.075f) / 16.184376489665897f : expf((x - 0.5520126568606655f) / 0.09232902596577353f) - 0.0057048244042473785f; }
 __device__ float oetf_acescct(float x) { return x <= 0.155251141552511f ? (x - 0.0729055341958355f) / 10.5402377416545f : exp2f(x * 17.52f - 9.72f); }
-__device__ float oetf_arri_logc3(float x) { return x < 5.367655f * 0.010591f + 0.092809f ? (x - 0.092809f) / 5.367655f : (exp10f((x - 0.385537f) / 0.247190f) - 0.052272f) / 5.555556f; }
+__device__ float oetf_arri_logc3(float x) { return x < 5.367655f * 0.010591f + 0.092809f ? (x - 0.092809f) / 5.367655f : (exp10f_compat((x - 0.385537f) / 0.247190f) - 0.052272f) / 5.555556f; }
 __device__ float oetf_arri_logc4(float x) { return x < -0.7774983977293537f ? x * 0.3033266726886969f - 0.7774983977293537f : (exp2f(14.0f * (x - 0.09286412512218964f) / 0.9071358748778103f + 6.0f) - 64.0f) / 2231.8263090676883f; }
-__device__ float oetf_red_log3g10(float x) { return x < 0.0f ? (x / 15.1927f) - 0.01f : (exp10f(x / 0.224282f) - 1.0f) / 155.975327f - 0.01f; }
-__device__ float oetf_panasonic_vlog(float x) { return x < 0.181f ? (x - 0.125f) / 5.6f : exp10f((x - 0.598206f) / 0.241514f) - 0.00873f; }
-__device__ float oetf_sony_slog3(float x) { return x < 171.2102946929f / 1023.0f ? (x * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f) : (exp10f(((x * 1023.0f - 420.0f) / 261.5f)) * (0.18f + 0.01f) - 0.01f); }
-__device__ float oetf_fujifilm_flog2(float x) { return x < 0.100686685370811f ? (x - 0.092864f) / 8.799461f : (exp10f(((x - 0.384316f) / 0.245281f)) / 5.555556f - 0.064829f / 5.555556f); }
+__device__ float oetf_red_log3g10(float x) { return x < 0.0f ? (x / 15.1927f) - 0.01f : (exp10f_compat(x / 0.224282f) - 1.0f) / 155.975327f - 0.01f; }
+__device__ float oetf_panasonic_vlog(float x) { return x < 0.181f ? (x - 0.125f) / 5.6f : exp10f_compat((x - 0.598206f) / 0.241514f) - 0.00873f; }
+__device__ float oetf_sony_slog3(float x) { return x < 171.2102946929f / 1023.0f ? (x * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f) : (exp10f_compat(((x * 1023.0f - 420.0f) / 261.5f)) * (0.18f + 0.01f) - 0.01f); }
+__device__ float oetf_fujifilm_flog2(float x) { return x < 0.100686685370811f ? (x - 0.092864f) / 8.799461f : (exp10f_compat(((x - 0.384316f) / 0.245281f)) / 5.555556f - 0.064829f / 5.555556f); }
 
 __device__ float3 linearize(float3 rgb, int tf) {
   if (tf == 0) return rgb;
@@ -151,7 +152,10 @@ __device__ float compress_toe_cubic(float x, float m, float w, int inv) {
   if (inv == 0) return x * (x2 + m * w) / (x2 + w);
   float p0 = x2 - 3.0f * m * w;
   float p1 = 2.0f * x2 + 27.0f * w - 9.0f * m * w;
-  float p2 = powf(sqrtf(x2 * p1 * p1 - 4 * p0 * p0 * p0) / 2.0f + x * p1 / 2.0f, 1.0f / 3.0f);
+  float radicand = fmaxf(0.0f, x2 * p1 * p1 - 4.0f * p0 * p0 * p0);
+  float base = sqrtf(radicand) / 2.0f + x * p1 / 2.0f;
+  float p2 = base <= 0.0f ? 0.0f : powf(base, 1.0f / 3.0f);
+  if (p2 == 0.0f) return x;
   return p0 / (3.0f * p2) + p2 / 3.0f + x / 3.0f;
 }
 __device__ float softplus(float x, float s) { if (x > 10.0f * s || s < 1e-4f) return x; return s * logf(fmaxf(0.0f, 1.0f + expf(x / s))); }
@@ -166,7 +170,11 @@ __device__ float contrast_high(float x, float p, float pv, float pv_lx, int inv)
   const float x1 = x0 * powf(2.0f, pv_lx);
   const float k1 = p * s0 * powf(x1, p) / x1;
   const float y1 = s0 * powf(x1, p) + o;
-  if (inv == 1) return x > y1 ? (x - y1) / k1 + x1 : powf((x - o) / s0, 1.0f / p);
+  if (inv == 1) {
+    if (x > y1) return (x - y1) / k1 + x1;
+    float base = (x - o) / s0;
+    return base <= 0.0f ? 0.0f : powf(base, 1.0f / p);
+  }
   return x > x1 ? k1 * (x - x1) + y1 : s0 * powf(x, p) + o;
 }
 
@@ -325,9 +333,12 @@ __device__ float3 openDRTTransform(int width, int height, int x, int y, float3 r
   }
 
   float pt_lml_p = 1.0f + 4.0f * (1.0f - tsn_pt) * (pt_lml + pt_lml_r * ha_rgb_hs.x + pt_lml_g * ha_rgb_hs.y + pt_lml_b * ha_rgb_hs.z);
-  float ptf = 1.0f - powf(tsn_pt, pt_lml_p);
-  float pt_lmh_p = (1.0f - ach_d * (pt_lmh_r * ha_rgb_hs.x + pt_lmh_b * ha_rgb_hs.z)) * (1.0f - pt_lmh * ach_d);
-  ptf = powf(ptf, pt_lmh_p);
+  float ptf = 1.0f;
+  if (pt_enable) {
+    ptf = 1.0f - powf(tsn_pt, pt_lml_p);
+    float pt_lmh_p = (1.0f - ach_d * (pt_lmh_r * ha_rgb_hs.x + pt_lmh_b * ha_rgb_hs.z)) * (1.0f - pt_lmh * ach_d);
+    ptf = powf(ptf, pt_lmh_p);
+  }
 
   if (ptm_enable) {
     float ptm_low_f = (ptm_low_st == 0.0f || ptm_low_rng == 0.0f) ? 1.0f : 1.0f + ptm_low * expf(-2.0f * ach_d * ach_d / ptm_low_st) * powf(1.0f - tsn_const, 1.0f / ptm_low_rng);
@@ -337,7 +348,9 @@ __device__ float3 openDRTTransform(int width, int height, int x, int y, float3 r
 
   rgb = rgb * ptf + 1.0f - ptf;
   sat_L = rgb.x * rs_w.x + rgb.y * rs_w.y + rgb.z * rs_w.z;
-  rgb = (sat_L * rs_sa - rgb) / (rs_sa - 1.0f);
+  float inv_rs_denom = rs_sa - 1.0f;
+  if (fabsf(inv_rs_denom) < 1e-6f) inv_rs_denom = inv_rs_denom < 0.0f ? -1e-6f : 1e-6f;
+  rgb = (sat_L * rs_sa - rgb) / inv_rs_denom;
   rgb = display_gamut_whitepoint(rgb, tsn_const, cwp_lm, display_gamut, cwp);
 
   if (brlp_enable) {
@@ -380,7 +393,6 @@ __device__ float3 openDRTTransform(int width, int height, int x, int y, float3 r
     crv_rgb_dst = clampf3(crv_rgb_dst, 0.0f, 1.0f);
     rgb = rgb * (1.0f - crv_rgb_dst) + make_float3(1.0f, 1.0f, 1.0f) * crv_rgb_dst;
   }
-  (void)pt_enable;
   return rgb;
 }
 
