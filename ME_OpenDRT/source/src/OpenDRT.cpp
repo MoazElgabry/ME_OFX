@@ -1,5 +1,12 @@
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <cstdio>
+#include <mutex>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +25,457 @@
 #define kPluginVersionMinor 3
 
 namespace {
+
+bool perfLogEnabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_PERF_LOG");
+    if (v == nullptr || v[0] == '\0') return false;
+    return !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+bool forceStageCopyEnabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_FORCE_STAGE_COPY");
+    if (v == nullptr || v[0] == '\0') return false;
+    return !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
+void perfLog(const char* stage, const std::chrono::steady_clock::time_point& start) {
+  if (!perfLogEnabled()) return;
+  const auto now = std::chrono::steady_clock::now();
+  const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+  std::fprintf(stderr, "[ME_OpenDRT][PERF] %s: %.3f ms\n", stage, ms);
+}
+
+constexpr int kBuiltInLookPresetCount = static_cast<int>(kLookPresetNames.size());
+// User preset slot count (look + tonescale). Update this value to add/remove slots.
+// If changed, only UI loops below should need adjustment automatically.
+constexpr int kUserLookPresetSlotCount = 4;
+constexpr int kBuiltInTonescalePresetCount = static_cast<int>(kTonescalePresetNames.size());
+constexpr int kUserTonescalePresetSlotCount = 4;
+
+struct UserLookSlot {
+  bool used = false;
+  std::string name;
+  LookPresetValues values{};
+};
+
+struct UserTonescaleSlot {
+  bool used = false;
+  std::string name;
+  TonescalePresetValues values{};
+};
+
+struct UserPresetStore {
+  bool loaded = false;
+  std::array<UserLookSlot, kUserLookPresetSlotCount> lookSlots{};
+  std::array<UserTonescaleSlot, kUserTonescalePresetSlotCount> tonescaleSlots{};
+  std::vector<int> visibleLookSlots;
+  std::vector<int> visibleTonescaleSlots;
+};
+
+UserPresetStore& userPresetStore() {
+  static UserPresetStore store;
+  return store;
+}
+
+std::mutex& userPresetMutex() {
+  static std::mutex m;
+  return m;
+}
+
+std::filesystem::path userPresetFilePath() {
+#ifdef _WIN32
+  const char* base = std::getenv("APPDATA");
+  if (!base || !*base) base = std::getenv("LOCALAPPDATA");
+  if (base && *base) {
+    return std::filesystem::path(base) / "ME_OpenDRT" / "user_presets_v1.txt";
+  }
+#else
+  const char* home = std::getenv("HOME");
+  if (home && *home) {
+    return std::filesystem::path(home) / "Library" / "Application Support" / "ME_OpenDRT" / "user_presets_v1.txt";
+  }
+#endif
+  return std::filesystem::path("ME_OpenDRT_user_presets_v1.txt");
+}
+
+std::string sanitizePresetName(const std::string& s, const char* fallback) {
+  std::string out;
+  out.reserve(s.size());
+  for (char c : s) {
+    if (c == '\n' || c == '\r' || c == '\t' || c == '|') continue;
+    out.push_back(c);
+  }
+  while (!out.empty() && out.front() == ' ') out.erase(out.begin());
+  while (!out.empty() && out.back() == ' ') out.pop_back();
+  if (out.empty()) out = fallback;
+  if (out.size() > 64) out.resize(64);
+  return out;
+}
+
+bool serializeLookValues(const LookPresetValues& v, std::string& out) {
+  std::ostringstream os;
+  os.setf(std::ios::fixed);
+  os.precision(9);
+  os << v.tn_con << ' ' << v.tn_sh << ' ' << v.tn_toe << ' ' << v.tn_off << ' '
+     << v.tn_hcon_enable << ' ' << v.tn_hcon << ' ' << v.tn_hcon_pv << ' ' << v.tn_hcon_st << ' '
+     << v.tn_lcon_enable << ' ' << v.tn_lcon << ' ' << v.tn_lcon_w << ' '
+     << v.cwp << ' ' << v.cwp_lm << ' '
+     << v.rs_sa << ' ' << v.rs_rw << ' ' << v.rs_bw << ' '
+     << v.pt_enable << ' '
+     << v.pt_lml << ' ' << v.pt_lml_r << ' ' << v.pt_lml_g << ' ' << v.pt_lml_b << ' '
+     << v.pt_lmh << ' ' << v.pt_lmh_r << ' ' << v.pt_lmh_b << ' '
+     << v.ptl_enable << ' ' << v.ptl_c << ' ' << v.ptl_m << ' ' << v.ptl_y << ' '
+     << v.ptm_enable << ' ' << v.ptm_low << ' ' << v.ptm_low_rng << ' ' << v.ptm_low_st << ' '
+     << v.ptm_high << ' ' << v.ptm_high_rng << ' ' << v.ptm_high_st << ' '
+     << v.brl_enable << ' ' << v.brl << ' ' << v.brl_r << ' ' << v.brl_g << ' ' << v.brl_b << ' '
+     << v.brl_rng << ' ' << v.brl_st << ' '
+     << v.brlp_enable << ' ' << v.brlp << ' ' << v.brlp_r << ' ' << v.brlp_g << ' ' << v.brlp_b << ' '
+     << v.hc_enable << ' ' << v.hc_r << ' ' << v.hc_r_rng << ' '
+     << v.hs_rgb_enable << ' ' << v.hs_r << ' ' << v.hs_r_rng << ' '
+     << v.hs_g << ' ' << v.hs_g_rng << ' ' << v.hs_b << ' ' << v.hs_b_rng << ' '
+     << v.hs_cmy_enable << ' ' << v.hs_c << ' ' << v.hs_c_rng << ' ' << v.hs_m << ' ' << v.hs_m_rng << ' '
+     << v.hs_y << ' ' << v.hs_y_rng;
+  out = os.str();
+  return true;
+}
+
+bool parseLookValues(const std::string& in, LookPresetValues* v) {
+  if (!v) return false;
+  std::istringstream is(in);
+  return static_cast<bool>(
+    is >> v->tn_con >> v->tn_sh >> v->tn_toe >> v->tn_off
+       >> v->tn_hcon_enable >> v->tn_hcon >> v->tn_hcon_pv >> v->tn_hcon_st
+       >> v->tn_lcon_enable >> v->tn_lcon >> v->tn_lcon_w
+       >> v->cwp >> v->cwp_lm
+       >> v->rs_sa >> v->rs_rw >> v->rs_bw
+       >> v->pt_enable
+       >> v->pt_lml >> v->pt_lml_r >> v->pt_lml_g >> v->pt_lml_b
+       >> v->pt_lmh >> v->pt_lmh_r >> v->pt_lmh_b
+       >> v->ptl_enable >> v->ptl_c >> v->ptl_m >> v->ptl_y
+       >> v->ptm_enable >> v->ptm_low >> v->ptm_low_rng >> v->ptm_low_st
+       >> v->ptm_high >> v->ptm_high_rng >> v->ptm_high_st
+       >> v->brl_enable >> v->brl >> v->brl_r >> v->brl_g >> v->brl_b
+       >> v->brl_rng >> v->brl_st
+       >> v->brlp_enable >> v->brlp >> v->brlp_r >> v->brlp_g >> v->brlp_b
+       >> v->hc_enable >> v->hc_r >> v->hc_r_rng
+       >> v->hs_rgb_enable >> v->hs_r >> v->hs_r_rng
+       >> v->hs_g >> v->hs_g_rng >> v->hs_b >> v->hs_b_rng
+       >> v->hs_cmy_enable >> v->hs_c >> v->hs_c_rng >> v->hs_m >> v->hs_m_rng
+       >> v->hs_y >> v->hs_y_rng
+  );
+}
+
+bool serializeTonescaleValues(const TonescalePresetValues& v, std::string& out) {
+  std::ostringstream os;
+  os.setf(std::ios::fixed);
+  os.precision(9);
+  os << v.tn_con << ' ' << v.tn_sh << ' ' << v.tn_toe << ' ' << v.tn_off << ' '
+     << v.tn_hcon_enable << ' ' << v.tn_hcon << ' ' << v.tn_hcon_pv << ' ' << v.tn_hcon_st << ' '
+     << v.tn_lcon_enable << ' ' << v.tn_lcon << ' ' << v.tn_lcon_w;
+  out = os.str();
+  return true;
+}
+
+bool parseTonescaleValues(const std::string& in, TonescalePresetValues* v) {
+  if (!v) return false;
+  std::istringstream is(in);
+  return static_cast<bool>(
+    is >> v->tn_con >> v->tn_sh >> v->tn_toe >> v->tn_off
+       >> v->tn_hcon_enable >> v->tn_hcon >> v->tn_hcon_pv >> v->tn_hcon_st
+       >> v->tn_lcon_enable >> v->tn_lcon >> v->tn_lcon_w
+  );
+}
+
+void saveUserPresetStoreLocked() {
+  const auto path = userPresetFilePath();
+  std::error_code ec;
+  std::filesystem::create_directories(path.parent_path(), ec);
+  std::ofstream os(path, std::ios::binary | std::ios::trunc);
+  if (!os.is_open()) return;
+  os << "ME_OPENDRT_USER_PRESETS_V1\n";
+
+  UserPresetStore& s = userPresetStore();
+  for (int i : s.visibleLookSlots) {
+    if (i < 0 || i >= kUserLookPresetSlotCount) continue;
+    if (!s.lookSlots[static_cast<size_t>(i)].used) continue;
+    std::string values;
+    serializeLookValues(s.lookSlots[static_cast<size_t>(i)].values, values);
+    os << "LOOK\t" << i << '\t' << sanitizePresetName(s.lookSlots[static_cast<size_t>(i)].name, "User Look") << '\t' << values << '\n';
+  }
+  for (int i : s.visibleTonescaleSlots) {
+    if (i < 0 || i >= kUserTonescalePresetSlotCount) continue;
+    if (!s.tonescaleSlots[static_cast<size_t>(i)].used) continue;
+    std::string values;
+    serializeTonescaleValues(s.tonescaleSlots[static_cast<size_t>(i)].values, values);
+    os << "TONE\t" << i << '\t' << sanitizePresetName(s.tonescaleSlots[static_cast<size_t>(i)].name, "User Tonescale") << '\t' << values << '\n';
+  }
+}
+
+void ensureUserPresetStoreLoadedLocked() {
+  UserPresetStore& s = userPresetStore();
+  if (s.loaded) return;
+  s = UserPresetStore{};
+  s.loaded = true;
+
+  std::ifstream is(userPresetFilePath(), std::ios::binary);
+  if (!is.is_open()) return;
+
+  std::string header;
+  std::getline(is, header);
+  if (header != "ME_OPENDRT_USER_PRESETS_V1") return;
+
+  std::string line;
+  while (std::getline(is, line)) {
+    if (line.empty()) continue;
+    const size_t p1 = line.find('\t');
+    if (p1 == std::string::npos) continue;
+    const size_t p2 = line.find('\t', p1 + 1);
+    if (p2 == std::string::npos) continue;
+    const size_t p3 = line.find('\t', p2 + 1);
+    if (p3 == std::string::npos) continue;
+
+    const std::string kind = line.substr(0, p1);
+    const int slot = std::atoi(line.substr(p1 + 1, p2 - p1 - 1).c_str());
+    const std::string name = sanitizePresetName(line.substr(p2 + 1, p3 - p2 - 1), "User Preset");
+    const std::string values = line.substr(p3 + 1);
+
+    if (kind == "LOOK" && slot >= 0 && slot < kUserLookPresetSlotCount) {
+      LookPresetValues parsed{};
+      if (parseLookValues(values, &parsed)) {
+        auto& dst = s.lookSlots[static_cast<size_t>(slot)];
+        dst.used = true;
+        dst.name = name;
+        dst.values = parsed;
+        bool exists = false;
+        for (int v : s.visibleLookSlots) if (v == slot) { exists = true; break; }
+        if (!exists) s.visibleLookSlots.push_back(slot);
+      }
+    } else if (kind == "TONE" && slot >= 0 && slot < kUserTonescalePresetSlotCount) {
+      TonescalePresetValues parsed{};
+      if (parseTonescaleValues(values, &parsed)) {
+        auto& dst = s.tonescaleSlots[static_cast<size_t>(slot)];
+        dst.used = true;
+        dst.name = name;
+        dst.values = parsed;
+        bool exists = false;
+        for (int v : s.visibleTonescaleSlots) if (v == slot) { exists = true; break; }
+        if (!exists) s.visibleTonescaleSlots.push_back(slot);
+      }
+    }
+  }
+}
+
+void rebuildVisiblePresetMapsLocked() {
+  UserPresetStore& s = userPresetStore();
+  std::vector<int> look;
+  for (int v : s.visibleLookSlots) {
+    if (v >= 0 && v < kUserLookPresetSlotCount && s.lookSlots[static_cast<size_t>(v)].used) look.push_back(v);
+  }
+  for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
+    if (!s.lookSlots[static_cast<size_t>(i)].used) continue;
+    bool exists = false;
+    for (int v : look) if (v == i) { exists = true; break; }
+    if (!exists) look.push_back(i);
+  }
+  s.visibleLookSlots = look;
+
+  std::vector<int> tone;
+  for (int v : s.visibleTonescaleSlots) {
+    if (v >= 0 && v < kUserTonescalePresetSlotCount && s.tonescaleSlots[static_cast<size_t>(v)].used) tone.push_back(v);
+  }
+  for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
+    if (!s.tonescaleSlots[static_cast<size_t>(i)].used) continue;
+    bool exists = false;
+    for (int v : tone) if (v == i) { exists = true; break; }
+    if (!exists) tone.push_back(i);
+  }
+  s.visibleTonescaleSlots = tone;
+}
+
+bool userLookSlotFromPresetIndex(int idx, int* slotOut) {
+  if (!slotOut) return false;
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  const int rel = idx - kBuiltInLookPresetCount;
+  const auto& map = userPresetStore().visibleLookSlots;
+  if (rel < 0 || rel >= static_cast<int>(map.size())) return false;
+  *slotOut = map[static_cast<size_t>(rel)];
+  return true;
+}
+
+int presetIndexFromUserLookSlot(int slot) {
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  const auto& map = userPresetStore().visibleLookSlots;
+  for (int i = 0; i < static_cast<int>(map.size()); ++i) {
+    if (map[static_cast<size_t>(i)] == slot) return kBuiltInLookPresetCount + i;
+  }
+  return -1;
+}
+
+bool isUserLookPresetIndex(int idx) {
+  int slot = -1;
+  return userLookSlotFromPresetIndex(idx, &slot);
+}
+
+bool userTonescaleSlotFromPresetIndex(int idx, int* slotOut) {
+  if (!slotOut) return false;
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  const int rel = idx - kBuiltInTonescalePresetCount;
+  const auto& map = userPresetStore().visibleTonescaleSlots;
+  if (rel < 0 || rel >= static_cast<int>(map.size())) return false;
+  *slotOut = map[static_cast<size_t>(rel)];
+  return true;
+}
+
+int presetIndexFromUserTonescaleSlot(int slot) {
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  const auto& map = userPresetStore().visibleTonescaleSlots;
+  for (int i = 0; i < static_cast<int>(map.size()); ++i) {
+    if (map[static_cast<size_t>(i)] == slot) return kBuiltInTonescalePresetCount + i;
+  }
+  return -1;
+}
+
+bool isUserTonescalePresetIndex(int idx) {
+  int slot = -1;
+  return userTonescaleSlotFromPresetIndex(idx, &slot);
+}
+
+std::vector<std::string> visibleUserLookNames() {
+  std::vector<std::string> out;
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  for (int slot : userPresetStore().visibleLookSlots) {
+    const auto& s = userPresetStore().lookSlots[static_cast<size_t>(slot)];
+    out.push_back(s.used ? s.name : ("User Look Slot " + std::to_string(slot + 1)));
+  }
+  return out;
+}
+
+std::vector<std::string> visibleUserTonescaleNames() {
+  std::vector<std::string> out;
+  std::lock_guard<std::mutex> lock(userPresetMutex());
+  ensureUserPresetStoreLoadedLocked();
+  for (int slot : userPresetStore().visibleTonescaleSlots) {
+    const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
+    out.push_back(s.used ? s.name : ("User Tonescale Slot " + std::to_string(slot + 1)));
+  }
+  return out;
+}
+
+void applyLookValuesToResolved(OpenDRTParams& p, const LookPresetValues& s) {
+  p.tn_con = s.tn_con; p.tn_sh = s.tn_sh; p.tn_toe = s.tn_toe; p.tn_off = s.tn_off;
+  p.tn_hcon_enable = s.tn_hcon_enable; p.tn_hcon = s.tn_hcon; p.tn_hcon_pv = s.tn_hcon_pv; p.tn_hcon_st = s.tn_hcon_st;
+  p.tn_lcon_enable = s.tn_lcon_enable; p.tn_lcon = s.tn_lcon; p.tn_lcon_w = s.tn_lcon_w;
+  p.cwp = s.cwp; p.cwp_lm = s.cwp_lm;
+  p.rs_sa = s.rs_sa; p.rs_rw = s.rs_rw; p.rs_bw = s.rs_bw;
+  p.pt_enable = s.pt_enable; p.pt_lml = s.pt_lml; p.pt_lml_r = s.pt_lml_r; p.pt_lml_g = s.pt_lml_g; p.pt_lml_b = s.pt_lml_b;
+  p.pt_lmh = s.pt_lmh; p.pt_lmh_r = s.pt_lmh_r; p.pt_lmh_b = s.pt_lmh_b;
+  p.ptl_enable = s.ptl_enable; p.ptl_c = s.ptl_c; p.ptl_m = s.ptl_m; p.ptl_y = s.ptl_y;
+  p.ptm_enable = s.ptm_enable; p.ptm_low = s.ptm_low; p.ptm_low_rng = s.ptm_low_rng; p.ptm_low_st = s.ptm_low_st;
+  p.ptm_high = s.ptm_high; p.ptm_high_rng = s.ptm_high_rng; p.ptm_high_st = s.ptm_high_st;
+  p.brl_enable = s.brl_enable; p.brl = s.brl; p.brl_r = s.brl_r; p.brl_g = s.brl_g; p.brl_b = s.brl_b; p.brl_rng = s.brl_rng; p.brl_st = s.brl_st;
+  p.brlp_enable = s.brlp_enable; p.brlp = s.brlp; p.brlp_r = s.brlp_r; p.brlp_g = s.brlp_g; p.brlp_b = s.brlp_b;
+  p.hc_enable = s.hc_enable; p.hc_r = s.hc_r; p.hc_r_rng = s.hc_r_rng;
+  p.hs_rgb_enable = s.hs_rgb_enable; p.hs_r = s.hs_r; p.hs_r_rng = s.hs_r_rng; p.hs_g = s.hs_g; p.hs_g_rng = s.hs_g_rng; p.hs_b = s.hs_b; p.hs_b_rng = s.hs_b_rng;
+  p.hs_cmy_enable = s.hs_cmy_enable; p.hs_c = s.hs_c; p.hs_c_rng = s.hs_c_rng; p.hs_m = s.hs_m; p.hs_m_rng = s.hs_m_rng; p.hs_y = s.hs_y; p.hs_y_rng = s.hs_y_rng;
+}
+
+void applyTonescaleValuesToResolved(OpenDRTParams& p, const TonescalePresetValues& t) {
+  p.tn_con = t.tn_con; p.tn_sh = t.tn_sh; p.tn_toe = t.tn_toe; p.tn_off = t.tn_off;
+  p.tn_hcon_enable = t.tn_hcon_enable; p.tn_hcon = t.tn_hcon; p.tn_hcon_pv = t.tn_hcon_pv; p.tn_hcon_st = t.tn_hcon_st;
+  p.tn_lcon_enable = t.tn_lcon_enable; p.tn_lcon = t.tn_lcon; p.tn_lcon_w = t.tn_lcon_w;
+}
+
+void writeLookValuesToParams(const LookPresetValues& s, OFX::ImageEffect& fx) {
+  setDoubleIfPresent(fx, "tn_con", s.tn_con);
+  setDoubleIfPresent(fx, "tn_sh", s.tn_sh);
+  setDoubleIfPresent(fx, "tn_toe", s.tn_toe);
+  setDoubleIfPresent(fx, "tn_off", s.tn_off);
+  setBoolIfPresent(fx, "tn_hcon_enable", s.tn_hcon_enable != 0);
+  setDoubleIfPresent(fx, "tn_hcon", s.tn_hcon);
+  setDoubleIfPresent(fx, "tn_hcon_pv", s.tn_hcon_pv);
+  setDoubleIfPresent(fx, "tn_hcon_st", s.tn_hcon_st);
+  setBoolIfPresent(fx, "tn_lcon_enable", s.tn_lcon_enable != 0);
+  setDoubleIfPresent(fx, "tn_lcon", s.tn_lcon);
+  setDoubleIfPresent(fx, "tn_lcon_w", s.tn_lcon_w);
+  setDoubleIfPresent(fx, "rs_sa", s.rs_sa);
+  setDoubleIfPresent(fx, "rs_rw", s.rs_rw);
+  setDoubleIfPresent(fx, "rs_bw", s.rs_bw);
+  setBoolIfPresent(fx, "pt_enable", s.pt_enable != 0);
+  setDoubleIfPresent(fx, "pt_lml", s.pt_lml);
+  setDoubleIfPresent(fx, "pt_lml_r", s.pt_lml_r);
+  setDoubleIfPresent(fx, "pt_lml_g", s.pt_lml_g);
+  setDoubleIfPresent(fx, "pt_lml_b", s.pt_lml_b);
+  setDoubleIfPresent(fx, "pt_lmh", s.pt_lmh);
+  setDoubleIfPresent(fx, "pt_lmh_r", s.pt_lmh_r);
+  setDoubleIfPresent(fx, "pt_lmh_b", s.pt_lmh_b);
+  setBoolIfPresent(fx, "ptl_enable", s.ptl_enable != 0);
+  setDoubleIfPresent(fx, "ptl_c", s.ptl_c);
+  setDoubleIfPresent(fx, "ptl_m", s.ptl_m);
+  setDoubleIfPresent(fx, "ptl_y", s.ptl_y);
+  setBoolIfPresent(fx, "ptm_enable", s.ptm_enable != 0);
+  setDoubleIfPresent(fx, "ptm_low", s.ptm_low);
+  setDoubleIfPresent(fx, "ptm_low_rng", s.ptm_low_rng);
+  setDoubleIfPresent(fx, "ptm_low_st", s.ptm_low_st);
+  setDoubleIfPresent(fx, "ptm_high", s.ptm_high);
+  setDoubleIfPresent(fx, "ptm_high_rng", s.ptm_high_rng);
+  setDoubleIfPresent(fx, "ptm_high_st", s.ptm_high_st);
+  setBoolIfPresent(fx, "brl_enable", s.brl_enable != 0);
+  setDoubleIfPresent(fx, "brl", s.brl);
+  setDoubleIfPresent(fx, "brl_r", s.brl_r);
+  setDoubleIfPresent(fx, "brl_g", s.brl_g);
+  setDoubleIfPresent(fx, "brl_b", s.brl_b);
+  setDoubleIfPresent(fx, "brl_rng", s.brl_rng);
+  setDoubleIfPresent(fx, "brl_st", s.brl_st);
+  setBoolIfPresent(fx, "brlp_enable", s.brlp_enable != 0);
+  setDoubleIfPresent(fx, "brlp", s.brlp);
+  setDoubleIfPresent(fx, "brlp_r", s.brlp_r);
+  setDoubleIfPresent(fx, "brlp_g", s.brlp_g);
+  setDoubleIfPresent(fx, "brlp_b", s.brlp_b);
+  setBoolIfPresent(fx, "hc_enable", s.hc_enable != 0);
+  setDoubleIfPresent(fx, "hc_r", s.hc_r);
+  setDoubleIfPresent(fx, "hc_r_rng", s.hc_r_rng);
+  setBoolIfPresent(fx, "hs_rgb_enable", s.hs_rgb_enable != 0);
+  setDoubleIfPresent(fx, "hs_r", s.hs_r);
+  setDoubleIfPresent(fx, "hs_r_rng", s.hs_r_rng);
+  setDoubleIfPresent(fx, "hs_g", s.hs_g);
+  setDoubleIfPresent(fx, "hs_g_rng", s.hs_g_rng);
+  setDoubleIfPresent(fx, "hs_b", s.hs_b);
+  setDoubleIfPresent(fx, "hs_b_rng", s.hs_b_rng);
+  setBoolIfPresent(fx, "hs_cmy_enable", s.hs_cmy_enable != 0);
+  setDoubleIfPresent(fx, "hs_c", s.hs_c);
+  setDoubleIfPresent(fx, "hs_c_rng", s.hs_c_rng);
+  setDoubleIfPresent(fx, "hs_m", s.hs_m);
+  setDoubleIfPresent(fx, "hs_m_rng", s.hs_m_rng);
+  setDoubleIfPresent(fx, "hs_y", s.hs_y);
+  setDoubleIfPresent(fx, "hs_y_rng", s.hs_y_rng);
+  setIntIfPresent(fx, "cwp", s.cwp);
+  setDoubleIfPresent(fx, "cwp_lm", s.cwp_lm);
+}
+
+void writeTonescaleValuesToParams(const TonescalePresetValues& t, OFX::ImageEffect& fx) {
+  setDoubleIfPresent(fx, "tn_con", t.tn_con);
+  setDoubleIfPresent(fx, "tn_sh", t.tn_sh);
+  setDoubleIfPresent(fx, "tn_toe", t.tn_toe);
+  setDoubleIfPresent(fx, "tn_off", t.tn_off);
+  setBoolIfPresent(fx, "tn_hcon_enable", t.tn_hcon_enable != 0);
+  setDoubleIfPresent(fx, "tn_hcon", t.tn_hcon);
+  setDoubleIfPresent(fx, "tn_hcon_pv", t.tn_hcon_pv);
+  setDoubleIfPresent(fx, "tn_hcon_st", t.tn_hcon_st);
+  setBoolIfPresent(fx, "tn_lcon_enable", t.tn_lcon_enable != 0);
+  setDoubleIfPresent(fx, "tn_lcon", t.tn_lcon);
+  setDoubleIfPresent(fx, "tn_lcon_w", t.tn_lcon_w);
+}
 
 const char* tooltipForParam(const std::string& name) {
   static const std::unordered_map<std::string, const char*> kTooltips = {
@@ -108,9 +566,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
       : ImageEffect(handle) {
     dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
     srcClip_ = fetchClip(kOfxImageEffectSimpleSourceClipName);
+    refreshUserSlotLabels();
+    updateToggleVisibility(0.0);
   }
 
   void render(const OFX::RenderArguments& args) override {
+    const auto tRenderStart = std::chrono::steady_clock::now();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
 
@@ -130,38 +591,111 @@ class OpenDRTEffect : public OFX::ImageEffect {
       return;
     }
 
-    std::vector<float> srcPixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0.0f);
-    std::vector<float> dstPixels(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0.0f);
-
-    for (int y = bounds.y1; y < bounds.y2; ++y) {
-      for (int x = bounds.x1; x < bounds.x2; ++x) {
-        float* sp = static_cast<float*>(src->getPixelAddress(x, y));
-        const size_t i = (static_cast<size_t>(y - bounds.y1) * static_cast<size_t>(width) + static_cast<size_t>(x - bounds.x1)) * 4u;
-        if (sp) {
-          srcPixels[i + 0] = sp[0];
-          srcPixels[i + 1] = sp[1];
-          srcPixels[i + 2] = sp[2];
-          srcPixels[i + 3] = sp[3];
-        }
+    const size_t rowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    struct RowLayout {
+      bool valid = false;
+      bool contiguous = false;
+      float* base = nullptr;
+      size_t pitchBytes = 0;
+    };
+    auto detectLayout = [&](OFX::Image* img) -> RowLayout {
+      RowLayout out{};
+      out.base = static_cast<float*>(img->getPixelAddress(bounds.x1, bounds.y1));
+      if (out.base == nullptr) return out;
+      if (height <= 1) {
+        out.valid = true;
+        out.contiguous = true;
+        out.pitchBytes = rowBytes;
+        return out;
       }
-    }
+      const char* prev = reinterpret_cast<const char*>(out.base);
+      std::ptrdiff_t step = 0;
+      for (int y = bounds.y1 + 1; y < bounds.y2; ++y) {
+        float* row = static_cast<float*>(img->getPixelAddress(bounds.x1, y));
+        if (row == nullptr) return RowLayout{};
+        const char* cur = reinterpret_cast<const char*>(row);
+        if (y == bounds.y1 + 1) {
+          step = cur - prev;
+        } else if (cur - prev != step) {
+          return RowLayout{};
+        }
+        prev = cur;
+      }
+      out.valid = true;
+      out.pitchBytes = static_cast<size_t>(step);
+      out.contiguous = (out.pitchBytes == rowBytes);
+      return out;
+    };
+    const RowLayout srcLayout = detectLayout(src.get());
+    const RowLayout dstLayout = detectLayout(dst.get());
 
+    const auto tResolveStart = std::chrono::steady_clock::now();
     OpenDRTRawValues raw = readRawValues(args.time);
     OpenDRTParams params = resolveParams(raw);
-    OpenDRTProcessor processor(params);
-    processor.render(srcPixels.data(), dstPixels.data(), width, height, true, false);
+    perfLog("Param resolve", tResolveStart);
 
-    for (int y = bounds.y1; y < bounds.y2; ++y) {
-      for (int x = bounds.x1; x < bounds.x2; ++x) {
-        float* dp = static_cast<float*>(dst->getPixelAddress(x, y));
-        if (!dp) continue;
-        const size_t i = (static_cast<size_t>(y - bounds.y1) * static_cast<size_t>(width) + static_cast<size_t>(x - bounds.x1)) * 4u;
-        dp[0] = dstPixels[i + 0];
-        dp[1] = dstPixels[i + 1];
-        dp[2] = dstPixels[i + 2];
-        dp[3] = dstPixels[i + 3];
-      }
+    if (!processor_) {
+      processor_ = std::make_unique<OpenDRTProcessor>(params);
+    } else {
+      processor_->setParams(params);
     }
+
+    bool rendered = false;
+    if (!forceStageCopyEnabled() && srcLayout.valid && dstLayout.valid) {
+      const auto tBackendDirect = std::chrono::steady_clock::now();
+      rendered = processor_->renderWithLayout(
+          srcLayout.base, dstLayout.base, width, height, srcLayout.pitchBytes, dstLayout.pitchBytes, true, false);
+      perfLog("Backend render direct", tBackendDirect);
+    }
+
+    if (!rendered) {
+      const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+      if (srcPixels_.size() != pixelCount) {
+        srcPixels_.assign(pixelCount, 0.0f);
+        dstPixels_.assign(pixelCount, 0.0f);
+      }
+
+      const auto tStageCopyStart = std::chrono::steady_clock::now();
+      if (srcLayout.valid && srcLayout.contiguous) {
+        std::memcpy(srcPixels_.data(), srcLayout.base, rowBytes * static_cast<size_t>(height));
+      } else {
+        // Row fallback for hosts with non-contiguous row layout.
+        for (int y = bounds.y1; y < bounds.y2; ++y) {
+          const int localY = y - bounds.y1;
+          float* sp = static_cast<float*>(src->getPixelAddress(bounds.x1, y));
+          float* rowDst = srcPixels_.data() + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
+          if (sp != nullptr) {
+            std::memcpy(rowDst, sp, rowBytes);
+          } else {
+            std::memset(rowDst, 0, rowBytes);
+          }
+        }
+      }
+      perfLog("Host src staging", tStageCopyStart);
+
+      const auto tBackendStart = std::chrono::steady_clock::now();
+      rendered = processor_->render(srcPixels_.data(), dstPixels_.data(), width, height, true, false);
+      perfLog("Backend render staging", tBackendStart);
+      if (!rendered) {
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+      }
+
+      const auto tDstCopyStart = std::chrono::steady_clock::now();
+      if (dstLayout.valid && dstLayout.contiguous) {
+        std::memcpy(dstLayout.base, dstPixels_.data(), rowBytes * static_cast<size_t>(height));
+      } else {
+        for (int y = bounds.y1; y < bounds.y2; ++y) {
+          const int localY = y - bounds.y1;
+          float* dp = static_cast<float*>(dst->getPixelAddress(bounds.x1, y));
+          if (!dp) continue;
+          const float* rowSrc = dstPixels_.data() + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
+          std::memcpy(dp, rowSrc, rowBytes);
+        }
+      }
+      perfLog("Host dst copy", tDstCopyStart);
+    }
+
+    perfLog("Render total", tRenderStart);
   }
 
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
@@ -173,19 +707,42 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
-      if (paramName == "presetState" || paramName == "presetLabel" ||
-          paramName == "baseTonescaleLabel" || paramName == "baseWhitepointLabel") {
+      if (paramName == "presetState" || paramName == "baseWhitepointLabel") {
         return;
       }
-      if (paramName == "surroundLabel") {
+      const bool isUserLabel =
+        ((paramName.rfind("userLookSlot", 0) == 0 || paramName.rfind("userToneSlot", 0) == 0) &&
+         paramName.find("Label") != std::string::npos);
+      if (paramName == "surroundLabel" ||
+          paramName == "activeUserLookSlot" || paramName == "activeUserToneSlot" || isUserLabel) {
         return;
       }
 
       if (paramName == "lookPreset") {
         int look = getChoice("lookPreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
-        writePresetToParams(look, *this);
-        updatePresetStateFromCurrent(args.time);
+        setChoice("tonescalePreset", 0);
+        setChoice("creativeWhitePreset", 0);
+        setInt("activeUserLookSlot", -1);
+        setInt("activeUserToneSlot", -1);
+        if (isUserLookPresetIndex(look)) {
+          int slot = -1;
+          if (!userLookSlotFromPresetIndex(look, &slot)) return;
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          const auto& userSlot = userPresetStore().lookSlots[static_cast<size_t>(slot)];
+          if (userSlot.used) {
+            writeLookValuesToParams(userSlot.values, *this);
+            setString("baseWhitepointLabel", whitepointNameFromCwp(userSlot.values.cwp));
+          } else {
+            setString("baseWhitepointLabel", "D65");
+          }
+        } else {
+          writePresetToParams(look, *this);
+        }
+        updateToggleVisibility(args.time);
+        setInt("presetState", 0);
+        setString("baseWhitepointLabel", effectiveWhitepointLabel(look, 0));
         return;
       }
 
@@ -193,8 +750,20 @@ class OpenDRTEffect : public OFX::ImageEffect {
         const int look = getChoice("lookPreset", args.time, 0);
         const int tsPreset = getChoice("tonescalePreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
-        writeTonescalePresetToParams(tsPreset, *this);
-        setString("baseTonescaleLabel", effectiveTonescaleLabel(look, tsPreset, false));
+        setInt("activeUserToneSlot", -1);
+        if (isUserTonescalePresetIndex(tsPreset)) {
+          int slot = -1;
+          if (!userTonescaleSlotFromPresetIndex(tsPreset, &slot)) return;
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          const auto& userSlot = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
+          if (userSlot.used) {
+            writeTonescaleValuesToParams(userSlot.values, *this);
+          }
+        } else {
+          writeTonescalePresetToParams(tsPreset, *this);
+        }
+        updateToggleVisibility(args.time);
         updatePresetStateFromCurrent(args.time);
         return;
       }
@@ -217,8 +786,125 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      if (paramName == "userLookSave") {
+        const int slot = getChoice("userLookSlotSelect", args.time, 0);
+        const std::string typedName = getString("userPresetName", "User Look");
+        const std::string name = sanitizePresetName(typedName, "User Look");
+        const LookPresetValues values = captureCurrentLookValues(args.time);
+        bool existed = false;
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          auto& dst = userPresetStore().lookSlots[static_cast<size_t>(slot)];
+          existed = dst.used;
+          dst.used = true;
+          dst.name = name;
+          dst.values = values;
+          rebuildVisiblePresetMapsLocked();
+          saveUserPresetStoreLocked();
+        }
+        FlagScope scope(suppressParamChanged_);
+        setInt("activeUserLookSlot", slot);
+        ensureLookSlotMenuVisible(slot, name, existed);
+        refreshUserSlotLabels();
+        const int idx = presetIndexFromUserLookSlot(slot);
+        if (idx >= 0) setChoice("lookPreset", idx);
+        writeLookValuesToParams(values, *this);
+        updateToggleVisibility(args.time);
+        updatePresetStateFromCurrent(args.time);
+        return;
+      }
+
+      if (paramName == "userLookLoad") {
+        const int slot = getChoice("userLookSlotSelect", args.time, 0);
+        bool used = false;
+        LookPresetValues values{};
+        std::string name;
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          const auto& src = userPresetStore().lookSlots[static_cast<size_t>(slot)];
+          used = src.used;
+          if (used) {
+            values = src.values;
+            name = src.name;
+          }
+        }
+        if (used) {
+          FlagScope scope(suppressParamChanged_);
+          setInt("activeUserLookSlot", slot);
+          ensureLookSlotMenuVisible(slot, name, true);
+          const int idx = presetIndexFromUserLookSlot(slot);
+          if (idx >= 0) setChoice("lookPreset", idx);
+          writeLookValuesToParams(values, *this);
+          updateToggleVisibility(args.time);
+          updatePresetStateFromCurrent(args.time);
+        }
+        return;
+      }
+
+      if (paramName == "userTonescaleSave") {
+        const int slot = getChoice("userToneSlotSelect", args.time, 0);
+        const std::string typedName = getString("userPresetName", "User Tonescale");
+        const std::string name = sanitizePresetName(typedName, "User Tonescale");
+        const TonescalePresetValues values = captureCurrentTonescaleValues(args.time);
+        bool existed = false;
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          auto& dst = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
+          existed = dst.used;
+          dst.used = true;
+          dst.name = name;
+          dst.values = values;
+          rebuildVisiblePresetMapsLocked();
+          saveUserPresetStoreLocked();
+        }
+        FlagScope scope(suppressParamChanged_);
+        setInt("activeUserToneSlot", slot);
+        ensureTonescaleSlotMenuVisible(slot, name, existed);
+        refreshUserSlotLabels();
+        const int idx = presetIndexFromUserTonescaleSlot(slot);
+        if (idx >= 0) setChoice("tonescalePreset", idx);
+        writeTonescaleValuesToParams(values, *this);
+        updateToggleVisibility(args.time);
+        updatePresetStateFromCurrent(args.time);
+        return;
+      }
+
+      if (paramName == "userTonescaleLoad") {
+        const int slot = getChoice("userToneSlotSelect", args.time, 0);
+        bool used = false;
+        TonescalePresetValues values{};
+        std::string name;
+        {
+          std::lock_guard<std::mutex> lock(userPresetMutex());
+          ensureUserPresetStoreLoadedLocked();
+          const auto& src = userPresetStore().tonescaleSlots[static_cast<size_t>(slot)];
+          used = src.used;
+          if (used) {
+            values = src.values;
+            name = src.name;
+          }
+        }
+        if (used) {
+          FlagScope scope(suppressParamChanged_);
+          setInt("activeUserToneSlot", slot);
+          ensureTonescaleSlotMenuVisible(slot, name, true);
+          const int idx = presetIndexFromUserTonescaleSlot(slot);
+          if (idx >= 0) setChoice("tonescalePreset", idx);
+          writeTonescaleValuesToParams(values, *this);
+          updateToggleVisibility(args.time);
+          updatePresetStateFromCurrent(args.time);
+        }
+        return;
+      }
+
       if (isAdvancedParam(paramName)) {
         FlagScope scope(suppressParamChanged_);
+        if (isVisibilityToggleParam(paramName)) {
+          updateToggleVisibility(args.time);
+        }
         if (paramName == "tn_su") setString("surroundLabel", surroundNameFromIndex(getChoice("tn_su", args.time, 1)));
         updatePresetStateFromCurrent(args.time);
       }
@@ -261,8 +947,140 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return false;
   }
 
+  bool isVisibilityToggleParam(const std::string& name) const {
+    static const std::vector<std::string> names = {
+      "tn_hcon_enable","tn_lcon_enable",
+      "ptl_enable","ptm_enable",
+      "brl_enable","brlp_enable",
+      "hc_enable","hs_rgb_enable","hs_cmy_enable"
+    };
+    for (const auto& n : names) if (n == name) return true;
+    return false;
+  }
+
   bool almostEqual(float a, float b, float eps = 1e-6f) const {
     return std::fabs(a - b) <= eps;
+  }
+
+  std::string lookPresetDisplayName(int lookPresetIndex) const {
+    if (!isUserLookPresetIndex(lookPresetIndex)) {
+      return currentPresetName(lookPresetIndex);
+    }
+    int slot = -1;
+    if (!userLookSlotFromPresetIndex(lookPresetIndex, &slot)) return std::string("Unknown User Look");
+    std::lock_guard<std::mutex> lock(userPresetMutex());
+    ensureUserPresetStoreLoadedLocked();
+    const auto& s = userPresetStore().lookSlots[static_cast<size_t>(slot)];
+    if (s.used && !s.name.empty()) return s.name;
+    return std::string("User Look Slot ") + std::to_string(slot + 1);
+  }
+
+  std::string presetLabelCleanForLook(int lookPresetIndex) const {
+    return lookPresetDisplayName(lookPresetIndex) + " | " + buildLabelText();
+  }
+
+  std::string presetLabelCustomForLook(int lookPresetIndex) const {
+    return std::string("Custom (") + lookPresetDisplayName(lookPresetIndex) + ") | " + buildLabelText();
+  }
+
+  TonescalePresetValues captureCurrentTonescaleValues(double time) const {
+    TonescalePresetValues t{};
+    t.tn_con = getDouble("tn_con", time, 1.66f);
+    t.tn_sh = getDouble("tn_sh", time, 0.5f);
+    t.tn_toe = getDouble("tn_toe", time, 0.003f);
+    t.tn_off = getDouble("tn_off", time, 0.005f);
+    t.tn_hcon_enable = getBool("tn_hcon_enable", time, 0);
+    t.tn_hcon = getDouble("tn_hcon", time, 0.0f);
+    t.tn_hcon_pv = getDouble("tn_hcon_pv", time, 1.0f);
+    t.tn_hcon_st = getDouble("tn_hcon_st", time, 4.0f);
+    t.tn_lcon_enable = getBool("tn_lcon_enable", time, 0);
+    t.tn_lcon = getDouble("tn_lcon", time, 0.0f);
+    t.tn_lcon_w = getDouble("tn_lcon_w", time, 0.5f);
+    return t;
+  }
+
+  LookPresetValues captureCurrentLookValues(double time) const {
+    LookPresetValues v{};
+    v.tn_con = getDouble("tn_con", time, 1.66f);
+    v.tn_sh = getDouble("tn_sh", time, 0.5f);
+    v.tn_toe = getDouble("tn_toe", time, 0.003f);
+    v.tn_off = getDouble("tn_off", time, 0.005f);
+    v.tn_hcon_enable = getBool("tn_hcon_enable", time, 0);
+    v.tn_hcon = getDouble("tn_hcon", time, 0.0f);
+    v.tn_hcon_pv = getDouble("tn_hcon_pv", time, 1.0f);
+    v.tn_hcon_st = getDouble("tn_hcon_st", time, 4.0f);
+    v.tn_lcon_enable = getBool("tn_lcon_enable", time, 0);
+    v.tn_lcon = getDouble("tn_lcon", time, 0.0f);
+    v.tn_lcon_w = getDouble("tn_lcon_w", time, 0.5f);
+    v.cwp = getInt("cwp", time, 2);
+    v.cwp_lm = getDouble("cwp_lm", time, 0.25f);
+    v.rs_sa = getDouble("rs_sa", time, 0.35f);
+    v.rs_rw = getDouble("rs_rw", time, 0.25f);
+    v.rs_bw = getDouble("rs_bw", time, 0.55f);
+    v.pt_enable = getBool("pt_enable", time, 1);
+    v.pt_lml = getDouble("pt_lml", time, 0.25f);
+    v.pt_lml_r = getDouble("pt_lml_r", time, 0.5f);
+    v.pt_lml_g = getDouble("pt_lml_g", time, 0.0f);
+    v.pt_lml_b = getDouble("pt_lml_b", time, 0.1f);
+    v.pt_lmh = getDouble("pt_lmh", time, 0.25f);
+    v.pt_lmh_r = getDouble("pt_lmh_r", time, 0.5f);
+    v.pt_lmh_b = getDouble("pt_lmh_b", time, 0.0f);
+    v.ptl_enable = getBool("ptl_enable", time, 1);
+    v.ptl_c = getDouble("ptl_c", time, 0.06f);
+    v.ptl_m = getDouble("ptl_m", time, 0.08f);
+    v.ptl_y = getDouble("ptl_y", time, 0.06f);
+    v.ptm_enable = getBool("ptm_enable", time, 1);
+    v.ptm_low = getDouble("ptm_low", time, 0.4f);
+    v.ptm_low_rng = getDouble("ptm_low_rng", time, 0.25f);
+    v.ptm_low_st = getDouble("ptm_low_st", time, 0.5f);
+    v.ptm_high = getDouble("ptm_high", time, -0.8f);
+    v.ptm_high_rng = getDouble("ptm_high_rng", time, 0.35f);
+    v.ptm_high_st = getDouble("ptm_high_st", time, 0.4f);
+    v.brl_enable = getBool("brl_enable", time, 1);
+    v.brl = getDouble("brl", time, 0.0f);
+    v.brl_r = getDouble("brl_r", time, -2.5f);
+    v.brl_g = getDouble("brl_g", time, -1.5f);
+    v.brl_b = getDouble("brl_b", time, -1.5f);
+    v.brl_rng = getDouble("brl_rng", time, 0.5f);
+    v.brl_st = getDouble("brl_st", time, 0.35f);
+    v.brlp_enable = getBool("brlp_enable", time, 1);
+    v.brlp = getDouble("brlp", time, -0.5f);
+    v.brlp_r = getDouble("brlp_r", time, -1.25f);
+    v.brlp_g = getDouble("brlp_g", time, -1.25f);
+    v.brlp_b = getDouble("brlp_b", time, -0.25f);
+    v.hc_enable = getBool("hc_enable", time, 1);
+    v.hc_r = getDouble("hc_r", time, 1.0f);
+    v.hc_r_rng = getDouble("hc_r_rng", time, 0.3f);
+    v.hs_rgb_enable = getBool("hs_rgb_enable", time, 1);
+    v.hs_r = getDouble("hs_r", time, 0.6f);
+    v.hs_r_rng = getDouble("hs_r_rng", time, 0.6f);
+    v.hs_g = getDouble("hs_g", time, 0.35f);
+    v.hs_g_rng = getDouble("hs_g_rng", time, 1.0f);
+    v.hs_b = getDouble("hs_b", time, 0.66f);
+    v.hs_b_rng = getDouble("hs_b_rng", time, 1.0f);
+    v.hs_cmy_enable = getBool("hs_cmy_enable", time, 1);
+    v.hs_c = getDouble("hs_c", time, 0.25f);
+    v.hs_c_rng = getDouble("hs_c_rng", time, 1.0f);
+    v.hs_m = getDouble("hs_m", time, 0.0f);
+    v.hs_m_rng = getDouble("hs_m_rng", time, 1.0f);
+    v.hs_y = getDouble("hs_y", time, 0.0f);
+    v.hs_y_rng = getDouble("hs_y_rng", time, 1.0f);
+    return v;
+  }
+
+  void refreshUserSlotLabels() {
+    std::lock_guard<std::mutex> lock(userPresetMutex());
+    ensureUserPresetStoreLoadedLocked();
+    for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
+      const auto& s = userPresetStore().lookSlots[static_cast<size_t>(i)];
+      const std::string fallback = std::string("Empty");
+      setString(("userLookSlot" + std::to_string(i + 1) + "Label").c_str(), s.used ? s.name : fallback);
+    }
+    for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
+      const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(i)];
+      const std::string fallback = std::string("Empty");
+      setString(("userToneSlot" + std::to_string(i + 1) + "Label").c_str(), s.used ? s.name : fallback);
+    }
   }
 
   bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
@@ -270,10 +1088,30 @@ class OpenDRTEffect : public OFX::ImageEffect {
     const int tsPreset = getChoice("tonescalePreset", time, 0);
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
     const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
+    const int activeUserLookSlot = getInt("activeUserLookSlot", time, -1);
+    const int activeUserToneSlot = getInt("activeUserToneSlot", time, -1);
 
     OpenDRTParams expected{};
-    applyLookPresetToResolved(expected, look);
-    applyTonescalePresetToResolved(expected, tsPreset);
+    if (activeUserLookSlot >= 0 && activeUserLookSlot < kUserLookPresetSlotCount) {
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      const auto& s = userPresetStore().lookSlots[static_cast<size_t>(activeUserLookSlot)];
+      if (!s.used) return false;
+      applyLookValuesToResolved(expected, s.values);
+    } else {
+      applyLookPresetToResolved(expected, look);
+    }
+
+    if (activeUserToneSlot >= 0 && activeUserToneSlot < kUserTonescalePresetSlotCount) {
+      std::lock_guard<std::mutex> lock(userPresetMutex());
+      ensureUserPresetStoreLoadedLocked();
+      const auto& s = userPresetStore().tonescaleSlots[static_cast<size_t>(activeUserToneSlot)];
+      if (!s.used) return false;
+      applyTonescaleValuesToResolved(expected, s.values);
+    } else {
+      applyTonescalePresetToResolved(expected, tsPreset);
+    }
+
     applyDisplayEncodingPreset(expected, displayPreset);
     if (cwpPreset > 0) expected.cwp = cwpPreset - 1;
 
@@ -356,11 +1194,24 @@ class OpenDRTEffect : public OFX::ImageEffect {
   void updatePresetStateFromCurrent(double time) {
     const int look = getChoice("lookPreset", time, 0);
     const int tsPreset = getChoice("tonescalePreset", time, 0);
+    const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
+    const int activeUserLookSlot = getInt("activeUserLookSlot", time, -1);
+    const int activeUserToneSlot = getInt("activeUserToneSlot", time, -1);
     bool tonescaleClean = true;
     const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean);
     setInt("presetState", clean ? 0 : 1);
-    setString("presetLabel", clean ? presetLabelForClean(look) : presetLabelForCustom(look));
-    setString("baseTonescaleLabel", effectiveTonescaleLabel(look, tsPreset, !tonescaleClean));
+    (void)activeUserToneSlot;
+    (void)tonescaleClean;
+    if (activeUserLookSlot >= 0 && activeUserLookSlot < kUserLookPresetSlotCount) {
+      {
+        std::lock_guard<std::mutex> lock(userPresetMutex());
+        ensureUserPresetStoreLoadedLocked();
+        const auto& s = userPresetStore().lookSlots[static_cast<size_t>(activeUserLookSlot)];
+        if (s.used) setString("baseWhitepointLabel", whitepointNameFromCwp(s.values.cwp));
+      }
+    } else {
+      setString("baseWhitepointLabel", effectiveWhitepointLabel(look, cwpPreset));
+    }
   }
 
   int getChoice(const char* name, double t, int def) const {
@@ -382,6 +1233,145 @@ class OpenDRTEffect : public OFX::ImageEffect {
   float getDouble(const char* name, double t, float def) const {
     if (auto* p = fetchDoubleParam(name)) return static_cast<float>(p->getValueAtTime(t));
     return def;
+  }
+  std::string getString(const char* name, const std::string& def) const {
+    if (auto* p = fetchStringParam(name)) {
+      std::string v = def;
+      p->getValue(v);
+      return v;
+    }
+    return def;
+  }
+  void setChoice(const char* name, int v) {
+    if (auto* p = fetchChoiceParam(name)) p->setValue(v);
+  }
+  void ensureLookSlotMenuVisible(int slot, const std::string& name, bool existed) {
+    if (slot < 0 || slot >= kUserLookPresetSlotCount) return;
+    const int idx = presetIndexFromUserLookSlot(slot);
+    if (auto* p = fetchChoiceParam("lookPreset")) {
+      if (idx >= 0 && existed) p->setOption(idx, name);
+      else p->appendOption(name);
+    }
+  }
+  void ensureTonescaleSlotMenuVisible(int slot, const std::string& name, bool existed) {
+    if (slot < 0 || slot >= kUserTonescalePresetSlotCount) return;
+    const int idx = presetIndexFromUserTonescaleSlot(slot);
+    if (auto* p = fetchChoiceParam("tonescalePreset")) {
+      if (idx >= 0 && existed) p->setOption(idx, name);
+      else p->appendOption(name);
+    }
+  }
+  void setParamVisible(const char* name, bool visible) {
+    try {
+      if (auto* p = fetchDoubleParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
+      if (auto* p = fetchBooleanParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
+      if (auto* p = fetchChoiceParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
+      if (auto* p = fetchIntParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
+      if (auto* p = fetchStringParam(name)) { p->setIsSecret(!visible); p->setEnabled(visible); return; }
+    } catch (...) {
+    }
+  }
+  void updateToggleVisibility(double t) {
+    const bool hcon = getBool("tn_hcon_enable", t, 0) != 0;
+    const bool lcon = getBool("tn_lcon_enable", t, 0) != 0;
+    const bool ptl = getBool("ptl_enable", t, 1) != 0;
+    const bool ptm = getBool("ptm_enable", t, 1) != 0;
+    const bool brl = getBool("brl_enable", t, 1) != 0;
+    const bool brlp = getBool("brlp_enable", t, 1) != 0;
+    const bool hc = getBool("hc_enable", t, 1) != 0;
+    const bool hsRgb = getBool("hs_rgb_enable", t, 1) != 0;
+    const bool hsCmy = getBool("hs_cmy_enable", t, 1) != 0;
+
+    if (visibilityCacheInit_ &&
+        hcon == vis_hcon_ &&
+        lcon == vis_lcon_ &&
+        ptl == vis_ptl_ &&
+        ptm == vis_ptm_ &&
+        brl == vis_brl_ &&
+        brlp == vis_brlp_ &&
+        hc == vis_hc_ &&
+        hsRgb == vis_hsRgb_ &&
+        hsCmy == vis_hsCmy_) {
+      return;
+    }
+
+    const bool applyHcon = !visibilityCacheInit_ || hcon != vis_hcon_;
+    const bool applyLcon = !visibilityCacheInit_ || lcon != vis_lcon_;
+    const bool applyPtl = !visibilityCacheInit_ || ptl != vis_ptl_;
+    const bool applyPtm = !visibilityCacheInit_ || ptm != vis_ptm_;
+    const bool applyBrl = !visibilityCacheInit_ || brl != vis_brl_;
+    const bool applyBrlp = !visibilityCacheInit_ || brlp != vis_brlp_;
+    const bool applyHc = !visibilityCacheInit_ || hc != vis_hc_;
+    const bool applyHsRgb = !visibilityCacheInit_ || hsRgb != vis_hsRgb_;
+    const bool applyHsCmy = !visibilityCacheInit_ || hsCmy != vis_hsCmy_;
+
+    if (applyHcon) {
+      setParamVisible("tn_hcon", hcon);
+      setParamVisible("tn_hcon_pv", hcon);
+      setParamVisible("tn_hcon_st", hcon);
+    }
+    if (applyLcon) {
+      setParamVisible("tn_lcon", lcon);
+      setParamVisible("tn_lcon_w", lcon);
+    }
+    if (applyPtl) {
+      setParamVisible("ptl_c", ptl);
+      setParamVisible("ptl_m", ptl);
+      setParamVisible("ptl_y", ptl);
+    }
+    if (applyPtm) {
+      setParamVisible("ptm_low", ptm);
+      setParamVisible("ptm_low_rng", ptm);
+      setParamVisible("ptm_low_st", ptm);
+      setParamVisible("ptm_high", ptm);
+      setParamVisible("ptm_high_rng", ptm);
+      setParamVisible("ptm_high_st", ptm);
+    }
+    if (applyBrl) {
+      setParamVisible("brl", brl);
+      setParamVisible("brl_r", brl);
+      setParamVisible("brl_g", brl);
+      setParamVisible("brl_b", brl);
+      setParamVisible("brl_rng", brl);
+      setParamVisible("brl_st", brl);
+    }
+    if (applyBrlp) {
+      setParamVisible("brlp", brlp);
+      setParamVisible("brlp_r", brlp);
+      setParamVisible("brlp_g", brlp);
+      setParamVisible("brlp_b", brlp);
+    }
+    if (applyHc) {
+      setParamVisible("hc_r", hc);
+      setParamVisible("hc_r_rng", hc);
+    }
+    if (applyHsRgb) {
+      setParamVisible("hs_r", hsRgb);
+      setParamVisible("hs_r_rng", hsRgb);
+      setParamVisible("hs_g", hsRgb);
+      setParamVisible("hs_g_rng", hsRgb);
+      setParamVisible("hs_b", hsRgb);
+      setParamVisible("hs_b_rng", hsRgb);
+    }
+    if (applyHsCmy) {
+      setParamVisible("hs_c", hsCmy);
+      setParamVisible("hs_c_rng", hsCmy);
+      setParamVisible("hs_m", hsCmy);
+      setParamVisible("hs_m_rng", hsCmy);
+      setParamVisible("hs_y", hsCmy);
+      setParamVisible("hs_y_rng", hsCmy);
+    }
+
+    vis_hcon_ = hcon;
+    vis_lcon_ = lcon;
+    vis_ptl_ = ptl;
+    vis_ptm_ = ptm;
+    vis_brl_ = brl;
+    vis_brlp_ = brlp;
+    vis_hc_ = hc;
+    vis_hsRgb_ = hsRgb;
+    vis_hsCmy_ = hsCmy;
+    visibilityCacheInit_ = true;
   }
   void setInt(const char* name, int v) {
     if (auto* p = fetchIntParam(name)) p->setValue(v);
@@ -483,7 +1473,20 @@ class OpenDRTEffect : public OFX::ImageEffect {
 
   OFX::Clip* dstClip_ = nullptr;
   OFX::Clip* srcClip_ = nullptr;
+  std::unique_ptr<OpenDRTProcessor> processor_;
+  std::vector<float> srcPixels_;
+  std::vector<float> dstPixels_;
   bool suppressParamChanged_ = false;
+  bool visibilityCacheInit_ = false;
+  bool vis_hcon_ = false;
+  bool vis_lcon_ = false;
+  bool vis_ptl_ = false;
+  bool vis_ptm_ = false;
+  bool vis_brl_ = false;
+  bool vis_brlp_ = false;
+  bool vis_hc_ = false;
+  bool vis_hsRgb_ = false;
+  bool vis_hsCmy_ = false;
 };
 
 class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
@@ -522,8 +1525,12 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     auto* pInput = d.definePageParam("Input");
     auto* pLook = d.definePageParam("Look");
     auto* pTonescale = d.definePageParam("Tonescale");
-    auto* pAdvanced = d.definePageParam("Advanced");
+    auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pOverlay = d.definePageParam("Overlay");
+    auto* pUserPresets = d.definePageParam("User Presets");
+    auto* grpUserPresetsRoot = d.defineGroupParam("grp_user_presets_root");
+    grpUserPresetsRoot->setLabel("User Presets");
+    grpUserPresetsRoot->setOpen(false);
 
     auto addChoice = [&d](const char* name, const char* label, int def, const std::vector<const char*>& opts) {
       auto* p = d.defineChoiceParam(name);
@@ -549,16 +1556,18 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
 
     auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
     auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
-    auto* presetLabel = d.defineStringParam("presetLabel"); presetLabel->setLabel("Preset Label"); presetLabel->setDefault(presetLabelForClean(0)); presetLabel->setEnabled(false);
-    auto* baseTsLabel = d.defineStringParam("baseTonescaleLabel"); baseTsLabel->setLabel("Base Tonescale"); baseTsLabel->setDefault(baseTonescaleLabelForLook(0)); baseTsLabel->setEnabled(false);
+    for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
     auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel"); baseWpLabel->setLabel("Base Whitepoint"); baseWpLabel->setDefault(baseWhitepointLabelForLook(0)); baseWpLabel->setEnabled(false);
     auto* surroundLabel = d.defineStringParam("surroundLabel"); surroundLabel->setLabel("Selected Surround"); surroundLabel->setDefault("Dim"); surroundLabel->setEnabled(false);
     auto* presetState = d.defineIntParam("presetState"); presetState->setIsSecret(true); presetState->setDefault(0);
     auto* cwpHidden = d.defineIntParam("cwp"); cwpHidden->setIsSecret(true); cwpHidden->setDefault(2);
+    auto* activeUserLookSlot = d.defineIntParam("activeUserLookSlot"); activeUserLookSlot->setIsSecret(true); activeUserLookSlot->setDefault(-1);
+    auto* activeUserToneSlot = d.defineIntParam("activeUserToneSlot"); activeUserToneSlot->setIsSecret(true); activeUserToneSlot->setDefault(-1);
     auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", 0, {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
+    for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
     auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", 0, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
     auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", 0.25, 0.0, 1.0);
-    pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*presetLabel); pLook->addChild(*baseTsLabel); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm);
+    pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm);
 
     pTonescale->addChild(*addDouble("tn_Lp", "Display Peak Luminance", 100.0, 100.0, 1000.0));
     pTonescale->addChild(*addDouble("tn_Lg", "Display Grey Luminance", 10.0, 3.0, 25.0));
@@ -634,17 +1643,17 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     addAdvD("hc_r_rng","Hue Contrast R Range",0.3,0.0,1.0,grpHue);
     addAdvBool("hs_rgb_enable","Enable Hueshift RGB",true,grpHue);
     addAdvD("hs_r","Hueshift R",0.6,0.0,1.0,grpHue);
-    addAdvD("hs_r_rng","Hueshift R Range",0.6,0.0,2.0,grpHue);
     addAdvD("hs_g","Hueshift G",0.35,0.0,1.0,grpHue);
-    addAdvD("hs_g_rng","Hueshift G Range",1.0,0.0,2.0,grpHue);
     addAdvD("hs_b","Hueshift B",0.66,0.0,1.0,grpHue);
+    addAdvD("hs_r_rng","Hueshift R Range",0.6,0.0,2.0,grpHue);
+    addAdvD("hs_g_rng","Hueshift G Range",1.0,0.0,2.0,grpHue);
     addAdvD("hs_b_rng","Hueshift B Range",1.0,0.0,4.0,grpHue);
     addAdvBool("hs_cmy_enable","Enable Hueshift CMY",true,grpHue);
     addAdvD("hs_c","Hueshift C",0.25,0.0,1.0,grpHue);
-    addAdvD("hs_c_rng","Hueshift C Range",1.0,0.0,1.0,grpHue);
     addAdvD("hs_m","Hueshift M",0.0,0.0,1.0,grpHue);
-    addAdvD("hs_m_rng","Hueshift M Range",1.0,0.0,1.0,grpHue);
     addAdvD("hs_y","Hueshift Y",0.0,0.0,1.0,grpHue);
+    addAdvD("hs_c_rng","Hueshift C Range",1.0,0.0,1.0,grpHue);
+    addAdvD("hs_m_rng","Hueshift M Range",1.0,0.0,1.0,grpHue);
     addAdvD("hs_y_rng","Hueshift Y Range",1.0,0.0,1.0,grpHue);
 
     addAdvBool("clamp","Clamp",true,grpDisplay);
@@ -657,6 +1666,77 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     overlay->setDefault(false);
     if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
     pOverlay->addChild(*overlay);
+
+    auto* userPresetName = d.defineStringParam("userPresetName");
+    userPresetName->setLabel("User Preset Name");
+    userPresetName->setDefault("");
+    userPresetName->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userPresetName);
+
+    auto* userLookSlotSelect = d.defineChoiceParam("userLookSlotSelect");
+    userLookSlotSelect->setLabel("Look Slot");
+    userLookSlotSelect->appendOption("Slot 1");
+    userLookSlotSelect->appendOption("Slot 2");
+    userLookSlotSelect->appendOption("Slot 3");
+    userLookSlotSelect->appendOption("Slot 4");
+    userLookSlotSelect->setDefault(0);
+    userLookSlotSelect->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userLookSlotSelect);
+
+    auto* userLookSave = d.definePushButtonParam("userLookSave");
+    userLookSave->setLabel("Save Look To Slot");
+    userLookSave->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userLookSave);
+
+    auto* userLookLoad = d.definePushButtonParam("userLookLoad");
+    userLookLoad->setLabel("Load Look From Slot");
+    userLookLoad->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userLookLoad);
+
+    // Slot label params are generated from kUserLookPresetSlotCount. Increase that constant to add slots.
+    for (int i = 0; i < kUserLookPresetSlotCount; ++i) {
+      const std::string id = "userLookSlot" + std::to_string(i + 1) + "Label";
+      const std::string label = "Look Slot " + std::to_string(i + 1) + " Name";
+      auto* p = d.defineStringParam(id);
+      p->setLabel(label);
+      p->setDefault("Empty");
+      p->setEnabled(false);
+      p->setParent(*grpUserPresetsRoot);
+      pUserPresets->addChild(*p);
+    }
+
+    auto* userToneSlotSelect = d.defineChoiceParam("userToneSlotSelect");
+    userToneSlotSelect->setLabel("Tonescale Slot");
+    userToneSlotSelect->appendOption("Slot 1");
+    userToneSlotSelect->appendOption("Slot 2");
+    userToneSlotSelect->appendOption("Slot 3");
+    userToneSlotSelect->appendOption("Slot 4");
+    userToneSlotSelect->setDefault(0);
+    userToneSlotSelect->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userToneSlotSelect);
+
+    auto* userTonescaleSave = d.definePushButtonParam("userTonescaleSave");
+    userTonescaleSave->setLabel("Save Tonescale To Slot");
+    userTonescaleSave->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userTonescaleSave);
+
+    auto* userTonescaleLoad = d.definePushButtonParam("userTonescaleLoad");
+    userTonescaleLoad->setLabel("Load Tonescale From Slot");
+    userTonescaleLoad->setParent(*grpUserPresetsRoot);
+    pUserPresets->addChild(*userTonescaleLoad);
+
+    // Slot label params are generated from kUserTonescalePresetSlotCount. Increase that constant to add slots.
+    for (int i = 0; i < kUserTonescalePresetSlotCount; ++i) {
+      const std::string id = "userToneSlot" + std::to_string(i + 1) + "Label";
+      const std::string label = "Tonescale Slot " + std::to_string(i + 1) + " Name";
+      auto* p = d.defineStringParam(id);
+      p->setLabel(label);
+      p->setDefault("Empty");
+      p->setEnabled(false);
+      p->setParent(*grpUserPresetsRoot);
+      pUserPresets->addChild(*p);
+    }
   }
 
   OFX::ImageEffect* createInstance(OfxImageEffectHandle h, OFX::ContextEnum) override {

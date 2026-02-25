@@ -83,6 +83,24 @@ typedef struct {
 } OpenDRTParams;
 
 typedef struct {
+  int enabled;
+  float ts_x1;
+  float ts_y1;
+  float ts_x0;
+  float ts_y0;
+  float ts_s0;
+  float ts_p;
+  float ts_s10;
+  float ts_m1;
+  float ts_m2;
+  float ts_s;
+  float ts_dsc;
+  float pt_cmp_Lf;
+  float s_Lp100;
+  float ts_s1;
+} OpenDRTDerivedParams;
+
+typedef struct {
   float3 x, y, z;
 } float3x3;
 

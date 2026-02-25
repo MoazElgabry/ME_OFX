@@ -214,7 +214,8 @@ inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int 
 }
 
 // Core OpenDRT per-pixel transform. Input/output are display-agnostic RGB ratios + tonescale.
-inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, constant OpenDRTParams& p) {
+inline float3 openDRTTransform(
+    int width, int height, int x, int y, float3 rgb, constant OpenDRTParams& p, constant OpenDRTDerivedParams& d) {
   int in_gamut = p.in_gamut, in_oetf = p.in_oetf, crv_enable = p.crv_enable, tn_hcon_enable = p.tn_hcon_enable, tn_lcon_enable = p.tn_lcon_enable;
   int pt_enable = p.pt_enable, ptl_enable = p.ptl_enable, ptm_enable = p.ptm_enable, brl_enable = p.brl_enable, brlp_enable = p.brlp_enable, hc_enable = p.hc_enable, hs_rgb_enable = p.hs_rgb_enable, hs_cmy_enable = p.hs_cmy_enable;
   int cwp = p.cwp, tn_su = p.tn_su, clamp = p.clamp, display_gamut = p.display_gamut, eotf = p.eotf;
@@ -250,11 +251,38 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
   if (crv_enable == 1) crv_tsn = oetf_filmlight_tlog(pos.x / res.x);
   rgb = linearize(rgb, in_oetf);
 
-  const float ts_x1 = pow(2.0f, 6.0f * tn_sh + 4.0f), ts_y1 = tn_Lp / 100.0f, ts_x0 = 0.18f + tn_off;
-  const float ts_y0 = tn_Lg / 100.0f * (1.0f + tn_gb * log2(ts_y1)), ts_s0 = compress_toe_quadratic(ts_y0, tn_toe, 1), ts_p = tn_con / (1.0f + (float)tn_su * 0.05f);
-  const float ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / tn_con) - 1.0f), ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), tn_con), ts_m2 = compress_toe_quadratic(ts_m1, tn_toe, 1);
-  const float ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / tn_con) - 1.0f), ts_dsc = eotf == 4 ? 0.01f : eotf == 5 ? 0.1f : 100.0f / tn_Lp;
-  const float pt_cmp_Lf = pt_hdr * fmin(1.0f, (tn_Lp - 100.0f) / 900.0f), s_Lp100 = ts_x0 * (pow((tn_Lg / 100.0f), -1.0f / tn_con) - 1.0f), ts_s1 = ts_s * pt_cmp_Lf + s_Lp100 * (1.0f - pt_cmp_Lf);
+  float ts_x1, ts_y1, ts_x0, ts_y0, ts_s0, ts_p, ts_s10, ts_m1, ts_m2, ts_s, ts_dsc, pt_cmp_Lf, s_Lp100, ts_s1;
+  if (d.enabled != 0) {
+    ts_x1 = d.ts_x1;
+    ts_y1 = d.ts_y1;
+    ts_x0 = d.ts_x0;
+    ts_y0 = d.ts_y0;
+    ts_s0 = d.ts_s0;
+    ts_p = d.ts_p;
+    ts_s10 = d.ts_s10;
+    ts_m1 = d.ts_m1;
+    ts_m2 = d.ts_m2;
+    ts_s = d.ts_s;
+    ts_dsc = d.ts_dsc;
+    pt_cmp_Lf = d.pt_cmp_Lf;
+    s_Lp100 = d.s_Lp100;
+    ts_s1 = d.ts_s1;
+  } else {
+    ts_x1 = pow(2.0f, 6.0f * tn_sh + 4.0f);
+    ts_y1 = tn_Lp / 100.0f;
+    ts_x0 = 0.18f + tn_off;
+    ts_y0 = tn_Lg / 100.0f * (1.0f + tn_gb * log2(ts_y1));
+    ts_s0 = compress_toe_quadratic(ts_y0, tn_toe, 1);
+    ts_p = tn_con / (1.0f + (float)tn_su * 0.05f);
+    ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / tn_con) - 1.0f);
+    ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), tn_con);
+    ts_m2 = compress_toe_quadratic(ts_m1, tn_toe, 1);
+    ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / tn_con) - 1.0f);
+    ts_dsc = eotf == 4 ? 0.01f : eotf == 5 ? 0.1f : 100.0f / tn_Lp;
+    pt_cmp_Lf = pt_hdr * fmin(1.0f, (tn_Lp - 100.0f) / 900.0f);
+    s_Lp100 = ts_x0 * (pow((tn_Lg / 100.0f), -1.0f / tn_con) - 1.0f);
+    ts_s1 = ts_s * pt_cmp_Lf + s_Lp100 * (1.0f - pt_cmp_Lf);
+  }
 
   rgb = vdot(matrix_xyz_to_p3d65, vdot(in_to_xyz, rgb));
   float3 rs_w = make_float3(rs_rw, 1.0f - rs_rw - rs_bw, rs_bw);
@@ -389,6 +417,7 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
 kernel void OpenDRTKernel(device const float* src [[buffer(0)]],
                           device float* dst [[buffer(1)]],
                           constant OpenDRTParams& p [[buffer(2)]],
+                          constant OpenDRTDerivedParams& d [[buffer(5)]],
                           constant int& width [[buffer(3)]],
                           constant int& height [[buffer(4)]],
                           uint2 gid [[thread_position_in_grid]]) {
@@ -398,7 +427,7 @@ kernel void OpenDRTKernel(device const float* src [[buffer(0)]],
   if (x >= width || y >= height) return;
   const int i = (y * width + x) * 4;
   float3 rgb = make_float3(src[i + 0], src[i + 1], src[i + 2]);
-  rgb = openDRTTransform(width, height, x, y, rgb, p);
+  rgb = openDRTTransform(width, height, x, y, rgb, p, d);
   dst[i + 0] = rgb.x;
   dst[i + 1] = rgb.y;
   dst[i + 2] = rgb.z;

@@ -3,6 +3,9 @@
 
 #include <dlfcn.h>
 #include <cstddef>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -20,16 +23,68 @@ struct MetalContext {
   id<MTLDevice> device = nil;
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
+  std::mutex initMutex;
+  bool initialized = false;
+  bool initAttempted = false;
+};
+
+struct ThreadBuffers {
   id<MTLBuffer> srcBuffer = nil;
   id<MTLBuffer> dstBuffer = nil;
   size_t bufferBytes = 0;
-  bool initialized = false;
-  bool initAttempted = false;
 };
 
 MetalContext& context() {
   static MetalContext ctx;
   return ctx;
+}
+
+ThreadBuffers& threadBuffers() {
+  thread_local ThreadBuffers buffers;
+  return buffers;
+}
+
+std::mutex& legacyRenderMutex() {
+  static std::mutex m;
+  return m;
+}
+
+bool envFlagEnabled(const char* name) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return false;
+  return !(v[0] == '0' && v[1] == '\0');
+}
+
+bool perfLogEnabled() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_PERF_LOG");
+  return enabled;
+}
+
+bool debugLogEnabled() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_DEBUG_LOG");
+  return enabled;
+}
+
+bool shouldSerializeRender() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_METAL_SERIALIZE");
+  return enabled;
+}
+
+bool disableMetal2DCopy() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_DISABLE_METAL_2D_COPY");
+  return enabled;
+}
+
+void debugLog(const char* msg) {
+  if (!debugLogEnabled()) return;
+  std::fprintf(stderr, "[ME_OpenDRT][Metal] %s\n", msg);
+}
+
+void perfLogStage(const char* stage, const std::chrono::steady_clock::time_point& start) {
+  if (!perfLogEnabled()) return;
+  const auto now = std::chrono::steady_clock::now();
+  const double ms = std::chrono::duration<double, std::milli>(now - start).count();
+  std::fprintf(stderr, "[ME_OpenDRT][PERF][Metal] %s: %.3f ms\n", stage, ms);
 }
 
 std::string moduleDirectory() {
@@ -52,8 +107,12 @@ std::string metallibPath() {
 
 bool initialize() {
   auto& ctx = context();
-  if (ctx.initialized || ctx.initAttempted) {
-    return ctx.device != nil && ctx.queue != nil && ctx.pipeline != nil;
+  std::lock_guard<std::mutex> lock(ctx.initMutex);
+  if (ctx.initialized) {
+    return true;
+  }
+  if (ctx.initAttempted) {
+    return false;
   }
   ctx.initAttempted = true;
 
@@ -100,47 +159,96 @@ bool initialize() {
 
 namespace OpenDRTMetal {
 
-bool render(const float* src, float* dst, int width, int height, const OpenDRTParams& params) {
-  static std::mutex m;
-  // Keep this path serialized for stability while iterating on host integration.
-  std::lock_guard<std::mutex> lock(m);
-
+static bool renderImpl(
+    const float* src,
+    float* dst,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    const OpenDRTParams& params,
+    const OpenDRTDerivedParams& derived) {
+  const auto tStart = std::chrono::steady_clock::now();
   if (src == nullptr || dst == nullptr || width <= 0 || height <= 0) return false;
-  if (!initialize()) return false;
-
-  auto& ctx = context();
-  const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
-  if (ctx.srcBuffer == nil || ctx.dstBuffer == nil || ctx.bufferBytes != bytes) {
-    ctx.srcBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    ctx.dstBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-    ctx.bufferBytes = bytes;
-  }
-  if (ctx.srcBuffer == nil || ctx.dstBuffer == nil) {
+  if (!initialize()) {
+    debugLog("Initialization failed.");
     return false;
   }
-  std::memcpy(ctx.srcBuffer.contents, src, bytes);
 
+  auto& ctx = context();
+  auto& buffers = threadBuffers();
+  const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
+  const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+  const bool packedSrc = (srcRowBytes == packedRowBytes);
+  const bool packedDst = (dstRowBytes == packedRowBytes);
+  const auto tCopyInStart = std::chrono::steady_clock::now();
+  if (buffers.srcBuffer == nil || buffers.dstBuffer == nil || buffers.bufferBytes != bytes) {
+    buffers.srcBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    buffers.dstBuffer = [ctx.device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+    buffers.bufferBytes = bytes;
+  }
+  if (buffers.srcBuffer == nil || buffers.dstBuffer == nil) {
+    debugLog("Thread-local Metal buffer allocation failed.");
+    return false;
+  }
+  if (packedSrc) {
+    std::memcpy(buffers.srcBuffer.contents, src, bytes);
+  } else {
+    if (disableMetal2DCopy()) return false;
+    char* dstBase = static_cast<char*>(buffers.srcBuffer.contents);
+    const char* srcBase = reinterpret_cast<const char*>(src);
+    for (int y = 0; y < height; ++y) {
+      std::memcpy(dstBase + static_cast<size_t>(y) * packedRowBytes, srcBase + static_cast<size_t>(y) * srcRowBytes, packedRowBytes);
+    }
+  }
+  perfLogStage("Host->Metal staging", tCopyInStart);
+
+  const auto tGpuStart = std::chrono::steady_clock::now();
   id<MTLCommandBuffer> cmd = [ctx.queue commandBuffer];
-  if (cmd == nil) return false;
+  if (cmd == nil) {
+    debugLog("Failed to create command buffer.");
+    return false;
+  }
 
   id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-  if (enc == nil) return false;
+  if (enc == nil) {
+    debugLog("Failed to create compute encoder.");
+    return false;
+  }
 
   [enc setComputePipelineState:ctx.pipeline];
-  [enc setBuffer:ctx.srcBuffer offset:0 atIndex:0];
-  [enc setBuffer:ctx.dstBuffer offset:0 atIndex:1];
+  [enc setBuffer:buffers.srcBuffer offset:0 atIndex:0];
+  [enc setBuffer:buffers.dstBuffer offset:0 atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
   [enc setBytes:&width length:sizeof(int) atIndex:3];
   [enc setBytes:&height length:sizeof(int) atIndex:4];
+  [enc setBytes:&derived length:sizeof(OpenDRTDerivedParams) atIndex:5];
 
   // Mirrors CUDA-style 2D launch: one thread per output pixel.
-  NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
-  NSUInteger side = 1;
-  while ((side + 1) * (side + 1) <= maxThreads) {
-    ++side;
-  }
-  side = side > 16 ? 16 : side;
-  const MTLSize threadsPerThreadgroup = MTLSizeMake(side, side, 1);
+  auto chooseThreadsPerThreadgroup = [&]() -> MTLSize {
+    const char* env = std::getenv("ME_OPENDRT_METAL_BLOCK");
+    if (env != nullptr && env[0] != '\0') {
+      int bx = 0;
+      int by = 0;
+      if (std::sscanf(env, "%dx%d", &bx, &by) == 2 && bx > 0 && by > 0) {
+        const NSUInteger ux = static_cast<NSUInteger>(bx);
+        const NSUInteger uy = static_cast<NSUInteger>(by);
+        const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+        if (ux * uy <= maxThreads) {
+          return MTLSizeMake(ux, uy, 1);
+        }
+      }
+    }
+    const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+    const NSUInteger tew = ctx.pipeline.threadExecutionWidth;
+    NSUInteger tx = tew > 0 ? tew : 16;
+    if (tx > maxThreads) tx = maxThreads;
+    NSUInteger ty = maxThreads / tx;
+    if (ty == 0) ty = 1;
+    if (ty > 16) ty = 16;
+    return MTLSizeMake(tx, ty, 1);
+  };
+  const MTLSize threadsPerThreadgroup = chooseThreadsPerThreadgroup();
   const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
   [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
   [enc endEncoding];
@@ -152,11 +260,41 @@ bool render(const float* src, float* dst, int width, int height, const OpenDRTPa
     if (cmd.error != nil) {
       NSLog(@"ME_OpenDRT Metal: command buffer failed: %@", cmd.error.localizedDescription);
     }
+    debugLog("Command buffer failed.");
     return false;
   }
 
-  std::memcpy(dst, ctx.dstBuffer.contents, bytes);
+  const auto tCopyOutStart = std::chrono::steady_clock::now();
+  if (packedDst) {
+    std::memcpy(dst, buffers.dstBuffer.contents, bytes);
+  } else {
+    if (disableMetal2DCopy()) return false;
+    const char* srcBase = static_cast<const char*>(buffers.dstBuffer.contents);
+    char* dstBase = reinterpret_cast<char*>(dst);
+    for (int y = 0; y < height; ++y) {
+      std::memcpy(dstBase + static_cast<size_t>(y) * dstRowBytes, srcBase + static_cast<size_t>(y) * packedRowBytes, packedRowBytes);
+    }
+  }
+  perfLogStage("Metal GPU submit+wait", tGpuStart);
+  perfLogStage("Metal->Host copy", tCopyOutStart);
+  perfLogStage("Metal total", tStart);
   return true;
+}
+
+bool render(
+    const float* src,
+    float* dst,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    const OpenDRTParams& params,
+    const OpenDRTDerivedParams& derived) {
+  if (shouldSerializeRender()) {
+    std::lock_guard<std::mutex> lock(legacyRenderMutex());
+    return renderImpl(src, dst, width, height, srcRowBytes, dstRowBytes, params, derived);
+  }
+  return renderImpl(src, dst, width, height, srcRowBytes, dstRowBytes, params, derived);
 }
 
 }  // namespace OpenDRTMetal

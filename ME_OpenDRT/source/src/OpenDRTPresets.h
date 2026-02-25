@@ -156,7 +156,7 @@ static constexpr std::array<const char*, 14> kTonescalePresetNames = {
 };
 
 static constexpr const char* kOpenDRTPortVersion = "1.1.0";
-static constexpr int kOpenDRTBuildNumber = 13;
+static constexpr int kOpenDRTBuildNumber = 16;
 
 // Look preset table order must match kLookPresetNames and UI choice indices.
 static constexpr std::array<LookPresetValues, 8> kLookPresets = {{

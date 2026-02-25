@@ -83,3 +83,21 @@ struct OpenDRTParams {
   int clamp;
   float cwp_lm;
 };
+
+struct OpenDRTDerivedParams {
+  int enabled;
+  float ts_x1;
+  float ts_y1;
+  float ts_x0;
+  float ts_y0;
+  float ts_s0;
+  float ts_p;
+  float ts_s10;
+  float ts_m1;
+  float ts_m2;
+  float ts_s;
+  float ts_dsc;
+  float pt_cmp_Lf;
+  float s_Lp100;
+  float ts_s1;
+};
