@@ -19,7 +19,7 @@
 #include "OpenDRTProcessor.h"
 
 #define kPluginName "ME_OpenDRT"
-#define kPluginGrouping "Color"
+#define kPluginGrouping "Moaz Elgabry"
 #define kPluginDescription "OpenDRT v1.1.0 by Jed Smith, ported to OFX by Moaz ELgabry"
 #define kPluginIdentifier "com.moazelgabry.me_opendrt"
 #define kPluginVersionMajor 1
@@ -55,6 +55,8 @@ void perfLog(const char* stage, const std::chrono::steady_clock::time_point& sta
 constexpr int kBuiltInLookPresetCount = static_cast<int>(kLookPresetNames.size());
 constexpr int kBuiltInTonescalePresetCount = static_cast<int>(kTonescalePresetNames.size());
 
+// User preset records persisted to presets_v2.json.
+// These are host-side settings only and never used in the render kernel hot path.
 struct UserLookPreset {
   std::string id;
   std::string name;
@@ -77,6 +79,8 @@ struct UserPresetStore {
   std::vector<UserTonescalePreset> tonescalePresets;
 };
 
+// Global in-memory preset cache.
+// Access is synchronized by userPresetMutex() for all load/save/update paths.
 UserPresetStore& userPresetStore() {
   static UserPresetStore store;
   return store;
@@ -182,6 +186,8 @@ std::string jsonUnescape(const std::string& in) {
   return out;
 }
 
+// Resolve user-level preset location.
+// Keep path logic centralized so save/import/refresh always resolve consistently.
 std::filesystem::path userPresetDirPath() {
 #ifdef _WIN32
   const char* base = std::getenv("APPDATA");
@@ -212,6 +218,7 @@ enum class DeleteTarget {
 #define NOMINMAX
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>
 
 std::string pickOpenJsonFilePath() {
   char filePath[MAX_PATH] = {0};
@@ -266,6 +273,11 @@ DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
   if (result == IDNO) return DeleteTarget::Tonescale;
   return DeleteTarget::Cancel;
 }
+
+bool openExternalUrl(const std::string& url) {
+  const HINSTANCE rc = ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+  return reinterpret_cast<intptr_t>(rc) > 32;
+}
 #else
 std::string execAndRead(const std::string& cmd) {
   std::string out;
@@ -312,8 +324,20 @@ DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
   if (out == (action + " Tonescale")) return DeleteTarget::Tonescale;
   return DeleteTarget::Cancel;
 }
+
+bool openExternalUrl(const std::string& url) {
+  if (url.empty()) return false;
+  std::string safe = url;
+  for (char& c : safe) {
+    if (c == '"') c = '\'';
+  }
+  std::string cmd = "open \"" + safe + "\" >/dev/null 2>&1";
+  return std::system(cmd.c_str()) == 0;
+}
 #endif
 
+// Compact payload serialization keeps files small and load fast.
+// Field ordering is versioned-by-convention and should remain stable.
 bool serializeLookValues(const LookPresetValues& v, std::string& out) {
   std::ostringstream os;
   os.setf(std::ios::fixed);
@@ -448,6 +472,7 @@ void saveUserPresetStoreLocked() {
   os << "}\n";
 }
 
+// One-time compatibility migration from legacy v1 format when v2 does not exist.
 void migrateLegacyV1IfNeededLocked() {
   const auto v2 = userPresetFilePathV2();
   if (std::filesystem::exists(v2)) return;
@@ -501,6 +526,8 @@ void migrateLegacyV1IfNeededLocked() {
   saveUserPresetStoreLocked();
 }
 
+// Lazy-load the v2 file into memory.
+// Callers must hold userPresetMutex() before calling this helper.
 void ensureUserPresetStoreLoadedLocked() {
   UserPresetStore& s = userPresetStore();
   if (s.loaded) return;
@@ -866,6 +893,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updateReadonlyDisplayLabels(0.0);
   }
 
+  // Main render callback.
+  // Rule: keep preset/file management out of this path for predictable playback.
   void render(const OFX::RenderArguments& args) override {
     const auto tRenderStart = std::chrono::steady_clock::now();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
@@ -894,6 +923,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       float* base = nullptr;
       size_t pitchBytes = 0;
     };
+    // Detect host row layout so we can use the direct path when rows are contiguous.
     auto detectLayout = [&](OFX::Image* img) -> RowLayout {
       RowLayout out{};
       out.base = static_cast<float*>(img->getPixelAddress(bounds.x1, bounds.y1));
@@ -937,6 +967,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     }
 
     bool rendered = false;
+    // Fast path: process directly on host image memory layout (no extra staging vectors).
     if (!forceStageCopyEnabled() && srcLayout.valid && dstLayout.valid) {
       const auto tBackendDirect = std::chrono::steady_clock::now();
       rendered = processor_->renderWithLayout(
@@ -944,6 +975,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       perfLog("Backend render direct", tBackendDirect);
     }
 
+    // Fallback path: stable staged copy used for irregular host layouts.
     if (!rendered) {
       const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
       if (srcPixels_.size() != pixelCount) {
@@ -994,6 +1026,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
     perfLog("Render total", tRenderStart);
   }
 
+  // UI/param callback entry point.
+  // Keep this deterministic: mutate params/state, then refresh dependent UI labels/states.
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
     try {
       if (suppressParamChanged_) {
@@ -1010,6 +1044,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // Look preset selection is authoritative: it resets linked preset selectors and applies full look values.
       if (paramName == "lookPreset") {
         int look = getChoice("lookPreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
@@ -1035,6 +1070,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // Tonescale preset can be independent, or inherit from currently selected look when index 0 is chosen.
       if (paramName == "tonescalePreset") {
         const int tsPreset = getChoice("tonescalePreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
@@ -1079,6 +1115,22 @@ class OpenDRTEffect : public OFX::ImageEffect {
         writeDisplayPresetToParams(preset, *this);
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        return;
+      }
+
+      // Support actions are side-effect free for grading state.
+      if (paramName == "supportParametersGuide") {
+        (void)openExternalUrl("https://github.com/jedypod/open-display-transform/blob/main/display-transforms/opendrt/docs/opendrt-parameters.md");
+        return;
+      }
+
+      if (paramName == "supportLatestReleases") {
+        (void)openExternalUrl("https://github.com/MoazElgabry/ME_OFX/releases");
+        return;
+      }
+
+      if (paramName == "supportReportIssue") {
+        (void)openExternalUrl("https://github.com/MoazElgabry/ME_OFX/issues");
         return;
       }
 
@@ -1916,6 +1968,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
   }
 
   void rebuildAllPresetMenus(int preferredLookIndex, int preferredToneIndex) {
+    // Reset cached "(Modified)" menu label state whenever options are rebuilt.
     menuLabelCacheInit_ = false;
     menuLabelLookIdx_ = -1;
     menuLabelToneIdx_ = -1;
@@ -1925,6 +1978,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
     rebuildTonescalePresetMenuOptions(preferredToneIndex);
   }
 
+  // Source-of-truth menu refresh:
+  // reload disk store, clamp selection indices, rebuild both menus, then refresh dependent UI state.
   void syncPresetMenusFromDisk(double t, int preferredLookIndex, int preferredToneIndex) {
     int lookPreferred = preferredLookIndex;
     int tonePreferred = preferredToneIndex;
@@ -1942,6 +1997,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updateReadonlyDisplayLabels(t);
   }
 
+  // Manager actions are enabled only when current look or tonescale points to a user preset.
   void updatePresetManagerActionState(double t) {
     const int lookIdx = getChoice("lookPreset", t, 0);
     const int toneIdx = getChoice("tonescalePreset", t, 0);
@@ -1961,6 +2017,9 @@ class OpenDRTEffect : public OFX::ImageEffect {
     } catch (...) {
     }
   }
+
+  // Advanced toggle visibility updater.
+  // Uses a small cache to avoid calling setIsSecret/setEnabled unless a driving toggle changed.
   void updateToggleVisibility(double t) {
     const bool hcon = getBool("tn_hcon_enable", t, 0) != 0;
     const bool lcon = getBool("tn_lcon_enable", t, 0) != 0;
@@ -2192,7 +2251,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   void unload() override {}
 
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT (1.1.0) v1.1";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.1";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -2421,6 +2480,43 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     userPresetRefresh->setLabel("Refresh Presets");
     userPresetRefresh->setParent(*grpUserPresetsRoot);
     pUserPresets->addChild(*userPresetRefresh);
+
+    auto* pSupport = d.definePageParam("Support");
+    pSupport->setLabel("Support");
+    auto* grpSupportRoot = d.defineGroupParam("grp_support_root");
+    grpSupportRoot->setLabel("Support");
+    grpSupportRoot->setOpen(false);
+    pSupport->addChild(*grpSupportRoot);
+
+    auto* supportParametersGuide = d.definePushButtonParam("supportParametersGuide");
+    supportParametersGuide->setLabel("Parameters Guide");
+    supportParametersGuide->setParent(*grpSupportRoot);
+    pSupport->addChild(*supportParametersGuide);
+
+    auto* supportLatestReleases = d.definePushButtonParam("supportLatestReleases");
+    supportLatestReleases->setLabel("Latest Releases");
+    supportLatestReleases->setParent(*grpSupportRoot);
+    pSupport->addChild(*supportLatestReleases);
+
+    auto* supportReportIssue = d.definePushButtonParam("supportReportIssue");
+    supportReportIssue->setLabel("Report an Issue");
+    supportReportIssue->setParent(*grpSupportRoot);
+    pSupport->addChild(*supportReportIssue);
+
+    // Keep version labels at the bottom of the Support tab for quick reference.
+    auto* supportPortedVersion = d.defineStringParam("supportPortedVersion");
+    supportPortedVersion->setLabel("Ported from version");
+    supportPortedVersion->setDefault("V1.1.0");
+    supportPortedVersion->setEnabled(false);
+    supportPortedVersion->setParent(*grpSupportRoot);
+    pSupport->addChild(*supportPortedVersion);
+
+    auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
+    supportOfxVersion->setLabel("OFX version");
+    supportOfxVersion->setDefault("V 1.1.0");
+    supportOfxVersion->setEnabled(false);
+    supportOfxVersion->setParent(*grpSupportRoot);
+    pSupport->addChild(*supportOfxVersion);
   }
 
   OFX::ImageEffect* createInstance(OfxImageEffectHandle h, OFX::ContextEnum) override {
