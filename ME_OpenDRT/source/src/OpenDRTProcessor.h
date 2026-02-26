@@ -6,11 +6,18 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "OpenDRTParams.h"
 
 #if defined(_WIN32)
+#define NOMINMAX
+#include <windows.h>
+#define CL_TARGET_OPENCL_VERSION 120
+#include <CL/cl.h>
 #include <cuda_runtime.h>
 extern "C" void launchOpenDRTKernel(
     const float* src,
@@ -34,6 +41,7 @@ class OpenDRTProcessor {
 #if defined(_WIN32)
     releaseCudaStream();
     releaseCudaBuffers();
+    releaseOpenCL();
 #endif
   }
 
@@ -51,8 +59,13 @@ class OpenDRTProcessor {
       size_t dstRowBytes,
       bool preferCuda,
       bool hostSupportsOpenCL) {
+    (void)hostSupportsOpenCL;
+    // Derived values are computed once per frame on host and consumed by all backends.
+    // This is a parity + performance guardrail (avoid per-pixel recompute drift).
     computeDerivedParams();
-    // Platform-first dispatch: Metal on macOS, CUDA on Windows, then fallbacks.
+    // Backend dispatch policy:
+    // - macOS: Metal first, then CPU fallback.
+    // - Windows: CUDA first (unless forced OpenCL), then OpenCL, then CPU fallback.
 #if defined(__APPLE__)
     if (renderMetal(src, dst, width, height, srcRowBytes, dstRowBytes)) {
       return true;
@@ -60,23 +73,23 @@ class OpenDRTProcessor {
     debugLog("Metal path failed, falling back.");
 #endif
 #if defined(_WIN32)
-    if (preferCuda && cudaAvailableCached()) {
-      if (renderCUDA(src, dst, width, height, srcRowBytes, dstRowBytes)) {
-        return true;
-      }
+    const bool forceOpenCL = openclForceEnabled_;
+    if (!forceOpenCL && preferCuda && cudaAvailableCached()) {
+      if (renderCUDA(src, dst, width, height, srcRowBytes, dstRowBytes)) return true;
       debugLog("CUDA path failed, falling back.");
     }
-#endif
-    if (hostSupportsOpenCL && renderOpenCL(src, dst, width, height)) {
-      return true;
-    }
-    if (hostSupportsOpenCL) {
+    if (!openclDisableEnabled_ && openclAvailableCached()) {
+      if (renderOpenCL(src, dst, width, height, srcRowBytes, dstRowBytes)) return true;
       debugLog("OpenCL path failed, falling back to CPU.");
     }
+#endif
+    // Last-resort correctness fallback; should never crash the host.
     return renderCPU(src, dst, width, height);
   }
 
 #if defined(_WIN32)
+  // CUDA path is the primary Windows GPU backend.
+  // It keeps existing async + 2D copy optimizations and can fall back to legacy sync via env flag.
   bool renderCUDA(const float* src, float* dst, int width, int height, size_t srcRowBytes, size_t dstRowBytes) {
     std::lock_guard<std::mutex> lock(cudaMutex_);
     const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
@@ -165,6 +178,7 @@ class OpenDRTProcessor {
 #endif
 
 #if defined(__APPLE__)
+  // Metal path remains unchanged and is the primary backend on macOS.
   bool renderMetal(
       const float* src,
       float* dst,
@@ -179,13 +193,116 @@ class OpenDRTProcessor {
   }
 #endif
 
-  bool renderOpenCL(const float* src, float* dst, int width, int height) {
-    // OpenCL path is reserved for future parity work.
+  // OpenCL path for non-CUDA systems (primarily AMD/Intel GPUs on Windows).
+  // Uses persistent runtime objects and buffers to avoid per-frame setup overhead.
+  bool renderOpenCL(
+      const float* src,
+      float* dst,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes) {
+#if !defined(_WIN32)
     (void)src;
     (void)dst;
     (void)width;
     (void)height;
+    (void)srcRowBytes;
+    (void)dstRowBytes;
     return false;
+#else
+    std::lock_guard<std::mutex> lock(openclMutex_);
+    if (!initializeOpenCLRuntime()) return false;
+
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    const size_t bytes = packedRowBytes * static_cast<size_t>(height);
+    const bool packedSrc = (srcRowBytes == packedRowBytes);
+    const bool packedDst = (dstRowBytes == packedRowBytes);
+    if (!ensureOpenCLBuffers(bytes)) return false;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto tH2D = std::chrono::steady_clock::now();
+    if (!openclDisable2DCopyEnabled_ && !packedSrc) {
+      const size_t origin[3] = {0, 0, 0};
+      const size_t region[3] = {packedRowBytes, static_cast<size_t>(height), 1};
+      if (clEnqueueWriteBufferRect(
+              clQueue_,
+              clSrc_,
+              CL_FALSE,
+              origin,
+              origin,
+              region,
+              packedRowBytes,
+              0,
+              srcRowBytes,
+              0,
+              src,
+              0,
+              nullptr,
+              nullptr) != CL_SUCCESS) {
+        return false;
+      }
+    } else {
+      if (!packedSrc) return false;
+      if (clEnqueueWriteBuffer(clQueue_, clSrc_, CL_FALSE, 0, bytes, src, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+    }
+    if (clEnqueueWriteBuffer(clQueue_, clParams_, CL_FALSE, 0, sizeof(OpenDRTParams), &params_, 0, nullptr, nullptr) != CL_SUCCESS) {
+      return false;
+    }
+    if (clEnqueueWriteBuffer(clQueue_, clDerived_, CL_FALSE, 0, sizeof(OpenDRTDerivedParams), &derived_, 0, nullptr, nullptr) != CL_SUCCESS) {
+      return false;
+    }
+    perfLogStage("OpenCL H2D", tH2D);
+
+    const auto tKernel = std::chrono::steady_clock::now();
+    if (clSetKernelArg(clKernel_, 0, sizeof(cl_mem), &clSrc_) != CL_SUCCESS) return false;
+    if (clSetKernelArg(clKernel_, 1, sizeof(cl_mem), &clDst_) != CL_SUCCESS) return false;
+    if (clSetKernelArg(clKernel_, 2, sizeof(int), &width) != CL_SUCCESS) return false;
+    if (clSetKernelArg(clKernel_, 3, sizeof(int), &height) != CL_SUCCESS) return false;
+    if (clSetKernelArg(clKernel_, 4, sizeof(cl_mem), &clParams_) != CL_SUCCESS) return false;
+    if (clSetKernelArg(clKernel_, 5, sizeof(cl_mem), &clDerived_) != CL_SUCCESS) return false;
+
+    const size_t global[2] = {static_cast<size_t>(width), static_cast<size_t>(height)};
+    if (clEnqueueNDRangeKernel(clQueue_, clKernel_, 2, nullptr, global, nullptr, 0, nullptr, nullptr) != CL_SUCCESS) {
+      return false;
+    }
+    perfLogStage("OpenCL kernel", tKernel);
+
+    const auto tD2H = std::chrono::steady_clock::now();
+    if (!openclDisable2DCopyEnabled_ && !packedDst) {
+      const size_t origin[3] = {0, 0, 0};
+      const size_t region[3] = {packedRowBytes, static_cast<size_t>(height), 1};
+      if (clEnqueueReadBufferRect(
+              clQueue_,
+              clDst_,
+              CL_FALSE,
+              origin,
+              origin,
+              region,
+              packedRowBytes,
+              0,
+              dstRowBytes,
+              0,
+              dst,
+              0,
+              nullptr,
+              nullptr) != CL_SUCCESS) {
+        return false;
+      }
+    } else {
+      if (!packedDst) return false;
+      if (clEnqueueReadBuffer(clQueue_, clDst_, CL_FALSE, 0, bytes, dst, 0, nullptr, nullptr) != CL_SUCCESS) {
+        return false;
+      }
+    }
+    perfLogStage("OpenCL D2H", tD2H);
+
+    if (clFinish(clQueue_) != CL_SUCCESS) return false;
+    perfLogStage("OpenCL render", t0);
+    return true;
+#endif
   }
 
   bool renderCPU(const float* src, float* dst, int width, int height) {
@@ -218,12 +335,18 @@ class OpenDRTProcessor {
     debugLogEnabled_ = envFlagEnabled("ME_OPENDRT_DEBUG_LOG");
     perfLogEnabled_ = envFlagEnabled("ME_OPENDRT_PERF_LOG");
 #if defined(_WIN32)
+    // Runtime switches for triage/perf tuning without rebuilding.
     cudaLegacySyncEnabled_ = envFlagEnabled("ME_OPENDRT_CUDA_LEGACY_SYNC");
     cudaDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_CUDA_2D_COPY");
+    openclForceEnabled_ = envFlagEnabled("ME_OPENDRT_FORCE_OPENCL");
+    openclDisableEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_OPENCL");
+    openclDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_OPENCL_DISABLE_2D_COPY");
 #endif
     disableDerivedEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_DERIVED");
   }
 
+  // Computes frame-constant terms for tonescale/purity logic once per frame.
+  // Backends consume this struct to preserve parity and reduce GPU workload.
   void computeDerivedParams() {
     if (disableDerivedEnabled_) {
       derived_.enabled = 0;
@@ -262,6 +385,156 @@ class OpenDRTProcessor {
   }
 
 #if defined(_WIN32)
+  // ----- OpenCL runtime lifecycle -----
+  // Lazy-init the runtime once, cache availability, and reuse buffers per frame size.
+  bool openclAvailableCached() {
+    if (openclAvailabilityKnown_) return openclAvailability_;
+    openclAvailability_ = initializeOpenCLRuntime();
+    openclAvailabilityKnown_ = true;
+    return openclAvailability_;
+  }
+
+  std::string openclKernelPath() const {
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(&launchOpenDRTKernel), &self)) {
+      return std::string();
+    }
+    char modulePath[MAX_PATH] = {0};
+    if (GetModuleFileNameA(self, modulePath, MAX_PATH) == 0) return std::string();
+    std::string p(modulePath);
+    const size_t pos = p.find_last_of("\\/");
+    if (pos == std::string::npos) return "OpenDRT.cl";
+    return p.substr(0, pos + 1) + "OpenDRT.cl";
+  }
+
+  bool initializeOpenCLRuntime() {
+    if (clInitFailed_) return false;
+    if (clKernel_ != nullptr) return true;
+
+    cl_int err = CL_SUCCESS;
+    cl_uint numPlatforms = 0;
+    if (clGetPlatformIDs(0, nullptr, &numPlatforms) != CL_SUCCESS || numPlatforms == 0) {
+      clInitFailed_ = true;
+      return false;
+    }
+    std::vector<cl_platform_id> platforms(numPlatforms);
+    if (clGetPlatformIDs(numPlatforms, platforms.data(), nullptr) != CL_SUCCESS) {
+      clInitFailed_ = true;
+      return false;
+    }
+
+    cl_device_id chosenDevice = nullptr;
+    cl_platform_id chosenPlatform = nullptr;
+    for (cl_platform_id pid : platforms) {
+      cl_uint numDevices = 0;
+      if (clGetDeviceIDs(pid, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
+        continue;
+      }
+      std::vector<cl_device_id> devices(numDevices);
+      if (clGetDeviceIDs(pid, CL_DEVICE_TYPE_GPU, numDevices, devices.data(), nullptr) != CL_SUCCESS) continue;
+      chosenPlatform = pid;
+      chosenDevice = devices[0];
+      break;
+    }
+    if (chosenDevice == nullptr) {
+      clInitFailed_ = true;
+      return false;
+    }
+
+    clContext_ = clCreateContext(nullptr, 1, &chosenDevice, nullptr, nullptr, &err);
+    if (err != CL_SUCCESS || clContext_ == nullptr) {
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+    clDevice_ = chosenDevice;
+    clPlatform_ = chosenPlatform;
+    clQueue_ = clCreateCommandQueue(clContext_, clDevice_, 0, &err);
+    if (err != CL_SUCCESS || clQueue_ == nullptr) {
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+
+    const std::string path = openclKernelPath();
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs.is_open()) {
+      debugLog("OpenCL kernel source not found next to plugin binary.");
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+    const std::string source((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    const char* src = source.c_str();
+    const size_t len = source.size();
+    clProgram_ = clCreateProgramWithSource(clContext_, 1, &src, &len, &err);
+    if (err != CL_SUCCESS || clProgram_ == nullptr) {
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+
+    err = clBuildProgram(clProgram_, 1, &clDevice_, nullptr, nullptr, nullptr);
+    if (err != CL_SUCCESS) {
+      size_t logSize = 0;
+      clGetProgramBuildInfo(clProgram_, clDevice_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
+      if (logSize > 1) {
+        std::vector<char> log(logSize);
+        clGetProgramBuildInfo(clProgram_, clDevice_, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
+        if (debugLogEnabled_) std::fprintf(stderr, "[ME_OpenDRT] OpenCL build log:\n%s\n", log.data());
+      }
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+
+    clKernel_ = clCreateKernel(clProgram_, "OpenDRTKernel", &err);
+    if (err != CL_SUCCESS || clKernel_ == nullptr) {
+      clInitFailed_ = true;
+      releaseOpenCL();
+      return false;
+    }
+    return true;
+  }
+
+  bool ensureOpenCLBuffers(size_t bytes) {
+    if (clSrc_ != nullptr && clDst_ != nullptr && clParams_ != nullptr && clDerived_ != nullptr && clBytes_ == bytes) {
+      return true;
+    }
+    releaseOpenCLBuffers();
+    cl_int err = CL_SUCCESS;
+    clSrc_ = clCreateBuffer(clContext_, CL_MEM_READ_ONLY, bytes, nullptr, &err);
+    if (err != CL_SUCCESS || clSrc_ == nullptr) return false;
+    clDst_ = clCreateBuffer(clContext_, CL_MEM_WRITE_ONLY, bytes, nullptr, &err);
+    if (err != CL_SUCCESS || clDst_ == nullptr) return false;
+    clParams_ = clCreateBuffer(clContext_, CL_MEM_READ_ONLY, sizeof(OpenDRTParams), nullptr, &err);
+    if (err != CL_SUCCESS || clParams_ == nullptr) return false;
+    clDerived_ = clCreateBuffer(clContext_, CL_MEM_READ_ONLY, sizeof(OpenDRTDerivedParams), nullptr, &err);
+    if (err != CL_SUCCESS || clDerived_ == nullptr) return false;
+    clBytes_ = bytes;
+    return true;
+  }
+
+  void releaseOpenCLBuffers() {
+    if (clDerived_ != nullptr) { clReleaseMemObject(clDerived_); clDerived_ = nullptr; }
+    if (clParams_ != nullptr) { clReleaseMemObject(clParams_); clParams_ = nullptr; }
+    if (clDst_ != nullptr) { clReleaseMemObject(clDst_); clDst_ = nullptr; }
+    if (clSrc_ != nullptr) { clReleaseMemObject(clSrc_); clSrc_ = nullptr; }
+    clBytes_ = 0;
+  }
+
+  void releaseOpenCL() {
+    releaseOpenCLBuffers();
+    if (clKernel_ != nullptr) { clReleaseKernel(clKernel_); clKernel_ = nullptr; }
+    if (clProgram_ != nullptr) { clReleaseProgram(clProgram_); clProgram_ = nullptr; }
+    if (clQueue_ != nullptr) { clReleaseCommandQueue(clQueue_); clQueue_ = nullptr; }
+    if (clContext_ != nullptr) { clReleaseContext(clContext_); clContext_ = nullptr; }
+    clDevice_ = nullptr;
+    clPlatform_ = nullptr;
+  }
+
+  // ----- CUDA runtime lifecycle -----
   bool ensureCudaStream() {
     if (cudaStream_ != nullptr) {
       return true;
@@ -400,12 +673,21 @@ class OpenDRTProcessor {
 
   OpenDRTParams params_;
   OpenDRTDerivedParams derived_{};
+  // Generic runtime flags shared across backends.
   bool debugLogEnabled_ = false;
   bool perfLogEnabled_ = false;
   bool disableDerivedEnabled_ = false;
 #if defined(_WIN32)
+  // CUDA feature flags and cached device/runtime state.
   bool cudaLegacySyncEnabled_ = false;
   bool cudaDisable2DCopyEnabled_ = false;
+  // OpenCL feature flags and cached runtime state.
+  bool openclForceEnabled_ = false;
+  bool openclDisableEnabled_ = false;
+  bool openclDisable2DCopyEnabled_ = false;
+  bool openclAvailability_ = false;
+  bool openclAvailabilityKnown_ = false;
+  bool clInitFailed_ = false;
   bool cudaAvailability_ = false;
   bool cudaAvailabilityKnown_ = false;
   bool cudaDeviceReady_ = false;
@@ -414,5 +696,17 @@ class OpenDRTProcessor {
   cudaStream_t cudaStream_ = nullptr;
   size_t cudaBytes_ = 0;
   std::mutex cudaMutex_;
+  cl_platform_id clPlatform_ = nullptr;
+  cl_device_id clDevice_ = nullptr;
+  cl_context clContext_ = nullptr;
+  cl_command_queue clQueue_ = nullptr;
+  cl_program clProgram_ = nullptr;
+  cl_kernel clKernel_ = nullptr;
+  cl_mem clSrc_ = nullptr;
+  cl_mem clDst_ = nullptr;
+  cl_mem clParams_ = nullptr;
+  cl_mem clDerived_ = nullptr;
+  size_t clBytes_ = 0;
+  std::mutex openclMutex_;
 #endif
 };

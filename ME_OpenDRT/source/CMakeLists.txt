@@ -28,6 +28,9 @@ if(WIN32)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+  # VS 2026 toolset is newer than nvcc's supported host-compiler list.
+  # This keeps local Windows builds working with newer MSVC installations.
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
   find_package(CUDAToolkit REQUIRED)
 
   set(OPENCL_LIB "${CUDAToolkit_LIBRARY_DIR}/OpenCL.lib")
@@ -75,6 +78,7 @@ endif()
 
 if(WIN32)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart_static "${OPENCL_LIB}")
+  target_include_directories(${PLUGIN_BASENAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 
 if(APPLE)
@@ -120,6 +124,12 @@ elseif(APPLE)
   set(OFX_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Resources")
 endif()
 file(MAKE_DIRECTORY "${OFX_OUTPUT_DIR}")
+if(WIN32)
+  add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/OpenDRT.cl"
+      "${OFX_OUTPUT_DIR}/OpenDRT.cl")
+endif()
 if(APPLE)
   file(MAKE_DIRECTORY "${OFX_RESOURCES_DIR}")
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
@@ -132,11 +142,6 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY_RELEASE "${OFX_OUTPUT_DIR}"
   RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OFX_OUTPUT_DIR}"
   RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY "${OFX_OUTPUT_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY_DEBUG "${OFX_OUTPUT_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY_RELEASE "${OFX_OUTPUT_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY_RELWITHDEBINFO "${OFX_OUTPUT_DIR}"
-  LIBRARY_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
 )
 
 

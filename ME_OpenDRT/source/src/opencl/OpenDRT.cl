@@ -241,7 +241,7 @@ inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int 
   return rgb;
 }
 
-inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, __constant OpenDRTParams* p) {
+inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, __constant OpenDRTParams* p, __constant OpenDRTDerivedParams* d) {
   // Mirrors CUDA transform implementation using resolved params from host.
   float3x3 in_to_xyz = identity();
   if (p->in_gamut == 1) in_to_xyz = matrix_ap0_to_xyz;
@@ -293,16 +293,26 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
 
   if (p->tn_hcon_enable) tsn = contrast_high(tsn, pow(2.0f, p->tn_hcon), p->tn_hcon_pv, p->tn_hcon_st, 0);
 
-  float ts_x1 = pow(2.0f, 6.0f * p->tn_sh + 4.0f), ts_y1 = p->tn_Lp / 100.0f, ts_x0 = 0.18f + p->tn_off;
-  float ts_y0 = p->tn_Lg / 100.0f * (1.0f + p->tn_gb * log2(ts_y1));
-  float ts_s0 = compress_toe_quadratic(ts_y0, p->tn_toe, 1);
-  float ts_p = p->tn_con / (1.0f + (float)p->tn_su * 0.05f);
-  float ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / p->tn_con) - 1.0f);
-  float ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), p->tn_con);
-  float ts_m2 = compress_toe_quadratic(ts_m1, p->tn_toe, 1);
-  float ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / p->tn_con) - 1.0f);
-  float s_Lp100 = ts_x0 * (pow((p->tn_Lg / 100.0f), -1.0f / p->tn_con) - 1.0f);
-  float ts_s1 = ts_s * (p->pt_hdr * fmin(1.0f, (p->tn_Lp - 100.0f) / 900.0f)) + s_Lp100 * (1.0f - (p->pt_hdr * fmin(1.0f, (p->tn_Lp - 100.0f) / 900.0f)));
+  float ts_m2, ts_p, ts_s1, s_Lp100, ts_s;
+  if (d->enabled != 0) {
+    ts_m2 = d->ts_m2;
+    ts_p = d->ts_p;
+    ts_s1 = d->ts_s1;
+    s_Lp100 = d->s_Lp100;
+    ts_s = d->ts_s;
+  } else {
+    float ts_x1 = pow(2.0f, 6.0f * p->tn_sh + 4.0f), ts_y1 = p->tn_Lp / 100.0f, ts_x0 = 0.18f + p->tn_off;
+    float ts_y0 = p->tn_Lg / 100.0f * (1.0f + p->tn_gb * log2(ts_y1));
+    float ts_s0 = compress_toe_quadratic(ts_y0, p->tn_toe, 1);
+    ts_p = p->tn_con / (1.0f + (float)p->tn_su * 0.05f);
+    float ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / p->tn_con) - 1.0f);
+    float ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), p->tn_con);
+    ts_m2 = compress_toe_quadratic(ts_m1, p->tn_toe, 1);
+    ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / p->tn_con) - 1.0f);
+    s_Lp100 = ts_x0 * (pow((p->tn_Lg / 100.0f), -1.0f / p->tn_con) - 1.0f);
+    float pt_cmp_Lf = p->pt_hdr * fmin(1.0f, (p->tn_Lp - 100.0f) / 900.0f);
+    ts_s1 = ts_s * pt_cmp_Lf + s_Lp100 * (1.0f - pt_cmp_Lf);
+  }
   float tsn_pt = compress_hyperbolic_power(tsn, ts_s1, ts_p);
   float tsn_const = compress_hyperbolic_power(tsn, s_Lp100, ts_p);
   tsn = compress_hyperbolic_power(tsn, ts_s, ts_p);
@@ -358,7 +368,8 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
   if (p->ptl_enable) rgb = (float3)(softplus(rgb.x,p->ptl_c), softplus(rgb.y,p->ptl_m), softplus(rgb.z,p->ptl_y));
 
   tsn = compress_toe_quadratic(tsn * ts_m2, p->tn_toe, 0);
-  tsn *= (p->eotf == 4 ? 0.01f : p->eotf == 5 ? 0.1f : 100.0f / p->tn_Lp);
+  float ts_dsc = d->enabled != 0 ? d->ts_dsc : (p->eotf == 4 ? 0.01f : p->eotf == 5 ? 0.1f : 100.0f / p->tn_Lp);
+  tsn *= ts_dsc;
   rgb *= tsn;
   if (p->display_gamut == 2) rgb = vdot(matrix_p3_to_rec2020, clampminf3(rgb, 0.0f));
   if (p->clamp) rgb = clampf3(rgb, 0.0f, 1.0f);
@@ -367,13 +378,13 @@ inline float3 openDRTTransform(int width, int height, int x, int y, float3 rgb, 
   return rgb;
 }
 
-__kernel void OpenDRTKernel(__global const float* src, __global float* dst, int width, int height, __constant OpenDRTParams* p) {
+__kernel void OpenDRTKernel(__global const float* src, __global float* dst, int width, int height, __constant OpenDRTParams* p, __constant OpenDRTDerivedParams* d) {
   int x = get_global_id(0);
   int y = get_global_id(1);
   if (x >= width || y >= height) return;
   int i = (y * width + x) * 4;
   float3 rgb = (float3)(src[i+0], src[i+1], src[i+2]);
-  rgb = openDRTTransform(width, height, x, y, rgb, p);
+  rgb = openDRTTransform(width, height, x, y, rgb, p, d);
   dst[i+0] = rgb.x;
   dst[i+1] = rgb.y;
   dst[i+2] = rgb.z;
