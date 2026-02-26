@@ -285,9 +285,12 @@ std::filesystem::path userPresetDirPath() {
   const char* base = std::getenv("APPDATA");
   if (!base || !*base) base = std::getenv("LOCALAPPDATA");
   if (base && *base) return std::filesystem::path(base) / "ME_OpenDRT";
-#else
+#elif defined(__APPLE__)
   const char* home = std::getenv("HOME");
   if (home && *home) return std::filesystem::path(home) / "Library" / "Application Support" / "ME_OpenDRT";
+#else
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::filesystem::path(home) / ".config" / "ME_OpenDRT";
 #endif
   return std::filesystem::path(".");
 }
@@ -370,7 +373,7 @@ bool openExternalUrl(const std::string& url) {
   const HINSTANCE rc = ShellExecuteA(nullptr, "open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
   return reinterpret_cast<intptr_t>(rc) > 32;
 }
-#else
+#elif defined(__APPLE__)
 std::string execAndRead(const std::string& cmd) {
   std::string out;
   FILE* f = popen(cmd.c_str(), "r");
@@ -424,6 +427,51 @@ bool openExternalUrl(const std::string& url) {
     if (c == '"') c = '\'';
   }
   std::string cmd = "open \"" + safe + "\" >/dev/null 2>&1";
+  return std::system(cmd.c_str()) == 0;
+}
+#else
+std::string pickOpenJsonFilePath() {
+  return std::string();
+}
+
+std::string pickSaveJsonFilePath(const std::string& defaultName) {
+  (void)defaultName;
+  return std::string();
+}
+
+bool confirmOverwriteDialog(const std::string& presetName) {
+  std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: overwrite confirmation unavailable for preset '%s'.\n", presetName.c_str());
+  return false;
+}
+
+void showInfoDialog(const std::string& text) {
+  std::fprintf(stderr, "[ME_OpenDRT] %s\n", text.c_str());
+}
+
+bool confirmDeleteDialog(const std::string& presetName) {
+  std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: delete confirmation unavailable for preset '%s'.\n", presetName.c_str());
+  return false;
+}
+
+DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
+  std::fprintf(
+      stderr,
+      "[ME_OpenDRT] Linux fallback: preset target chooser unavailable for action '%s'.\n",
+      actionVerb ? actionVerb : "Apply");
+  return DeleteTarget::Cancel;
+}
+
+bool openExternalUrl(const std::string& url) {
+  if (url.empty()) return false;
+  if (std::system("command -v xdg-open >/dev/null 2>&1") != 0) {
+    std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: xdg-open not found.\n");
+    return false;
+  }
+  std::string safe = url;
+  for (char& c : safe) {
+    if (c == '"') c = '\'';
+  }
+  const std::string cmd = "xdg-open \"" + safe + "\" >/dev/null 2>&1";
   return std::system(cmd.c_str()) == 0;
 }
 #endif

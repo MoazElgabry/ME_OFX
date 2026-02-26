@@ -1,0 +1,48 @@
+name: Build ME_OpenDRT Linux (x86_64 CPU-only)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure
+        run: cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-linux --config Release -j
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
+
+      - name: Package Linux portable bundle
+        run: |
+          tar -czf ../../ME_OpenDRT_linux_x86_64_portable.tar.gz \
+            -C bundle ME_OpenDRT.ofx.bundle
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ME_OpenDRT-linux-x86_64
+          path: |
+            ME_OpenDRT_linux_x86_64_portable.tar.gz
+            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
