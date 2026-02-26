@@ -1,4 +1,4 @@
-﻿#include <cmath>
+#include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
