@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev
 
       - name: Configure
         run: cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release

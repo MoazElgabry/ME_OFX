@@ -41,15 +41,16 @@ if(WIN32)
     message(FATAL_ERROR "OpenCL.lib not found in CUDA Toolkit")
   endif()
 
+  list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
+endif()
+
+if(WIN32 OR (UNIX AND NOT APPLE))
   # Embed OpenCL kernel source into generated header to avoid runtime file dependency.
   set(OPENCL_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/OpenDRT.cl")
   set(OPENCL_KERNEL_GEN_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/GenerateOpenDRTCLSource.cmake")
   set(OPENCL_KERNEL_HDR_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
   set(OPENCL_KERNEL_HDR "${OPENCL_KERNEL_HDR_DIR}/OpenDRTCLSource.h")
   file(MAKE_DIRECTORY "${OPENCL_KERNEL_HDR_DIR}")
-  # Note-to-self:
-  # Generate every build when source/script changes so embedded OpenCL source
-  # never drifts from src/opencl/OpenDRT.cl.
   add_custom_command(
     OUTPUT "${OPENCL_KERNEL_HDR}"
     COMMAND ${CMAKE_COMMAND}
@@ -60,8 +61,6 @@ if(WIN32)
     VERBATIM
   )
   add_custom_target(OpenDRTOpenCLSourceHeader ALL DEPENDS "${OPENCL_KERNEL_HDR}")
-
-  list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
 endif()
 
 if(APPLE)
@@ -72,7 +71,7 @@ if(APPLE)
 endif()
 
 add_library(${PLUGIN_BASENAME} SHARED ${PLUGIN_SOURCES})
-if(WIN32)
+if(WIN32 OR (UNIX AND NOT APPLE))
   # Ensure generated OpenCL header exists before C++ compilation begins.
   add_dependencies(${PLUGIN_BASENAME} OpenDRTOpenCLSourceHeader)
 endif()
@@ -82,7 +81,7 @@ target_include_directories(${PLUGIN_BASENAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-if(WIN32)
+if(WIN32 OR (UNIX AND NOT APPLE))
   target_include_directories(${PLUGIN_BASENAME} PRIVATE "${OPENCL_KERNEL_HDR_DIR}")
 endif()
 
@@ -106,6 +105,10 @@ endif()
 if(WIN32)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart_static "${OPENCL_LIB}")
   target_include_directories(${PLUGIN_BASENAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+if(UNIX AND NOT APPLE)
+  find_package(OpenCL REQUIRED)
+  target_link_libraries(${PLUGIN_BASENAME} PRIVATE OpenCL::OpenCL)
 endif()
 
 if(APPLE)

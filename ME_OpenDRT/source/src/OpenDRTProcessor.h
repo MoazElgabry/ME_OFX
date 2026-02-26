@@ -15,14 +15,26 @@
 #include "OpenDRTParams.h"
 
 #if defined(_WIN32)
+#define ME_OPENDRT_HAS_CUDA 1
+#endif
+
+#if defined(_WIN32) || defined(__linux__)
+#define ME_OPENDRT_HAS_OPENCL 1
+#endif
+
+#if defined(_WIN32)
 #define NOMINMAX
 #include <windows.h>
+#endif
+
+#if defined(ME_OPENDRT_HAS_OPENCL)
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
-#include <cuda_runtime.h>
-// Generated during build from src/opencl/OpenDRT.cl.
-// Note-to-self: this is the primary OpenCL source path now.
 #include "OpenDRTCLSource.h"
+#endif
+
+#if defined(ME_OPENDRT_HAS_CUDA)
+#include <cuda_runtime.h>
 extern "C" void launchOpenDRTKernel(
     const float* src,
     float* dst,
@@ -52,10 +64,12 @@ class OpenDRTProcessor {
   explicit OpenDRTProcessor(const OpenDRTParams& params) : params_(params) { initRuntimeFlags(); }
   void setParams(const OpenDRTParams& params) { params_ = params; }
   ~OpenDRTProcessor() {
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_CUDA)
     releaseCudaStream();
     releaseCudaCopyResources();
     releaseCudaBuffers();
+#endif
+#if defined(ME_OPENDRT_HAS_OPENCL)
     releaseOpenCL();
 #endif
   }
@@ -87,7 +101,7 @@ class OpenDRTProcessor {
     }
     debugLog("Metal path failed, falling back.");
 #endif
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_CUDA)
     const bool forceOpenCL = openclForceEnabled_;
     if (!forceOpenCL && preferCuda && cudaAvailableCached()) {
       if (renderCUDA(src, dst, width, height, srcRowBytes, dstRowBytes)) return true;
@@ -97,12 +111,17 @@ class OpenDRTProcessor {
       if (renderOpenCL(src, dst, width, height, srcRowBytes, dstRowBytes)) return true;
       debugLog("OpenCL path failed, falling back to CPU.");
     }
+#elif defined(ME_OPENDRT_HAS_OPENCL)
+    if (!openclDisableEnabled_ && openclAvailableCached()) {
+      if (renderOpenCL(src, dst, width, height, srcRowBytes, dstRowBytes)) return true;
+      debugLog("OpenCL path failed, falling back to CPU.");
+    }
 #endif
     // Last-resort correctness fallback; should never crash the host.
     return renderCPU(src, dst, width, height);
   }
 
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_CUDA)
   // Host CUDA path: source/destination pointers are device pointers provided by OFX host.
   // This avoids host<->device staging copies and keeps math parity by launching the same kernel.
   bool renderCUDAHostBuffers(
@@ -390,7 +409,7 @@ class OpenDRTProcessor {
       int height,
       size_t srcRowBytes,
       size_t dstRowBytes) {
-#if !defined(_WIN32)
+#if !defined(ME_OPENDRT_HAS_OPENCL)
     (void)src;
     (void)dst;
     (void)width;
@@ -542,12 +561,14 @@ class OpenDRTProcessor {
   void initRuntimeFlags() {
     debugLogEnabled_ = envFlagEnabled("ME_OPENDRT_DEBUG_LOG");
     perfLogEnabled_ = envFlagEnabled("ME_OPENDRT_PERF_LOG");
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_CUDA)
     // Runtime switches for triage/perf tuning without rebuilding.
     cudaLegacySyncEnabled_ = envFlagEnabled("ME_OPENDRT_CUDA_LEGACY_SYNC");
     cudaDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_CUDA_2D_COPY");
     cudaDualStreamEnabled_ = !envFlagEnabled("ME_OPENDRT_DISABLE_CUDA_PIPELINE");
     hostCudaForceSyncEnabled_ = envFlagEnabled("ME_OPENDRT_HOST_CUDA_FORCE_SYNC");
+#endif
+#if defined(ME_OPENDRT_HAS_OPENCL)
     openclForceEnabled_ = envFlagEnabled("ME_OPENDRT_FORCE_OPENCL");
     openclDisableEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_OPENCL");
     openclDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_OPENCL_DISABLE_2D_COPY");
@@ -556,7 +577,11 @@ class OpenDRTProcessor {
     // Set this env to 0 to test strict embedded-only behavior.
     const char* openclFallbackEnv = std::getenv("ME_OPENDRT_OPENCL_EXTERNAL_KERNEL_FALLBACK");
     if (openclFallbackEnv == nullptr || openclFallbackEnv[0] == '\0') {
+#if defined(_WIN32)
       openclExternalKernelFallbackEnabled_ = true;
+#else
+      openclExternalKernelFallbackEnabled_ = false;
+#endif
     } else {
       openclExternalKernelFallbackEnabled_ = !(openclFallbackEnv[0] == '0' && openclFallbackEnv[1] == '\0');
     }
@@ -603,7 +628,7 @@ class OpenDRTProcessor {
     derived_.ts_s1 = ts_s1;
   }
 
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_OPENCL)
   // ----- OpenCL runtime lifecycle -----
   // Lazy-init the runtime once, cache availability, and reuse buffers per frame size.
   bool openclAvailableCached() {
@@ -617,6 +642,7 @@ class OpenDRTProcessor {
     // Note-to-self:
     // This exists only for temporary external-source fallback troubleshooting.
     // Safe to remove when rollout completes and fallback is retired.
+#if defined(_WIN32)
     HMODULE self = nullptr;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCSTR>(&launchOpenDRTKernel), &self)) {
@@ -628,6 +654,9 @@ class OpenDRTProcessor {
     const size_t pos = p.find_last_of("\\/");
     if (pos == std::string::npos) return "OpenDRT.cl";
     return p.substr(0, pos + 1) + "OpenDRT.cl";
+#else
+    return "OpenDRT.cl";
+#endif
   }
 
   bool initializeOpenCLRuntime() {
@@ -648,16 +677,20 @@ class OpenDRTProcessor {
 
     cl_device_id chosenDevice = nullptr;
     cl_platform_id chosenPlatform = nullptr;
-    for (cl_platform_id pid : platforms) {
-      cl_uint numDevices = 0;
-      if (clGetDeviceIDs(pid, CL_DEVICE_TYPE_GPU, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
-        continue;
+    const cl_device_type probeTypes[] = {CL_DEVICE_TYPE_GPU, CL_DEVICE_TYPE_DEFAULT, CL_DEVICE_TYPE_ALL};
+    for (cl_device_type deviceType : probeTypes) {
+      for (cl_platform_id pid : platforms) {
+        cl_uint numDevices = 0;
+        if (clGetDeviceIDs(pid, deviceType, 0, nullptr, &numDevices) != CL_SUCCESS || numDevices == 0) {
+          continue;
+        }
+        std::vector<cl_device_id> devices(numDevices);
+        if (clGetDeviceIDs(pid, deviceType, numDevices, devices.data(), nullptr) != CL_SUCCESS) continue;
+        chosenPlatform = pid;
+        chosenDevice = devices[0];
+        break;
       }
-      std::vector<cl_device_id> devices(numDevices);
-      if (clGetDeviceIDs(pid, CL_DEVICE_TYPE_GPU, numDevices, devices.data(), nullptr) != CL_SUCCESS) continue;
-      chosenPlatform = pid;
-      chosenDevice = devices[0];
-      break;
+      if (chosenDevice != nullptr) break;
     }
     if (chosenDevice == nullptr) {
       clInitFailed_ = true;
@@ -770,6 +803,7 @@ class OpenDRTProcessor {
   }
 
   // ----- CUDA runtime lifecycle -----
+#if defined(ME_OPENDRT_HAS_CUDA)
   bool ensureCudaStream() {
     if (cudaStream_ != nullptr) {
       return true;
@@ -932,6 +966,7 @@ class OpenDRTProcessor {
     cudaBytes_ = 0;
   }
 #endif
+#endif
 
   OpenDRTParams params_;
   OpenDRTDerivedParams derived_{};
@@ -939,12 +974,14 @@ class OpenDRTProcessor {
   bool debugLogEnabled_ = false;
   bool perfLogEnabled_ = false;
   bool disableDerivedEnabled_ = false;
-#if defined(_WIN32)
+#if defined(ME_OPENDRT_HAS_CUDA)
   // CUDA feature flags and cached device/runtime state.
   bool cudaLegacySyncEnabled_ = false;
   bool cudaDisable2DCopyEnabled_ = false;
   bool cudaDualStreamEnabled_ = true;
   bool hostCudaForceSyncEnabled_ = false;
+#endif
+#if defined(ME_OPENDRT_HAS_OPENCL)
   // OpenCL feature flags and cached runtime state.
   bool openclForceEnabled_ = false;
   bool openclDisableEnabled_ = false;
@@ -953,17 +990,6 @@ class OpenDRTProcessor {
   bool openclAvailability_ = false;
   bool openclAvailabilityKnown_ = false;
   bool clInitFailed_ = false;
-  bool cudaAvailability_ = false;
-  bool cudaAvailabilityKnown_ = false;
-  bool cudaDeviceReady_ = false;
-  float* cudaSrc_ = nullptr;
-  float* cudaDst_ = nullptr;
-  cudaStream_t cudaStream_ = nullptr;
-  cudaStream_t cudaCopyStream_ = nullptr;
-  cudaEvent_t h2dDoneEvent_ = nullptr;
-  cudaEvent_t kernelDoneEvent_ = nullptr;
-  size_t cudaBytes_ = 0;
-  std::mutex cudaMutex_;
   cl_platform_id clPlatform_ = nullptr;
   cl_device_id clDevice_ = nullptr;
   cl_context clContext_ = nullptr;
@@ -976,5 +1002,18 @@ class OpenDRTProcessor {
   cl_mem clDerived_ = nullptr;
   size_t clBytes_ = 0;
   std::mutex openclMutex_;
+#endif
+#if defined(ME_OPENDRT_HAS_CUDA)
+  bool cudaAvailability_ = false;
+  bool cudaAvailabilityKnown_ = false;
+  bool cudaDeviceReady_ = false;
+  float* cudaSrc_ = nullptr;
+  float* cudaDst_ = nullptr;
+  cudaStream_t cudaStream_ = nullptr;
+  cudaStream_t cudaCopyStream_ = nullptr;
+  cudaEvent_t h2dDoneEvent_ = nullptr;
+  cudaEvent_t kernelDoneEvent_ = nullptr;
+  size_t cudaBytes_ = 0;
+  std::mutex cudaMutex_;
 #endif
 };
