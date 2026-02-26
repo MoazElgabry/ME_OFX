@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT Linux (x86_64 CPU-only)
+name: Build ME_OpenDRT Linux (x86_64 OpenCL/CPU)
 
 on:
   workflow_dispatch:
