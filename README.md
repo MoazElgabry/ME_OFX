@@ -70,3 +70,30 @@ Architecture mapping:
 
 macOS install path:
 - `/Library/OFX/Plugins/ME_OpenDRT.ofx.bundle`
+
+## macOS Gatekeeper (Unsigned Plugin)
+`ME_OpenDRT.ofx.bundle` is currently unsigned/not notarized, so macOS Gatekeeper may block it by default.
+
+Use one of these methods:
+
+### Method 1 (recommended): Terminal fix
+Run these commands in order:
+
+```bash
+sudo chmod -R 755 /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
+sudo chown -R root:wheel /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
+sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
+sudo codesign --force --deep --sign - /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
+```
+
+Then relaunch DaVinci Resolve.
+
+### Method 2: macOS UI flow (no Terminal)
+1. Install/copy the plugin fresh to `/Library/OFX/Plugins/ME_OpenDRT.ofx.bundle`.
+2. Launch Resolve. When macOS shows the verification warning, click `Done`.
+3. Open `System Settings` -> `Privacy & Security`, scroll down, and click `Allow Anyway` for ME_OpenDRT.
+4. In Resolve, go to `Preferences` -> `Video Plugins`, find `ME_OpenDRT`, enable/check it, save, and quit Resolve.
+5. Relaunch Resolve, then click `Open Anyway` when prompted and authenticate with your Mac password.
+
+Note:
+- If the Mac account has no password, macOS may not show the required `Open Anyway` flow correctly.
