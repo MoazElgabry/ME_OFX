@@ -1,4 +1,4 @@
-#include <cmath>
+﻿#include <cmath>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
@@ -13,6 +13,10 @@
 #include <vector>
 
 #include "ofxsImageEffect.h"
+
+#if defined(_WIN32)
+#include <cuda_runtime.h>
+#endif
 
 #include "OpenDRTParams.h"
 #include "OpenDRTPresets.h"
@@ -45,11 +49,99 @@ bool forceStageCopyEnabled() {
   return enabled;
 }
 
+enum class CudaRenderMode {
+  HostPreferred,
+  InternalOnly
+};
+
+enum class MetalRenderMode {
+  HostPreferred,
+  InternalOnly
+};
+
+// Deterministic mode selection (single source of truth):
+// - ME_OPENDRT_RENDER_MODE=HOST|AUTO -> host preferred
+// - ME_OPENDRT_RENDER_MODE=INTERNAL  -> internal only
+// Legacy env vars remain as compatibility fallback.
+// Note-to-self:
+// Keep this selector stable because both describe() capability advertisement
+// and render() routing depend on it. If these drift, Resolve may expose
+// CUDA host mode but runtime silently falls back (or vice versa).
+CudaRenderMode selectedCudaRenderMode() {
+  static const CudaRenderMode mode = []() {
+    const char* modeVar = std::getenv("ME_OPENDRT_RENDER_MODE");
+    if (modeVar && modeVar[0] != '\0') {
+      std::string m(modeVar);
+      for (char& c : m) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (m == "INTERNAL") return CudaRenderMode::InternalOnly;
+      if (m == "HOST" || m == "AUTO") return CudaRenderMode::HostPreferred;
+    }
+
+    const char* forceInternal = std::getenv("ME_OPENDRT_FORCE_INTERNAL_PATH");
+    if (forceInternal && forceInternal[0] != '\0' && !(forceInternal[0] == '0' && forceInternal[1] == '\0')) {
+      return CudaRenderMode::InternalOnly;
+    }
+    const char* hostEnable = std::getenv("ME_OPENDRT_ENABLE_OFX_HOST_CUDA");
+    if (hostEnable && hostEnable[0] != '\0' && !(hostEnable[0] == '0' && hostEnable[1] == '\0')) {
+      return CudaRenderMode::HostPreferred;
+    }
+
+    // Default on Windows: host-CUDA preferred for fastest playback.
+    return CudaRenderMode::HostPreferred;
+  }();
+  return mode;
+}
+
+// Deterministic Metal mode selector:
+// - ME_OPENDRT_METAL_RENDER_MODE=HOST|AUTO -> host preferred
+// - ME_OPENDRT_METAL_RENDER_MODE=INTERNAL  -> internal-only path
+MetalRenderMode selectedMetalRenderMode() {
+  static const MetalRenderMode mode = []() {
+    const char* modeVar = std::getenv("ME_OPENDRT_METAL_RENDER_MODE");
+    if (modeVar && modeVar[0] != '\0') {
+      std::string m(modeVar);
+      for (char& c : m) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+      if (m == "INTERNAL") return MetalRenderMode::InternalOnly;
+      if (m == "HOST" || m == "AUTO") return MetalRenderMode::HostPreferred;
+    }
+    return MetalRenderMode::HostPreferred;
+  }();
+  return mode;
+}
+
+bool debugLogEnabled() {
+  static const bool enabled = []() {
+    const char* v = std::getenv("ME_OPENDRT_DEBUG_LOG");
+    if (v == nullptr || v[0] == '\0') return false;
+    return !(v[0] == '0' && v[1] == '\0');
+  }();
+  return enabled;
+}
+
 void perfLog(const char* stage, const std::chrono::steady_clock::time_point& start) {
   if (!perfLogEnabled()) return;
   const auto now = std::chrono::steady_clock::now();
   const double ms = std::chrono::duration<double, std::milli>(now - start).count();
   std::fprintf(stderr, "[ME_OpenDRT][PERF] %s: %.3f ms\n", stage, ms);
+#if defined(_WIN32)
+  static bool pathInit = false;
+  static std::filesystem::path logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* base = std::getenv("LOCALAPPDATA");
+    if (base && *base) {
+      logPath = std::filesystem::path(base) / "ME_OpenDRT" / "perf.log";
+      std::error_code ec;
+      std::filesystem::create_directories(logPath.parent_path(), ec);
+    }
+  }
+  if (!logPath.empty()) {
+    std::ofstream ofs(logPath, std::ios::app);
+    if (ofs.is_open()) {
+      ofs << "[ME_OpenDRT][PERF] " << stage << ": " << ms << " ms\n";
+    }
+  }
+#endif
 }
 
 constexpr int kBuiltInLookPresetCount = static_cast<int>(kLookPresetNames.size());
@@ -893,6 +985,20 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updateReadonlyDisplayLabels(0.0);
   }
 
+  ~OpenDRTEffect() override {
+#if defined(_WIN32)
+    if (stageSrcPinned_ != nullptr) {
+      cudaFreeHost(stageSrcPinned_);
+      stageSrcPinned_ = nullptr;
+    }
+    if (stageDstPinned_ != nullptr) {
+      cudaFreeHost(stageDstPinned_);
+      stageDstPinned_ = nullptr;
+    }
+    stagePinnedCapacityFloats_ = 0;
+#endif
+  }
+
   // Main render callback.
   // Rule: keep preset/file management out of this path for predictable playback.
   void render(const OFX::RenderArguments& args) override {
@@ -966,6 +1072,69 @@ class OpenDRTEffect : public OFX::ImageEffect {
       processor_->setParams(params);
     }
 
+#if defined(_WIN32)
+    // Optional OFX host CUDA mode:
+    // - Controlled by selectedCudaRenderMode().
+    // - Uses host-provided CUDA stream and device pointers from fetchImage().
+    // - Avoids host<->device staging copies.
+    // Note-to-self:
+    // This is the fastest route for playback. If I see "Backend render direct"
+    // in logs on a CUDA-enabled host, this branch was not taken.
+    const bool preferHostCuda = (selectedCudaRenderMode() == CudaRenderMode::HostPreferred);
+    const bool tryHostCuda = preferHostCuda && args.isEnabledCudaRender && (args.pCudaStream != nullptr);
+    if (tryHostCuda) {
+      const auto tHostCuda = std::chrono::steady_clock::now();
+      const float* srcDevice = static_cast<const float*>(src->getPixelData());
+      float* dstDevice = static_cast<float*>(dst->getPixelData());
+      const int srcRb = src->getRowBytes();
+      const int dstRb = dst->getRowBytes();
+      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      if (srcDevice != nullptr && dstDevice != nullptr &&
+          processor_->renderCUDAHostBuffers(srcDevice, dstDevice, width, height, srcRowBytes, dstRowBytes, args.pCudaStream)) {
+        perfLog("Backend render host CUDA", tHostCuda);
+        perfLog("Render total", tRenderStart);
+        return;
+      }
+      if (debugLogEnabled()) {
+        std::fprintf(stderr, "[ME_OpenDRT] Host CUDA render failed.\n");
+      }
+      // When the host explicitly provided CUDA memory, do not fall through into CPU staging
+      // paths that assume host-readable pointers.
+      OFX::throwSuiteStatusException(kOfxStatFailed);
+    }
+#endif
+
+#if defined(__APPLE__)
+    // Host Metal mode (macOS):
+    // - Uses host-provided command queue + MTLBuffer image handles.
+    // - Avoids plugin-owned CPU staging copies.
+    const bool preferHostMetal = (selectedMetalRenderMode() == MetalRenderMode::HostPreferred);
+    const bool tryHostMetal = preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
+    if (tryHostMetal) {
+      const auto tHostMetal = std::chrono::steady_clock::now();
+      const void* srcMetalBuffer = src->getPixelData();
+      void* dstMetalBuffer = dst->getPixelData();
+      const int srcRb = src->getRowBytes();
+      const int dstRb = dst->getRowBytes();
+      const size_t srcRowBytes = srcRb < 0 ? static_cast<size_t>(-srcRb) : static_cast<size_t>(srcRb);
+      const size_t dstRowBytes = dstRb < 0 ? static_cast<size_t>(-dstRb) : static_cast<size_t>(dstRb);
+      if (srcMetalBuffer != nullptr && dstMetalBuffer != nullptr &&
+          processor_->renderMetalHostBuffers(
+              srcMetalBuffer, dstMetalBuffer, width, height, srcRowBytes, dstRowBytes, args.pMetalCmdQ)) {
+        OpenDRTMetal::resetHostMetalFailureState();
+        perfLog("Backend render host Metal", tHostMetal);
+        perfLog("Render total", tRenderStart);
+        return;
+      }
+      if (debugLogEnabled()) {
+        std::fprintf(stderr, "[ME_OpenDRT] Host Metal render failed.\n");
+      }
+      // Safe fallback: continue into existing internal render path.
+      // This preserves stability if host-Metal submission fails transiently.
+    }
+#endif
+
     bool rendered = false;
     // Fast path: process directly on host image memory layout (no extra staging vectors).
     if (!forceStageCopyEnabled() && srcLayout.valid && dstLayout.valid) {
@@ -978,20 +1147,24 @@ class OpenDRTEffect : public OFX::ImageEffect {
     // Fallback path: stable staged copy used for irregular host layouts.
     if (!rendered) {
       const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
-      if (srcPixels_.size() != pixelCount) {
-        srcPixels_.assign(pixelCount, 0.0f);
-        dstPixels_.assign(pixelCount, 0.0f);
+      if (!ensureStageBuffers(pixelCount)) {
+        OFX::throwSuiteStatusException(kOfxStatFailed);
+      }
+      float* srcStage = stageSrcPtr();
+      float* dstStage = stageDstPtr();
+      if (!srcStage || !dstStage) {
+        OFX::throwSuiteStatusException(kOfxStatFailed);
       }
 
       const auto tStageCopyStart = std::chrono::steady_clock::now();
       if (srcLayout.valid && srcLayout.contiguous) {
-        std::memcpy(srcPixels_.data(), srcLayout.base, rowBytes * static_cast<size_t>(height));
+        std::memcpy(srcStage, srcLayout.base, rowBytes * static_cast<size_t>(height));
       } else {
         // Row fallback for hosts with non-contiguous row layout.
         for (int y = bounds.y1; y < bounds.y2; ++y) {
           const int localY = y - bounds.y1;
           float* sp = static_cast<float*>(src->getPixelAddress(bounds.x1, y));
-          float* rowDst = srcPixels_.data() + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
+          float* rowDst = srcStage + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
           if (sp != nullptr) {
             std::memcpy(rowDst, sp, rowBytes);
           } else {
@@ -1002,7 +1175,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       perfLog("Host src staging", tStageCopyStart);
 
       const auto tBackendStart = std::chrono::steady_clock::now();
-      rendered = processor_->render(srcPixels_.data(), dstPixels_.data(), width, height, true, false);
+      rendered = processor_->render(srcStage, dstStage, width, height, true, false);
       perfLog("Backend render staging", tBackendStart);
       if (!rendered) {
         OFX::throwSuiteStatusException(kOfxStatFailed);
@@ -1010,13 +1183,13 @@ class OpenDRTEffect : public OFX::ImageEffect {
 
       const auto tDstCopyStart = std::chrono::steady_clock::now();
       if (dstLayout.valid && dstLayout.contiguous) {
-        std::memcpy(dstLayout.base, dstPixels_.data(), rowBytes * static_cast<size_t>(height));
+        std::memcpy(dstLayout.base, dstStage, rowBytes * static_cast<size_t>(height));
       } else {
         for (int y = bounds.y1; y < bounds.y2; ++y) {
           const int localY = y - bounds.y1;
           float* dp = static_cast<float*>(dst->getPixelAddress(bounds.x1, y));
           if (!dp) continue;
-          const float* rowSrc = dstPixels_.data() + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
+          const float* rowSrc = dstStage + static_cast<size_t>(localY) * static_cast<size_t>(width) * 4u;
           std::memcpy(dp, rowSrc, rowBytes);
         }
       }
@@ -1508,6 +1681,54 @@ class OpenDRTEffect : public OFX::ImageEffect {
     ~FlagScope() { flag = false; }
     bool& flag;
   };
+
+  bool ensureStageBuffers(size_t pixelCount) {
+#if defined(_WIN32)
+    // Prefer pinned host buffers for staged path to improve CUDA transfer throughput.
+    if (stageSrcPinned_ != nullptr && stageDstPinned_ != nullptr && stagePinnedCapacityFloats_ == pixelCount) return true;
+    if (stageSrcPinned_ != nullptr) {
+      cudaFreeHost(stageSrcPinned_);
+      stageSrcPinned_ = nullptr;
+    }
+    if (stageDstPinned_ != nullptr) {
+      cudaFreeHost(stageDstPinned_);
+      stageDstPinned_ = nullptr;
+    }
+    stagePinnedCapacityFloats_ = 0;
+    const size_t bytes = pixelCount * sizeof(float);
+    if (cudaHostAlloc(reinterpret_cast<void**>(&stageSrcPinned_), bytes, cudaHostAllocDefault) == cudaSuccess &&
+        cudaHostAlloc(reinterpret_cast<void**>(&stageDstPinned_), bytes, cudaHostAllocDefault) == cudaSuccess) {
+      stagePinnedCapacityFloats_ = pixelCount;
+      return true;
+    }
+    if (stageSrcPinned_ != nullptr) {
+      cudaFreeHost(stageSrcPinned_);
+      stageSrcPinned_ = nullptr;
+    }
+    if (stageDstPinned_ != nullptr) {
+      cudaFreeHost(stageDstPinned_);
+      stageDstPinned_ = nullptr;
+    }
+    stagePinnedCapacityFloats_ = 0;
+#endif
+    if (srcPixels_.size() != pixelCount) srcPixels_.assign(pixelCount, 0.0f);
+    if (dstPixels_.size() != pixelCount) dstPixels_.assign(pixelCount, 0.0f);
+    return true;
+  }
+
+  float* stageSrcPtr() {
+#if defined(_WIN32)
+    if (stageSrcPinned_ != nullptr) return stageSrcPinned_;
+#endif
+    return srcPixels_.empty() ? nullptr : srcPixels_.data();
+  }
+
+  float* stageDstPtr() {
+#if defined(_WIN32)
+    if (stageDstPinned_ != nullptr) return stageDstPinned_;
+#endif
+    return dstPixels_.empty() ? nullptr : dstPixels_.data();
+  }
 
   bool isAdvancedParam(const std::string& name) const {
     static const std::vector<std::string> names = {
@@ -2225,6 +2446,11 @@ class OpenDRTEffect : public OFX::ImageEffect {
   std::unique_ptr<OpenDRTProcessor> processor_;
   std::vector<float> srcPixels_;
   std::vector<float> dstPixels_;
+#if defined(_WIN32)
+  float* stageSrcPinned_ = nullptr;
+  float* stageDstPinned_ = nullptr;
+  size_t stagePinnedCapacityFloats_ = 0;
+#endif
   bool suppressParamChanged_ = false;
   bool visibilityCacheInit_ = false;
   bool vis_hcon_ = false;
@@ -2262,8 +2488,19 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     d.setSupportsMultiResolution(false);
     d.setTemporalClipAccess(false);
     d.setSupportsOpenCLBuffersRender(false);
+#if defined(_WIN32)
+    const bool advertiseHostCuda = (selectedCudaRenderMode() == CudaRenderMode::HostPreferred);
+    d.setSupportsCudaRender(advertiseHostCuda);
+    d.setSupportsCudaStream(advertiseHostCuda);
+#elif defined(__APPLE__)
+    const bool advertiseHostMetal = (selectedMetalRenderMode() == MetalRenderMode::HostPreferred);
+    d.setSupportsMetalRender(advertiseHostMetal);
     d.setSupportsCudaRender(false);
     d.setSupportsCudaStream(false);
+#else
+    d.setSupportsCudaRender(false);
+    d.setSupportsCudaStream(false);
+#endif
   }
 
   void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override {

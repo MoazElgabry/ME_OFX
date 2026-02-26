@@ -41,6 +41,26 @@ if(WIN32)
     message(FATAL_ERROR "OpenCL.lib not found in CUDA Toolkit")
   endif()
 
+  # Embed OpenCL kernel source into generated header to avoid runtime file dependency.
+  set(OPENCL_KERNEL_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/OpenDRT.cl")
+  set(OPENCL_KERNEL_GEN_SCRIPT "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/GenerateOpenDRTCLSource.cmake")
+  set(OPENCL_KERNEL_HDR_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  set(OPENCL_KERNEL_HDR "${OPENCL_KERNEL_HDR_DIR}/OpenDRTCLSource.h")
+  file(MAKE_DIRECTORY "${OPENCL_KERNEL_HDR_DIR}")
+  # Note-to-self:
+  # Generate every build when source/script changes so embedded OpenCL source
+  # never drifts from src/opencl/OpenDRT.cl.
+  add_custom_command(
+    OUTPUT "${OPENCL_KERNEL_HDR}"
+    COMMAND ${CMAKE_COMMAND}
+      -DINPUT_FILE=${OPENCL_KERNEL_SRC}
+      -DOUTPUT_FILE=${OPENCL_KERNEL_HDR}
+      -P "${OPENCL_KERNEL_GEN_SCRIPT}"
+    DEPENDS "${OPENCL_KERNEL_SRC}" "${OPENCL_KERNEL_GEN_SCRIPT}"
+    VERBATIM
+  )
+  add_custom_target(OpenDRTOpenCLSourceHeader ALL DEPENDS "${OPENCL_KERNEL_HDR}")
+
   list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
 endif()
 
@@ -52,12 +72,19 @@ if(APPLE)
 endif()
 
 add_library(${PLUGIN_BASENAME} SHARED ${PLUGIN_SOURCES})
+if(WIN32)
+  # Ensure generated OpenCL header exists before C++ compilation begins.
+  add_dependencies(${PLUGIN_BASENAME} OpenDRTOpenCLSourceHeader)
+endif()
 
 target_include_directories(${PLUGIN_BASENAME} PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/include
   ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
   ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+if(WIN32)
+  target_include_directories(${PLUGIN_BASENAME} PRIVATE "${OPENCL_KERNEL_HDR_DIR}")
+endif()
 
 target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
   OFX_SUPPORTS_OPENCLRENDER
@@ -124,12 +151,6 @@ elseif(APPLE)
   set(OFX_RESOURCES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Resources")
 endif()
 file(MAKE_DIRECTORY "${OFX_OUTPUT_DIR}")
-if(WIN32)
-  add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-      "${CMAKE_CURRENT_SOURCE_DIR}/src/opencl/OpenDRT.cl"
-      "${OFX_OUTPUT_DIR}/OpenDRT.cl")
-endif()
 if(APPLE)
   file(MAKE_DIRECTORY "${OFX_RESOURCES_DIR}")
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD

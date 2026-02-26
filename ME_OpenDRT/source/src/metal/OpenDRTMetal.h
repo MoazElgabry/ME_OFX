@@ -16,4 +16,17 @@ bool render(
     const OpenDRTParams& params,
     const OpenDRTDerivedParams& derived);
 
+bool renderHost(
+    const void* srcMetalBuffer,
+    void* dstMetalBuffer,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    const OpenDRTParams& params,
+    const OpenDRTDerivedParams& derived,
+    void* metalCommandQueue);
+
+void resetHostMetalFailureState();
+
 }  // namespace OpenDRTMetal

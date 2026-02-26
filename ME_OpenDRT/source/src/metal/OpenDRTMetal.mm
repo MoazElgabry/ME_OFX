@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
+#include <atomic>
 
 #include "OpenDRTMetal.h"
 
@@ -24,6 +25,8 @@ struct MetalContext {
   id<MTLCommandQueue> queue = nil;
   id<MTLComputePipelineState> pipeline = nil;
   std::mutex initMutex;
+  std::atomic<int> hostAsyncErrorCount{0};
+  std::atomic<bool> hostTemporarilyDisabled{false};
   bool initialized = false;
   bool initAttempted = false;
 };
@@ -70,6 +73,11 @@ bool shouldSerializeRender() {
   return enabled;
 }
 
+bool forceHostMetalWait() {
+  static const bool enabled = envFlagEnabled("ME_OPENDRT_HOST_METAL_FORCE_WAIT");
+  return enabled;
+}
+
 bool disableMetal2DCopy() {
   static const bool enabled = envFlagEnabled("ME_OPENDRT_DISABLE_METAL_2D_COPY");
   return enabled;
@@ -105,21 +113,11 @@ std::string metallibPath() {
   return (macosDir.parent_path() / "Resources" / "OpenDRT.metallib").string();
 }
 
-bool initialize() {
+bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defaultQueue) {
   auto& ctx = context();
-  std::lock_guard<std::mutex> lock(ctx.initMutex);
-  if (ctx.initialized) {
-    return true;
-  }
-  if (ctx.initAttempted) {
-    return false;
-  }
-  ctx.initAttempted = true;
-
-  ctx.device = MTLCreateSystemDefaultDevice();
-  if (ctx.device == nil) return false;
-
-  ctx.queue = [ctx.device newCommandQueue];
+  if (device == nil || defaultQueue == nil) return false;
+  ctx.device = device;
+  ctx.queue = defaultQueue;
   if (ctx.queue == nil) return false;
 
   // Metallib is packaged into Contents/Resources during CMake build.
@@ -152,7 +150,36 @@ bool initialize() {
   }
 
   ctx.initialized = true;
+  ctx.initAttempted = true;
   return true;
+}
+
+bool initialize(id<MTLCommandQueue> preferredQueue = nil) {
+  auto& ctx = context();
+  std::lock_guard<std::mutex> lock(ctx.initMutex);
+
+  id<MTLDevice> desiredDevice = preferredQueue != nil ? preferredQueue.device : MTLCreateSystemDefaultDevice();
+  id<MTLCommandQueue> desiredQueue = preferredQueue != nil ? preferredQueue : (desiredDevice != nil ? [desiredDevice newCommandQueue] : nil);
+  if (desiredDevice == nil || desiredQueue == nil) return false;
+
+  if (ctx.initialized) {
+    if (ctx.device == desiredDevice) {
+      // Keep shared queue stable for internal path if already set; only initialize it once.
+      if (ctx.queue == nil) ctx.queue = desiredQueue;
+      return true;
+    }
+    // Host queue/device changed (or host uses different device): rebuild pipeline safely.
+    ctx.pipeline = nil;
+    ctx.queue = nil;
+    ctx.device = nil;
+    ctx.initialized = false;
+    ctx.initAttempted = false;
+  } else if (ctx.initAttempted) {
+    // Prior init attempt failed and no valid initialized context exists.
+    return false;
+  }
+
+  return initializePipelineForDevice(desiredDevice, desiredQueue);
 }
 
 }  // namespace
@@ -179,6 +206,7 @@ static bool renderImpl(
   auto& buffers = threadBuffers();
   const size_t bytes = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u * sizeof(float);
   const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+  const int packedRowFloats = width * 4;
   const bool packedSrc = (srcRowBytes == packedRowBytes);
   const bool packedDst = (dstRowBytes == packedRowBytes);
   const auto tCopyInStart = std::chrono::steady_clock::now();
@@ -223,6 +251,8 @@ static bool renderImpl(
   [enc setBytes:&width length:sizeof(int) atIndex:3];
   [enc setBytes:&height length:sizeof(int) atIndex:4];
   [enc setBytes:&derived length:sizeof(OpenDRTDerivedParams) atIndex:5];
+  [enc setBytes:&packedRowFloats length:sizeof(int) atIndex:6];
+  [enc setBytes:&packedRowFloats length:sizeof(int) atIndex:7];
 
   // Mirrors CUDA-style 2D launch: one thread per output pixel.
   auto chooseThreadsPerThreadgroup = [&]() -> MTLSize {
@@ -295,6 +325,131 @@ bool render(
     return renderImpl(src, dst, width, height, srcRowBytes, dstRowBytes, params, derived);
   }
   return renderImpl(src, dst, width, height, srcRowBytes, dstRowBytes, params, derived);
+}
+
+void resetHostMetalFailureState() {
+  auto& ctx = context();
+  ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+  ctx.hostTemporarilyDisabled.store(false, std::memory_order_relaxed);
+}
+
+bool renderHost(
+    const void* srcMetalBuffer,
+    void* dstMetalBuffer,
+    int width,
+    int height,
+    size_t srcRowBytes,
+    size_t dstRowBytes,
+    const OpenDRTParams& params,
+    const OpenDRTDerivedParams& derived,
+    void* metalCommandQueue) {
+  const auto tStart = std::chrono::steady_clock::now();
+  if (srcMetalBuffer == nullptr || dstMetalBuffer == nullptr || metalCommandQueue == nullptr || width <= 0 || height <= 0) {
+    return false;
+  }
+
+  id<MTLCommandQueue> hostQueue = (id<MTLCommandQueue>)metalCommandQueue;
+  if (hostQueue == nil) return false;
+  auto& ctx = context();
+  if (ctx.hostTemporarilyDisabled.load(std::memory_order_relaxed)) {
+    debugLog("Host Metal path temporarily disabled due to prior async errors.");
+    return false;
+  }
+  if (!initialize(hostQueue)) {
+    debugLog("Host Metal initialization failed.");
+    return false;
+  }
+
+  id<MTLBuffer> srcBuffer = (id<MTLBuffer>)srcMetalBuffer;
+  id<MTLBuffer> dstBuffer = (id<MTLBuffer>)dstMetalBuffer;
+  if (srcBuffer == nil || dstBuffer == nil) return false;
+
+  const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+  if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+  if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+  if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes) return false;
+  if ((srcRowBytes % sizeof(float)) != 0 || (dstRowBytes % sizeof(float)) != 0) return false;
+
+  const size_t requiredSrcBytes = srcRowBytes * static_cast<size_t>(height);
+  const size_t requiredDstBytes = dstRowBytes * static_cast<size_t>(height);
+  if (srcBuffer.length < requiredSrcBytes || dstBuffer.length < requiredDstBytes) return false;
+
+  const int srcRowFloats = static_cast<int>(srcRowBytes / sizeof(float));
+  const int dstRowFloats = static_cast<int>(dstRowBytes / sizeof(float));
+
+  id<MTLCommandBuffer> cmd = [hostQueue commandBuffer];
+  if (cmd == nil) {
+    debugLog("Failed to create host Metal command buffer.");
+    return false;
+  }
+  id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+  if (enc == nil) {
+    debugLog("Failed to create host Metal compute encoder.");
+    return false;
+  }
+
+  [enc setComputePipelineState:ctx.pipeline];
+  [enc setBuffer:srcBuffer offset:0 atIndex:0];
+  [enc setBuffer:dstBuffer offset:0 atIndex:1];
+  [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
+  [enc setBytes:&width length:sizeof(int) atIndex:3];
+  [enc setBytes:&height length:sizeof(int) atIndex:4];
+  [enc setBytes:&derived length:sizeof(OpenDRTDerivedParams) atIndex:5];
+  [enc setBytes:&srcRowFloats length:sizeof(int) atIndex:6];
+  [enc setBytes:&dstRowFloats length:sizeof(int) atIndex:7];
+
+  const NSUInteger maxThreads = ctx.pipeline.maxTotalThreadsPerThreadgroup;
+  const NSUInteger tew = ctx.pipeline.threadExecutionWidth;
+  NSUInteger tx = tew > 0 ? tew : 16;
+  if (tx > maxThreads) tx = maxThreads;
+  NSUInteger ty = maxThreads / tx;
+  if (ty == 0) ty = 1;
+  if (ty > 16) ty = 16;
+  const MTLSize threadsPerThreadgroup = MTLSizeMake(tx, ty, 1);
+  const MTLSize threadsPerGrid = MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(height), 1);
+  [enc dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+  [enc endEncoding];
+  if (!forceHostMetalWait()) {
+    [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+      if (cb.status != MTLCommandBufferStatusCompleted) {
+        context().hostAsyncErrorCount.fetch_add(1, std::memory_order_relaxed);
+        if (debugLogEnabled()) {
+          if (cb.error != nil) {
+            NSLog(@"ME_OpenDRT Metal host async failure: %@", cb.error.localizedDescription);
+          } else {
+            NSLog(@"ME_OpenDRT Metal host async failure with unknown error");
+          }
+        }
+      } else {
+        context().hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+      }
+    }];
+  }
+  [cmd commit];
+
+  if (forceHostMetalWait()) {
+    [cmd waitUntilCompleted];
+    if (cmd.status != MTLCommandBufferStatusCompleted) {
+      if (cmd.error != nil) {
+        NSLog(@"ME_OpenDRT Metal host: command buffer failed: %@", cmd.error.localizedDescription);
+      }
+      debugLog("Host Metal command buffer failed.");
+      return false;
+    }
+    ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+  }
+
+  if (!forceHostMetalWait()) {
+    const int errors = ctx.hostAsyncErrorCount.load(std::memory_order_relaxed);
+    if (errors >= 3) {
+      ctx.hostTemporarilyDisabled.store(true, std::memory_order_relaxed);
+      debugLog("Host Metal path auto-disabled after repeated async errors.");
+      return false;
+    }
+  }
+
+  perfLogStage("Metal host total", tStart);
+  return true;
 }
 
 }  // namespace OpenDRTMetal

@@ -9,6 +9,7 @@
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <sstream>
 #include <vector>
 
 #include "OpenDRTParams.h"
@@ -19,9 +20,22 @@
 #define CL_TARGET_OPENCL_VERSION 120
 #include <CL/cl.h>
 #include <cuda_runtime.h>
+// Generated during build from src/opencl/OpenDRT.cl.
+// Note-to-self: this is the primary OpenCL source path now.
+#include "OpenDRTCLSource.h"
 extern "C" void launchOpenDRTKernel(
     const float* src,
     float* dst,
+    int width,
+    int height,
+    const OpenDRTParams* p,
+    const OpenDRTDerivedParams* d,
+    cudaStream_t stream);
+extern "C" void launchOpenDRTKernelPitched(
+    const float* src,
+    size_t srcRowBytes,
+    float* dst,
+    size_t dstRowBytes,
     int width,
     int height,
     const OpenDRTParams* p,
@@ -40,6 +54,7 @@ class OpenDRTProcessor {
   ~OpenDRTProcessor() {
 #if defined(_WIN32)
     releaseCudaStream();
+    releaseCudaCopyResources();
     releaseCudaBuffers();
     releaseOpenCL();
 #endif
@@ -88,6 +103,96 @@ class OpenDRTProcessor {
   }
 
 #if defined(_WIN32)
+  // Host CUDA path: source/destination pointers are device pointers provided by OFX host.
+  // This avoids host<->device staging copies and keeps math parity by launching the same kernel.
+  bool renderCUDAHostBuffers(
+      const float* srcDevice,
+      float* dstDevice,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes,
+      void* hostCudaStreamOpaque) {
+    std::lock_guard<std::mutex> lock(cudaMutex_);
+    if (!srcDevice || !dstDevice || width <= 0 || height <= 0) return false;
+    if (!ensureCudaDevice()) return false;
+
+    computeDerivedParams();
+
+    const size_t packedRowBytes = static_cast<size_t>(width) * 4u * sizeof(float);
+    if (srcRowBytes == 0) srcRowBytes = packedRowBytes;
+    if (dstRowBytes == 0) dstRowBytes = packedRowBytes;
+    if (srcRowBytes < packedRowBytes || dstRowBytes < packedRowBytes) return false;
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(hostCudaStreamOpaque);
+    bool usingHostStream = (stream != nullptr);
+    if (stream == nullptr) {
+      if (!ensureCudaStream()) return false;
+      stream = cudaStream_;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto tKernel = std::chrono::steady_clock::now();
+    cudaEvent_t evStart = nullptr, evAfterKernel = nullptr;
+    const bool gpuEventTiming = perfLogEnabled_;
+    if (gpuEventTiming) {
+      if (cudaEventCreateWithFlags(&evStart, cudaEventDefault) != cudaSuccess ||
+          cudaEventCreateWithFlags(&evAfterKernel, cudaEventDefault) != cudaSuccess) {
+        if (evStart) cudaEventDestroy(evStart);
+        if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+        evStart = evAfterKernel = nullptr;
+      } else {
+        cudaEventRecord(evStart, stream);
+      }
+    }
+    // True host-CUDA zero-copy path: kernel reads/writes host-provided device buffers directly.
+    launchOpenDRTKernelPitched(
+        srcDevice, srcRowBytes, dstDevice, dstRowBytes, width, height, &params_, &derived_, stream);
+    if (cudaGetLastError() != cudaSuccess) {
+      if (evStart) cudaEventDestroy(evStart);
+      if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+      return false;
+    }
+    if (evAfterKernel != nullptr) cudaEventRecord(evAfterKernel, stream);
+    perfLogStage("CUDA host kernel launch", tKernel);
+
+    // In OFX host CUDA mode, default behavior avoids host-stream sync for max throughput.
+    // Optional debug mode can force sync for true wall-time profiling.
+    if (!usingHostStream || hostCudaForceSyncEnabled_) {
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        if (evStart) cudaEventDestroy(evStart);
+        if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+        return false;
+      }
+    }
+    if (evStart != nullptr && evAfterKernel != nullptr && (!usingHostStream || hostCudaForceSyncEnabled_)) {
+      float msKernel = 0.0f;
+      cudaEventElapsedTime(&msKernel, evStart, evAfterKernel);
+      std::ostringstream oss;
+      oss << "CUDA host GPU timings H2D=0 ms, Kernel=" << msKernel << " ms, D2H=0 ms, Total=" << msKernel << " ms";
+      const std::string msg = oss.str();
+      debugLog(msg.c_str());
+      if (perfLogEnabled_) {
+        std::fprintf(stderr, "[ME_OpenDRT][PERF] %s\n", msg.c_str());
+#if defined(_WIN32)
+        const char* base = std::getenv("LOCALAPPDATA");
+        if (base != nullptr && base[0] != '\0') {
+          std::string dir(base);
+          dir += "\\ME_OpenDRT";
+          CreateDirectoryA(dir.c_str(), nullptr);
+          std::string path = dir + "\\perf.log";
+          std::ofstream ofs(path, std::ios::app);
+          if (ofs.is_open()) ofs << "[ME_OpenDRT][PERF] " << msg << "\n";
+        }
+#endif
+      }
+    }
+    if (evStart) cudaEventDestroy(evStart);
+    if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+    perfLogStage("CUDA host render", t0);
+    return true;
+  }
+
   // CUDA path is the primary Windows GPU backend.
   // It keeps existing async + 2D copy optimizations and can fall back to legacy sync via env flag.
   bool renderCUDA(const float* src, float* dst, int width, int height, size_t srcRowBytes, size_t dstRowBytes) {
@@ -108,6 +213,9 @@ class OpenDRTProcessor {
       debugLog("CUDA stream init failed, using legacy sync path.");
       return renderCUDALegacy(src, dst, width, height, bytes, srcRowBytes, dstRowBytes);
     }
+    if (!cudaLegacySyncEnabled_ && cudaDualStreamEnabled_ && !ensureCudaCopyResources()) {
+      debugLog("CUDA copy stream/event init failed, using single-stream path.");
+    }
 
     if (cudaLegacySyncEnabled_) {
       return renderCUDALegacy(src, dst, width, height, bytes, srcRowBytes, dstRowBytes);
@@ -115,6 +223,24 @@ class OpenDRTProcessor {
 
     const auto t0 = std::chrono::steady_clock::now();
     const auto tH2D = std::chrono::steady_clock::now();
+    const bool useDualStream = cudaDualStreamEnabled_ && (cudaCopyStream_ != nullptr) && (h2dDoneEvent_ != nullptr) &&
+                               (kernelDoneEvent_ != nullptr);
+    cudaEvent_t evStart = nullptr, evAfterH2D = nullptr, evAfterKernel = nullptr, evAfterD2H = nullptr;
+    const bool gpuEventTiming = perfLogEnabled_;
+    if (gpuEventTiming) {
+      if (cudaEventCreateWithFlags(&evStart, cudaEventDefault) != cudaSuccess ||
+          cudaEventCreateWithFlags(&evAfterH2D, cudaEventDefault) != cudaSuccess ||
+          cudaEventCreateWithFlags(&evAfterKernel, cudaEventDefault) != cudaSuccess ||
+          cudaEventCreateWithFlags(&evAfterD2H, cudaEventDefault) != cudaSuccess) {
+        if (evStart) cudaEventDestroy(evStart);
+        if (evAfterH2D) cudaEventDestroy(evAfterH2D);
+        if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+        if (evAfterD2H) cudaEventDestroy(evAfterD2H);
+        evStart = evAfterH2D = evAfterKernel = evAfterD2H = nullptr;
+      } else {
+        cudaEventRecord(evStart, useDualStream ? cudaCopyStream_ : cudaStream_);
+      }
+    }
 
     if (!cudaDisable2DCopyEnabled_ && !packedSrc) {
       if (cudaMemcpy2DAsync(
@@ -125,15 +251,21 @@ class OpenDRTProcessor {
               packedRowBytes,
               static_cast<size_t>(height),
               cudaMemcpyHostToDevice,
-              cudaStream_) != cudaSuccess) {
+              useDualStream ? cudaCopyStream_ : cudaStream_) != cudaSuccess) {
         return false;
       }
     } else {
       if (!packedSrc) return false;
-      if (cudaMemcpyAsync(cudaSrc_, src, bytes, cudaMemcpyHostToDevice, cudaStream_) != cudaSuccess) {
+      if (cudaMemcpyAsync(cudaSrc_, src, bytes, cudaMemcpyHostToDevice, useDualStream ? cudaCopyStream_ : cudaStream_) !=
+          cudaSuccess) {
         return false;
       }
     }
+    if (useDualStream) {
+      if (cudaEventRecord(h2dDoneEvent_, cudaCopyStream_) != cudaSuccess) return false;
+      if (cudaStreamWaitEvent(cudaStream_, h2dDoneEvent_, 0) != cudaSuccess) return false;
+    }
+    if (evAfterH2D != nullptr) cudaEventRecord(evAfterH2D, useDualStream ? cudaCopyStream_ : cudaStream_);
     perfLogStage("CUDA H2D", tH2D);
 
     // Kernel reads flat RGBA float pixels and resolved scalar params.
@@ -144,9 +276,14 @@ class OpenDRTProcessor {
     if (launchStatus != cudaSuccess) {
       return false;
     }
+    if (evAfterKernel != nullptr) cudaEventRecord(evAfterKernel, cudaStream_);
     perfLogStage("CUDA kernel launch", tKernel);
 
     const auto tD2H = std::chrono::steady_clock::now();
+    if (useDualStream) {
+      if (cudaEventRecord(kernelDoneEvent_, cudaStream_) != cudaSuccess) return false;
+      if (cudaStreamWaitEvent(cudaCopyStream_, kernelDoneEvent_, 0) != cudaSuccess) return false;
+    }
     if (!cudaDisable2DCopyEnabled_ && !packedDst) {
       if (cudaMemcpy2DAsync(
               dst,
@@ -156,20 +293,56 @@ class OpenDRTProcessor {
               packedRowBytes,
               static_cast<size_t>(height),
               cudaMemcpyDeviceToHost,
-              cudaStream_) != cudaSuccess) {
+              useDualStream ? cudaCopyStream_ : cudaStream_) != cudaSuccess) {
         return false;
       }
     } else {
       if (!packedDst) return false;
-      if (cudaMemcpyAsync(dst, cudaDst_, bytes, cudaMemcpyDeviceToHost, cudaStream_) != cudaSuccess) {
+      if (cudaMemcpyAsync(dst, cudaDst_, bytes, cudaMemcpyDeviceToHost, useDualStream ? cudaCopyStream_ : cudaStream_) !=
+          cudaSuccess) {
         return false;
       }
     }
     perfLogStage("CUDA D2H", tD2H);
 
-    if (cudaStreamSynchronize(cudaStream_) != cudaSuccess) {
-      return false;
+    if (useDualStream) {
+      if (cudaStreamSynchronize(cudaCopyStream_) != cudaSuccess) return false;
+    } else {
+      if (cudaStreamSynchronize(cudaStream_) != cudaSuccess) return false;
     }
+    if (evAfterD2H != nullptr) cudaEventRecord(evAfterD2H, useDualStream ? cudaCopyStream_ : cudaStream_);
+
+    if (evStart != nullptr && evAfterH2D != nullptr && evAfterKernel != nullptr && evAfterD2H != nullptr) {
+      cudaEventSynchronize(evAfterD2H);
+      float msH2D = 0.0f, msKernel = 0.0f, msD2H = 0.0f, msTotal = 0.0f;
+      cudaEventElapsedTime(&msH2D, evStart, evAfterH2D);
+      cudaEventElapsedTime(&msKernel, evAfterH2D, evAfterKernel);
+      cudaEventElapsedTime(&msD2H, evAfterKernel, evAfterD2H);
+      cudaEventElapsedTime(&msTotal, evStart, evAfterD2H);
+      std::ostringstream oss;
+      oss << "CUDA GPU timings H2D=" << msH2D << " ms, Kernel=" << msKernel
+          << " ms, D2H=" << msD2H << " ms, Total=" << msTotal << " ms";
+      const std::string msg = oss.str();
+      debugLog(msg.c_str());
+      if (perfLogEnabled_) {
+        std::fprintf(stderr, "[ME_OpenDRT][PERF] %s\n", msg.c_str());
+#if defined(_WIN32)
+        const char* base = std::getenv("LOCALAPPDATA");
+        if (base != nullptr && base[0] != '\0') {
+          std::string dir(base);
+          dir += "\\ME_OpenDRT";
+          CreateDirectoryA(dir.c_str(), nullptr);
+          std::string path = dir + "\\perf.log";
+          std::ofstream ofs(path, std::ios::app);
+          if (ofs.is_open()) ofs << "[ME_OpenDRT][PERF] " << msg << "\n";
+        }
+#endif
+      }
+    }
+    if (evStart) cudaEventDestroy(evStart);
+    if (evAfterH2D) cudaEventDestroy(evAfterH2D);
+    if (evAfterKernel) cudaEventDestroy(evAfterKernel);
+    if (evAfterD2H) cudaEventDestroy(evAfterD2H);
 
     perfLogStage("CUDA render", t0);
 
@@ -189,6 +362,21 @@ class OpenDRTProcessor {
     const auto t0 = std::chrono::steady_clock::now();
     const bool ok = OpenDRTMetal::render(src, dst, width, height, srcRowBytes, dstRowBytes, params_, derived_);
     perfLogStage("Metal render", t0);
+    return ok;
+  }
+
+  bool renderMetalHostBuffers(
+      const void* srcMetalBuffer,
+      void* dstMetalBuffer,
+      int width,
+      int height,
+      size_t srcRowBytes,
+      size_t dstRowBytes,
+      void* metalCommandQueue) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = OpenDRTMetal::renderHost(
+        srcMetalBuffer, dstMetalBuffer, width, height, srcRowBytes, dstRowBytes, params_, derived_, metalCommandQueue);
+    perfLogStage("Metal host render", t0);
     return ok;
   }
 #endif
@@ -329,6 +517,26 @@ class OpenDRTProcessor {
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - start).count();
     std::fprintf(stderr, "[ME_OpenDRT][PERF] %s: %.3f ms\n", label, ms);
+#if defined(_WIN32)
+    static bool pathInit = false;
+    static std::string logPath;
+    if (!pathInit) {
+      pathInit = true;
+      const char* base = std::getenv("LOCALAPPDATA");
+      if (base != nullptr && base[0] != '\0') {
+        std::string dir(base);
+        dir += "\\ME_OpenDRT";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        logPath = dir + "\\perf.log";
+      }
+    }
+    if (!logPath.empty()) {
+      std::ofstream ofs(logPath, std::ios::app);
+      if (ofs.is_open()) {
+        ofs << "[ME_OpenDRT][PERF] " << label << ": " << ms << " ms\n";
+      }
+    }
+#endif
   }
 
   void initRuntimeFlags() {
@@ -338,9 +546,20 @@ class OpenDRTProcessor {
     // Runtime switches for triage/perf tuning without rebuilding.
     cudaLegacySyncEnabled_ = envFlagEnabled("ME_OPENDRT_CUDA_LEGACY_SYNC");
     cudaDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_CUDA_2D_COPY");
+    cudaDualStreamEnabled_ = !envFlagEnabled("ME_OPENDRT_DISABLE_CUDA_PIPELINE");
+    hostCudaForceSyncEnabled_ = envFlagEnabled("ME_OPENDRT_HOST_CUDA_FORCE_SYNC");
     openclForceEnabled_ = envFlagEnabled("ME_OPENDRT_FORCE_OPENCL");
     openclDisableEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_OPENCL");
     openclDisable2DCopyEnabled_ = envFlagEnabled("ME_OPENDRT_OPENCL_DISABLE_2D_COPY");
+    // Note-to-self:
+    // Defaulting fallback to ON is intentional for safe transition to embedding.
+    // Set this env to 0 to test strict embedded-only behavior.
+    const char* openclFallbackEnv = std::getenv("ME_OPENDRT_OPENCL_EXTERNAL_KERNEL_FALLBACK");
+    if (openclFallbackEnv == nullptr || openclFallbackEnv[0] == '\0') {
+      openclExternalKernelFallbackEnabled_ = true;
+    } else {
+      openclExternalKernelFallbackEnabled_ = !(openclFallbackEnv[0] == '0' && openclFallbackEnv[1] == '\0');
+    }
 #endif
     disableDerivedEnabled_ = envFlagEnabled("ME_OPENDRT_DISABLE_DERIVED");
   }
@@ -395,6 +614,9 @@ class OpenDRTProcessor {
   }
 
   std::string openclKernelPath() const {
+    // Note-to-self:
+    // This exists only for temporary external-source fallback troubleshooting.
+    // Safe to remove when rollout completes and fallback is retired.
     HMODULE self = nullptr;
     if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             reinterpret_cast<LPCSTR>(&launchOpenDRTKernel), &self)) {
@@ -457,26 +679,7 @@ class OpenDRTProcessor {
       return false;
     }
 
-    const std::string path = openclKernelPath();
-    std::ifstream ifs(path, std::ios::binary);
-    if (!ifs.is_open()) {
-      debugLog("OpenCL kernel source not found next to plugin binary.");
-      clInitFailed_ = true;
-      releaseOpenCL();
-      return false;
-    }
-    const std::string source((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-    const char* src = source.c_str();
-    const size_t len = source.size();
-    clProgram_ = clCreateProgramWithSource(clContext_, 1, &src, &len, &err);
-    if (err != CL_SUCCESS || clProgram_ == nullptr) {
-      clInitFailed_ = true;
-      releaseOpenCL();
-      return false;
-    }
-
-    err = clBuildProgram(clProgram_, 1, &clDevice_, nullptr, nullptr, nullptr);
-    if (err != CL_SUCCESS) {
+    auto printBuildLog = [&]() {
       size_t logSize = 0;
       clGetProgramBuildInfo(clProgram_, clDevice_, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
       if (logSize > 1) {
@@ -484,6 +687,38 @@ class OpenDRTProcessor {
         clGetProgramBuildInfo(clProgram_, clDevice_, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
         if (debugLogEnabled_) std::fprintf(stderr, "[ME_OpenDRT] OpenCL build log:\n%s\n", log.data());
       }
+    };
+
+    // Shared compile helper for embedded source + optional external fallback.
+    auto buildProgramFromSource = [&](const char* src, size_t len, const char* sourceMode) -> bool {
+      clProgram_ = clCreateProgramWithSource(clContext_, 1, &src, &len, &err);
+      if (err != CL_SUCCESS || clProgram_ == nullptr) return false;
+
+      err = clBuildProgram(clProgram_, 1, &clDevice_, nullptr, nullptr, nullptr);
+      if (err == CL_SUCCESS) {
+        if (debugLogEnabled_) std::fprintf(stderr, "[ME_OpenDRT] OpenCL kernel source mode: %s\n", sourceMode);
+        return true;
+      }
+
+      printBuildLog();
+      clReleaseProgram(clProgram_);
+      clProgram_ = nullptr;
+      return false;
+    };
+
+    bool programReady = buildProgramFromSource(kOpenDRTCLSource, kOpenDRTCLSourceSize, "embedded");
+    if (!programReady && openclExternalKernelFallbackEnabled_) {
+      const std::string path = openclKernelPath();
+      std::ifstream ifs(path, std::ios::binary);
+      if (ifs.is_open()) {
+        const std::string source((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        programReady = buildProgramFromSource(source.c_str(), source.size(), "external fallback");
+      } else if (debugLogEnabled_) {
+        std::fprintf(stderr, "[ME_OpenDRT] OpenCL external fallback source not found: %s\n", path.c_str());
+      }
+    }
+
+    if (!programReady) {
       clInitFailed_ = true;
       releaseOpenCL();
       return false;
@@ -546,6 +781,33 @@ class OpenDRTProcessor {
     if (cudaStream_ != nullptr) {
       cudaStreamDestroy(cudaStream_);
       cudaStream_ = nullptr;
+    }
+  }
+
+  bool ensureCudaCopyResources() {
+    if (cudaCopyStream_ == nullptr && cudaStreamCreate(&cudaCopyStream_) != cudaSuccess) return false;
+    if (h2dDoneEvent_ == nullptr && cudaEventCreateWithFlags(&h2dDoneEvent_, cudaEventDisableTiming) != cudaSuccess) {
+      return false;
+    }
+    if (kernelDoneEvent_ == nullptr &&
+        cudaEventCreateWithFlags(&kernelDoneEvent_, cudaEventDisableTiming) != cudaSuccess) {
+      return false;
+    }
+    return true;
+  }
+
+  void releaseCudaCopyResources() {
+    if (kernelDoneEvent_ != nullptr) {
+      cudaEventDestroy(kernelDoneEvent_);
+      kernelDoneEvent_ = nullptr;
+    }
+    if (h2dDoneEvent_ != nullptr) {
+      cudaEventDestroy(h2dDoneEvent_);
+      h2dDoneEvent_ = nullptr;
+    }
+    if (cudaCopyStream_ != nullptr) {
+      cudaStreamDestroy(cudaCopyStream_);
+      cudaCopyStream_ = nullptr;
     }
   }
 
@@ -681,10 +943,13 @@ class OpenDRTProcessor {
   // CUDA feature flags and cached device/runtime state.
   bool cudaLegacySyncEnabled_ = false;
   bool cudaDisable2DCopyEnabled_ = false;
+  bool cudaDualStreamEnabled_ = true;
+  bool hostCudaForceSyncEnabled_ = false;
   // OpenCL feature flags and cached runtime state.
   bool openclForceEnabled_ = false;
   bool openclDisableEnabled_ = false;
   bool openclDisable2DCopyEnabled_ = false;
+  bool openclExternalKernelFallbackEnabled_ = true;
   bool openclAvailability_ = false;
   bool openclAvailabilityKnown_ = false;
   bool clInitFailed_ = false;
@@ -694,6 +959,9 @@ class OpenDRTProcessor {
   float* cudaSrc_ = nullptr;
   float* cudaDst_ = nullptr;
   cudaStream_t cudaStream_ = nullptr;
+  cudaStream_t cudaCopyStream_ = nullptr;
+  cudaEvent_t h2dDoneEvent_ = nullptr;
+  cudaEvent_t kernelDoneEvent_ = nullptr;
   size_t cudaBytes_ = 0;
   std::mutex cudaMutex_;
   cl_platform_id clPlatform_ = nullptr;

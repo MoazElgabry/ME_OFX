@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <cstdio>
+#include <limits>
 
 #include "../OpenDRTParams.h"
 
@@ -228,19 +229,89 @@ __device__ float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, 
 
 // Full OpenDRT transform port is implemented here for CUDA.
 __device__ float3 openDRTTransform(
-    int width, int height, int x, int y, float3 rgb, const OpenDRTParams& p, const OpenDRTDerivedParams& d) {
-  int in_gamut = p.in_gamut, in_oetf = p.in_oetf, crv_enable = p.crv_enable, tn_hcon_enable = p.tn_hcon_enable, tn_lcon_enable = p.tn_lcon_enable;
-  int pt_enable = p.pt_enable, ptl_enable = p.ptl_enable, ptm_enable = p.ptm_enable, brl_enable = p.brl_enable, brlp_enable = p.brlp_enable, hc_enable = p.hc_enable, hs_rgb_enable = p.hs_rgb_enable, hs_cmy_enable = p.hs_cmy_enable;
-  int cwp = p.cwp, tn_su = p.tn_su, clamp = p.clamp, display_gamut = p.display_gamut, eotf = p.eotf;
-  float tn_Lp = p.tn_Lp, tn_gb = p.tn_gb, pt_hdr = p.pt_hdr, tn_Lg = p.tn_Lg, tn_con = p.tn_con, tn_sh = p.tn_sh, tn_toe = p.tn_toe, tn_off = p.tn_off;
-  float tn_hcon = p.tn_hcon, tn_hcon_pv = p.tn_hcon_pv, tn_hcon_st = p.tn_hcon_st, tn_lcon = p.tn_lcon, tn_lcon_w = p.tn_lcon_w;
-  float rs_sa = p.rs_sa, rs_rw = p.rs_rw, rs_bw = p.rs_bw;
-  float pt_lml = p.pt_lml, pt_lml_r = p.pt_lml_r, pt_lml_g = p.pt_lml_g, pt_lml_b = p.pt_lml_b, pt_lmh = p.pt_lmh, pt_lmh_r = p.pt_lmh_r, pt_lmh_b = p.pt_lmh_b;
-  float ptl_c = p.ptl_c, ptl_m = p.ptl_m, ptl_y = p.ptl_y, ptm_low = p.ptm_low, ptm_low_rng = p.ptm_low_rng, ptm_low_st = p.ptm_low_st, ptm_high = p.ptm_high, ptm_high_rng = p.ptm_high_rng, ptm_high_st = p.ptm_high_st;
-  float brl = p.brl, brl_r = p.brl_r, brl_g = p.brl_g, brl_b = p.brl_b, brl_rng = p.brl_rng, brl_st = p.brl_st;
-  float brlp = p.brlp, brlp_r = p.brlp_r, brlp_g = p.brlp_g, brlp_b = p.brlp_b;
-  float hc_r = p.hc_r, hc_r_rng = p.hc_r_rng, hs_r = p.hs_r, hs_r_rng = p.hs_r_rng, hs_g = p.hs_g, hs_g_rng = p.hs_g_rng, hs_b = p.hs_b, hs_b_rng = p.hs_b_rng;
-  float hs_c = p.hs_c, hs_c_rng = p.hs_c_rng, hs_m = p.hs_m, hs_m_rng = p.hs_m_rng, hs_y = p.hs_y, hs_y_rng = p.hs_y_rng, cwp_lm = p.cwp_lm;
+    int width,
+    int height,
+    int x,
+    int y,
+    float3 rgb,
+    const OpenDRTParams* __restrict__ p,
+    const OpenDRTDerivedParams* __restrict__ d) {
+  const int in_gamut = p->in_gamut;
+  const int in_oetf = p->in_oetf;
+  const int crv_enable = p->crv_enable;
+  const int display_gamut = p->display_gamut;
+  const int eotf = p->eotf;
+  const int clamp = p->clamp;
+
+#define tn_hcon_enable (p->tn_hcon_enable)
+#define tn_lcon_enable (p->tn_lcon_enable)
+#define pt_enable (p->pt_enable)
+#define ptl_enable (p->ptl_enable)
+#define ptm_enable (p->ptm_enable)
+#define brl_enable (p->brl_enable)
+#define brlp_enable (p->brlp_enable)
+#define hc_enable (p->hc_enable)
+#define hs_rgb_enable (p->hs_rgb_enable)
+#define hs_cmy_enable (p->hs_cmy_enable)
+#define cwp (p->cwp)
+#define tn_su (p->tn_su)
+#define tn_Lp (p->tn_Lp)
+#define tn_gb (p->tn_gb)
+#define pt_hdr (p->pt_hdr)
+#define tn_Lg (p->tn_Lg)
+#define tn_con (p->tn_con)
+#define tn_sh (p->tn_sh)
+#define tn_toe (p->tn_toe)
+#define tn_off (p->tn_off)
+#define tn_hcon (p->tn_hcon)
+#define tn_hcon_pv (p->tn_hcon_pv)
+#define tn_hcon_st (p->tn_hcon_st)
+#define tn_lcon (p->tn_lcon)
+#define tn_lcon_w (p->tn_lcon_w)
+#define rs_sa (p->rs_sa)
+#define rs_rw (p->rs_rw)
+#define rs_bw (p->rs_bw)
+#define pt_lml (p->pt_lml)
+#define pt_lml_r (p->pt_lml_r)
+#define pt_lml_g (p->pt_lml_g)
+#define pt_lml_b (p->pt_lml_b)
+#define pt_lmh (p->pt_lmh)
+#define pt_lmh_r (p->pt_lmh_r)
+#define pt_lmh_b (p->pt_lmh_b)
+#define ptl_c (p->ptl_c)
+#define ptl_m (p->ptl_m)
+#define ptl_y (p->ptl_y)
+#define ptm_low (p->ptm_low)
+#define ptm_low_rng (p->ptm_low_rng)
+#define ptm_low_st (p->ptm_low_st)
+#define ptm_high (p->ptm_high)
+#define ptm_high_rng (p->ptm_high_rng)
+#define ptm_high_st (p->ptm_high_st)
+#define brl (p->brl)
+#define brl_r (p->brl_r)
+#define brl_g (p->brl_g)
+#define brl_b (p->brl_b)
+#define brl_rng (p->brl_rng)
+#define brl_st (p->brl_st)
+#define brlp (p->brlp)
+#define brlp_r (p->brlp_r)
+#define brlp_g (p->brlp_g)
+#define brlp_b (p->brlp_b)
+#define hc_r (p->hc_r)
+#define hc_r_rng (p->hc_r_rng)
+#define hs_r (p->hs_r)
+#define hs_r_rng (p->hs_r_rng)
+#define hs_g (p->hs_g)
+#define hs_g_rng (p->hs_g_rng)
+#define hs_b (p->hs_b)
+#define hs_b_rng (p->hs_b_rng)
+#define hs_c (p->hs_c)
+#define hs_c_rng (p->hs_c_rng)
+#define hs_m (p->hs_m)
+#define hs_m_rng (p->hs_m_rng)
+#define hs_y (p->hs_y)
+#define hs_y_rng (p->hs_y_rng)
+#define cwp_lm (p->cwp_lm)
 
   float3x3 in_to_xyz;
   if (in_gamut == 0) in_to_xyz = identity();
@@ -265,21 +336,21 @@ __device__ float3 openDRTTransform(
   rgb = linearize(rgb, in_oetf);
 
   float ts_x1, ts_y1, ts_x0, ts_y0, ts_s0, ts_p, ts_s10, ts_m1, ts_m2, ts_s, ts_dsc, pt_cmp_Lf, s_Lp100, ts_s1;
-  if (d.enabled != 0) {
-    ts_x1 = d.ts_x1;
-    ts_y1 = d.ts_y1;
-    ts_x0 = d.ts_x0;
-    ts_y0 = d.ts_y0;
-    ts_s0 = d.ts_s0;
-    ts_p = d.ts_p;
-    ts_s10 = d.ts_s10;
-    ts_m1 = d.ts_m1;
-    ts_m2 = d.ts_m2;
-    ts_s = d.ts_s;
-    ts_dsc = d.ts_dsc;
-    pt_cmp_Lf = d.pt_cmp_Lf;
-    s_Lp100 = d.s_Lp100;
-    ts_s1 = d.ts_s1;
+  if (d->enabled != 0) {
+    ts_x1 = d->ts_x1;
+    ts_y1 = d->ts_y1;
+    ts_x0 = d->ts_x0;
+    ts_y0 = d->ts_y0;
+    ts_s0 = d->ts_s0;
+    ts_p = d->ts_p;
+    ts_s10 = d->ts_s10;
+    ts_m1 = d->ts_m1;
+    ts_m2 = d->ts_m2;
+    ts_s = d->ts_s;
+    ts_dsc = d->ts_dsc;
+    pt_cmp_Lf = d->pt_cmp_Lf;
+    s_Lp100 = d->s_Lp100;
+    ts_s1 = d->ts_s1;
   } else {
     ts_x1 = powf(2.0f, 6.0f * tn_sh + 4.0f);
     ts_y1 = tn_Lp / 100.0f;
@@ -423,6 +494,77 @@ __device__ float3 openDRTTransform(
     crv_rgb_dst = clampf3(crv_rgb_dst, 0.0f, 1.0f);
     rgb = rgb * (1.0f - crv_rgb_dst) + make_float3(1.0f, 1.0f, 1.0f) * crv_rgb_dst;
   }
+
+#undef tn_hcon_enable
+#undef tn_lcon_enable
+#undef pt_enable
+#undef ptl_enable
+#undef ptm_enable
+#undef brl_enable
+#undef brlp_enable
+#undef hc_enable
+#undef hs_rgb_enable
+#undef hs_cmy_enable
+#undef cwp
+#undef tn_su
+#undef tn_Lp
+#undef tn_gb
+#undef pt_hdr
+#undef tn_Lg
+#undef tn_con
+#undef tn_sh
+#undef tn_toe
+#undef tn_off
+#undef tn_hcon
+#undef tn_hcon_pv
+#undef tn_hcon_st
+#undef tn_lcon
+#undef tn_lcon_w
+#undef rs_sa
+#undef rs_rw
+#undef rs_bw
+#undef pt_lml
+#undef pt_lml_r
+#undef pt_lml_g
+#undef pt_lml_b
+#undef pt_lmh
+#undef pt_lmh_r
+#undef pt_lmh_b
+#undef ptl_c
+#undef ptl_m
+#undef ptl_y
+#undef ptm_low
+#undef ptm_low_rng
+#undef ptm_low_st
+#undef ptm_high
+#undef ptm_high_rng
+#undef ptm_high_st
+#undef brl
+#undef brl_r
+#undef brl_g
+#undef brl_b
+#undef brl_rng
+#undef brl_st
+#undef brlp
+#undef brlp_r
+#undef brlp_g
+#undef brlp_b
+#undef hc_r
+#undef hc_r_rng
+#undef hs_r
+#undef hs_r_rng
+#undef hs_g
+#undef hs_g_rng
+#undef hs_b
+#undef hs_b_rng
+#undef hs_c
+#undef hs_c_rng
+#undef hs_m
+#undef hs_m_rng
+#undef hs_y
+#undef hs_y_rng
+#undef cwp_lm
+
   return rgb;
 }
 
@@ -431,8 +573,8 @@ __global__ void OpenDRTKernel(
     float* __restrict__ dst,
     int width,
     int height,
-    OpenDRTParams p,
-    OpenDRTDerivedParams d) {
+    const OpenDRTParams* __restrict__ p,
+    const OpenDRTDerivedParams* __restrict__ d) {
   const int x = blockIdx.x * blockDim.x + threadIdx.x;
   const int y = blockIdx.y * blockDim.y + threadIdx.y;
   if (x >= width || y >= height) return;
@@ -445,6 +587,126 @@ __global__ void OpenDRTKernel(
   dst[i + 3] = src[i + 3];
 }
 
+__global__ void OpenDRTKernelLegacy(
+    const float* __restrict__ src,
+    float* __restrict__ dst,
+    int width,
+    int height,
+    OpenDRTParams p,
+    OpenDRTDerivedParams d) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+  const int i = (y * width + x) * 4;
+  float3 rgb = make_float3(src[i + 0], src[i + 1], src[i + 2]);
+  rgb = openDRTTransform(width, height, x, y, rgb, &p, &d);
+  dst[i + 0] = rgb.x;
+  dst[i + 1] = rgb.y;
+  dst[i + 2] = rgb.z;
+  dst[i + 3] = src[i + 3];
+}
+
+__global__ void OpenDRTKernelPitched(
+    const float* __restrict__ src,
+    size_t srcRowBytes,
+    float* __restrict__ dst,
+    size_t dstRowBytes,
+    int width,
+    int height,
+    const OpenDRTParams* __restrict__ p,
+    const OpenDRTDerivedParams* __restrict__ d) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+
+  const char* srcRow = reinterpret_cast<const char*>(src) + static_cast<size_t>(y) * srcRowBytes;
+  const float* srcPx = reinterpret_cast<const float*>(srcRow) + static_cast<size_t>(x) * 4u;
+  char* dstRow = reinterpret_cast<char*>(dst) + static_cast<size_t>(y) * dstRowBytes;
+  float* dstPx = reinterpret_cast<float*>(dstRow) + static_cast<size_t>(x) * 4u;
+
+  float3 rgb = make_float3(srcPx[0], srcPx[1], srcPx[2]);
+  rgb = openDRTTransform(width, height, x, y, rgb, p, d);
+  dstPx[0] = rgb.x;
+  dstPx[1] = rgb.y;
+  dstPx[2] = rgb.z;
+  dstPx[3] = srcPx[3];
+}
+
+__global__ void OpenDRTKernelPitchedLegacy(
+    const float* __restrict__ src,
+    size_t srcRowBytes,
+    float* __restrict__ dst,
+    size_t dstRowBytes,
+    int width,
+    int height,
+    OpenDRTParams p,
+    OpenDRTDerivedParams d) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= width || y >= height) return;
+
+  const char* srcRow = reinterpret_cast<const char*>(src) + static_cast<size_t>(y) * srcRowBytes;
+  const float* srcPx = reinterpret_cast<const float*>(srcRow) + static_cast<size_t>(x) * 4u;
+  char* dstRow = reinterpret_cast<char*>(dst) + static_cast<size_t>(y) * dstRowBytes;
+  float* dstPx = reinterpret_cast<float*>(dstRow) + static_cast<size_t>(x) * 4u;
+
+  float3 rgb = make_float3(srcPx[0], srcPx[1], srcPx[2]);
+  rgb = openDRTTransform(width, height, x, y, rgb, &p, &d);
+  dstPx[0] = rgb.x;
+  dstPx[1] = rgb.y;
+  dstPx[2] = rgb.z;
+  dstPx[3] = srcPx[3];
+}
+
+static dim3 pickBestCudaBlock() {
+  // User override always wins.
+  const char* env = std::getenv("ME_OPENDRT_CUDA_BLOCK");
+  if (env != nullptr && env[0] != '\0') {
+    int bx = 0;
+    int by = 0;
+    if (std::sscanf(env, "%dx%d", &bx, &by) == 2 &&
+        bx > 0 && by > 0 && bx <= 1024 && by <= 1024 && bx * by <= 1024) {
+      return dim3(static_cast<unsigned int>(bx), static_cast<unsigned int>(by), 1);
+    }
+  }
+
+  int dev = 0;
+  if (cudaGetDevice(&dev) != cudaSuccess) return dim3(16, 16, 1);
+  cudaDeviceProp prop{};
+  if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return dim3(16, 16, 1);
+
+  const dim3 candidates[] = {dim3(16, 16, 1), dim3(32, 8, 1), dim3(32, 16, 1), dim3(8, 32, 1)};
+  dim3 best = dim3(16, 16, 1);
+  long long bestScore = std::numeric_limits<long long>::min();
+  for (const dim3 c : candidates) {
+    const int threads = static_cast<int>(c.x * c.y);
+    if (threads <= 0 || threads > prop.maxThreadsPerBlock) continue;
+    if (c.x > static_cast<unsigned int>(prop.maxThreadsDim[0]) ||
+        c.y > static_cast<unsigned int>(prop.maxThreadsDim[1])) {
+      continue;
+    }
+    int active = 0;
+    if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active, OpenDRTKernel, threads, 0) != cudaSuccess) continue;
+    // Score by active resident threads; tie-break in favor of wider x for memory coalescing.
+    const long long score = static_cast<long long>(active) * threads * 1000LL + static_cast<long long>(c.x);
+    if (score > bestScore) {
+      bestScore = score;
+      best = c;
+    }
+  }
+  return best;
+}
+
+static dim3 getCachedCudaBlock() {
+  static bool inited = false;
+  static dim3 cached(16, 16, 1);
+  if (!inited) {
+    cached = pickBestCudaBlock();
+    inited = true;
+  }
+  return cached;
+}
+
 extern "C" void launchOpenDRTKernel(
     const float* src,
     float* dst,
@@ -453,23 +715,95 @@ extern "C" void launchOpenDRTKernel(
     const OpenDRTParams* p,
     const OpenDRTDerivedParams* d,
     cudaStream_t stream) {
-  auto pickBlock = []() -> dim3 {
+  auto usePointerParamPass = []() -> bool {
     static bool inited = false;
-    static dim3 cached(16, 16);
-    if (inited) return cached;
+    static bool enabled = true;
+    if (inited) return enabled;
     inited = true;
-    const char* env = std::getenv("ME_OPENDRT_CUDA_BLOCK");
-    if (env == nullptr || env[0] == '\0') return cached;
-    int bx = 0;
-    int by = 0;
-    if (std::sscanf(env, "%dx%d", &bx, &by) != 2) return cached;
-    if (bx <= 0 || by <= 0) return cached;
-    if (bx > 1024 || by > 1024) return cached;
-    if (bx * by > 1024) return cached;
-    cached = dim3(static_cast<unsigned int>(bx), static_cast<unsigned int>(by), 1);
-    return cached;
+    // Default is pointer-param path (best on current ME_OpenDRT test matrix).
+    // Allow explicit override for experiments.
+    const char* envPointer = std::getenv("ME_OPENDRT_CUDA_POINTER_PARAM_PASS");
+    if (envPointer != nullptr && envPointer[0] != '\0') {
+      enabled = !(envPointer[0] == '0' && envPointer[1] == '\0');
+    }
+    // Backward-compat guard: if legacy flag is explicitly enabled, force by-value path.
+    const char* envLegacy = std::getenv("ME_OPENDRT_CUDA_LEGACY_PARAM_PASS");
+    if (envLegacy != nullptr && envLegacy[0] != '\0' && !(envLegacy[0] == '0' && envLegacy[1] == '\0')) {
+      enabled = false;
+    }
+    return enabled;
   };
-  dim3 block = pickBlock();
+  dim3 block = getCachedCudaBlock();
   dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
-  OpenDRTKernel<<<grid, block, 0, stream>>>(src, dst, width, height, *p, *d);
+  static OpenDRTParams* dParams = nullptr;
+  static OpenDRTDerivedParams* dDerived = nullptr;
+  auto ensureDeviceParamBuffers = [&]() -> bool {
+    if (dParams != nullptr && dDerived != nullptr) return true;
+    if (dParams == nullptr && cudaMalloc(&dParams, sizeof(OpenDRTParams)) != cudaSuccess) return false;
+    if (dDerived == nullptr && cudaMalloc(&dDerived, sizeof(OpenDRTDerivedParams)) != cudaSuccess) return false;
+    return true;
+  };
+  auto uploadParamsToDevice = [&]() -> bool {
+    if (!ensureDeviceParamBuffers()) return false;
+    if (cudaMemcpyAsync(dParams, p, sizeof(OpenDRTParams), cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+    if (cudaMemcpyAsync(dDerived, d, sizeof(OpenDRTDerivedParams), cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+    return true;
+  };
+
+  if (usePointerParamPass() && uploadParamsToDevice()) {
+    OpenDRTKernel<<<grid, block, 0, stream>>>(src, dst, width, height, dParams, dDerived);
+  } else {
+    OpenDRTKernelLegacy<<<grid, block, 0, stream>>>(src, dst, width, height, *p, *d);
+  }
+}
+
+extern "C" void launchOpenDRTKernelPitched(
+    const float* src,
+    size_t srcRowBytes,
+    float* dst,
+    size_t dstRowBytes,
+    int width,
+    int height,
+    const OpenDRTParams* p,
+    const OpenDRTDerivedParams* d,
+    cudaStream_t stream) {
+  auto usePointerParamPass = []() -> bool {
+    static bool inited = false;
+    static bool enabled = true;
+    if (inited) return enabled;
+    inited = true;
+    const char* envPointer = std::getenv("ME_OPENDRT_CUDA_POINTER_PARAM_PASS");
+    if (envPointer != nullptr && envPointer[0] != '\0') {
+      enabled = !(envPointer[0] == '0' && envPointer[1] == '\0');
+    }
+    const char* envLegacy = std::getenv("ME_OPENDRT_CUDA_LEGACY_PARAM_PASS");
+    if (envLegacy != nullptr && envLegacy[0] != '\0' && !(envLegacy[0] == '0' && envLegacy[1] == '\0')) {
+      enabled = false;
+    }
+    return enabled;
+  };
+
+  dim3 block = getCachedCudaBlock();
+  dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+
+  static OpenDRTParams* dParams = nullptr;
+  static OpenDRTDerivedParams* dDerived = nullptr;
+  auto ensureDeviceParamBuffers = [&]() -> bool {
+    if (dParams != nullptr && dDerived != nullptr) return true;
+    if (dParams == nullptr && cudaMalloc(&dParams, sizeof(OpenDRTParams)) != cudaSuccess) return false;
+    if (dDerived == nullptr && cudaMalloc(&dDerived, sizeof(OpenDRTDerivedParams)) != cudaSuccess) return false;
+    return true;
+  };
+  auto uploadParamsToDevice = [&]() -> bool {
+    if (!ensureDeviceParamBuffers()) return false;
+    if (cudaMemcpyAsync(dParams, p, sizeof(OpenDRTParams), cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+    if (cudaMemcpyAsync(dDerived, d, sizeof(OpenDRTDerivedParams), cudaMemcpyHostToDevice, stream) != cudaSuccess) return false;
+    return true;
+  };
+
+  if (usePointerParamPass() && uploadParamsToDevice()) {
+    OpenDRTKernelPitched<<<grid, block, 0, stream>>>(src, srcRowBytes, dst, dstRowBytes, width, height, dParams, dDerived);
+  } else {
+    OpenDRTKernelPitchedLegacy<<<grid, block, 0, stream>>>(src, srcRowBytes, dst, dstRowBytes, width, height, *p, *d);
+  }
 }

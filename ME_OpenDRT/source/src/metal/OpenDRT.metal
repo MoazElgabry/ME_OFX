@@ -420,17 +420,20 @@ kernel void OpenDRTKernel(device const float* src [[buffer(0)]],
                           constant OpenDRTDerivedParams& d [[buffer(5)]],
                           constant int& width [[buffer(3)]],
                           constant int& height [[buffer(4)]],
+                          constant int& srcRowFloats [[buffer(6)]],
+                          constant int& dstRowFloats [[buffer(7)]],
                           uint2 gid [[thread_position_in_grid]]) {
   // Flat interleaved RGBA layout: one thread computes one destination pixel.
   const int x = static_cast<int>(gid.x);
   const int y = static_cast<int>(gid.y);
   if (x >= width || y >= height) return;
-  const int i = (y * width + x) * 4;
-  float3 rgb = make_float3(src[i + 0], src[i + 1], src[i + 2]);
+  const int iSrc = y * srcRowFloats + x * 4;
+  const int iDst = y * dstRowFloats + x * 4;
+  float3 rgb = make_float3(src[iSrc + 0], src[iSrc + 1], src[iSrc + 2]);
   rgb = openDRTTransform(width, height, x, y, rgb, p, d);
-  dst[i + 0] = rgb.x;
-  dst[i + 1] = rgb.y;
-  dst[i + 2] = rgb.z;
-  dst[i + 3] = src[i + 3];
+  dst[iDst + 0] = rgb.x;
+  dst[iDst + 1] = rgb.y;
+  dst[iDst + 2] = rgb.z;
+  dst[iDst + 3] = src[iSrc + 3];
 }
 
