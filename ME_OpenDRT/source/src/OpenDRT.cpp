@@ -430,40 +430,144 @@ bool openExternalUrl(const std::string& url) {
   return std::system(cmd.c_str()) == 0;
 }
 #else
+std::string execAndReadLinux(const std::string& cmd) {
+  std::string out;
+  FILE* f = popen(cmd.c_str(), "r");
+  if (!f) return out;
+  char buf[512];
+  while (fgets(buf, sizeof(buf), f)) out += buf;
+  pclose(f);
+  while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+  return out;
+}
+
+bool linuxCommandExists(const char* cmd) {
+  if (cmd == nullptr || cmd[0] == '\0') return false;
+  std::string probe = "command -v ";
+  probe += cmd;
+  probe += " >/dev/null 2>&1";
+  return std::system(probe.c_str()) == 0;
+}
+
 std::string pickOpenJsonFilePath() {
+  if (linuxCommandExists("zenity")) {
+    return execAndReadLinux("zenity --file-selection --title=\"Import ME_OpenDRT preset\" --file-filter=\"*.json\" 2>/dev/null");
+  }
+  if (linuxCommandExists("kdialog")) {
+    return execAndReadLinux("kdialog --getopenfilename \"$HOME\" \"*.json|JSON Files\" 2>/dev/null");
+  }
   return std::string();
 }
 
 std::string pickSaveJsonFilePath(const std::string& defaultName) {
-  (void)defaultName;
+  if (linuxCommandExists("zenity")) {
+    std::string safe = defaultName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    std::string cmd =
+        "zenity --file-selection --save --confirm-overwrite --title=\"Export ME_OpenDRT preset\" --filename=\"$HOME/" +
+        safe + "\" 2>/dev/null";
+    return execAndReadLinux(cmd);
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = defaultName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    std::string cmd = "kdialog --getsavefilename \"$HOME/" + safe + "\" \"*.json|JSON Files\" 2>/dev/null";
+    return execAndReadLinux(cmd);
+  }
   return std::string();
 }
 
 bool confirmOverwriteDialog(const std::string& presetName) {
+  if (linuxCommandExists("zenity")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "zenity --question --title=\"ME_OpenDRT\" --text=\"Preset '" + safe +
+                            "' already exists. Overwrite?\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "kdialog --warningyesno \"Preset '" + safe + "' already exists. Overwrite?\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
   std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: overwrite confirmation unavailable for preset '%s'.\n", presetName.c_str());
   return false;
 }
 
 void showInfoDialog(const std::string& text) {
+  if (linuxCommandExists("zenity")) {
+    std::string safe = text;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "zenity --info --title=\"ME_OpenDRT\" --text=\"" + safe + "\" 2>/dev/null";
+    (void)std::system(cmd.c_str());
+    return;
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = text;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd = "kdialog --msgbox \"" + safe + "\" 2>/dev/null";
+    (void)std::system(cmd.c_str());
+    return;
+  }
   std::fprintf(stderr, "[ME_OpenDRT] %s\n", text.c_str());
 }
 
 bool confirmDeleteDialog(const std::string& presetName) {
+  if (linuxCommandExists("zenity")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "zenity --question --title=\"ME_OpenDRT\" --text=\"Delete preset '" + safe + "'? This cannot be undone.\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = presetName;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "kdialog --warningyesno \"Delete preset '" + safe + "'? This cannot be undone.\" 2>/dev/null";
+    return std::system(cmd.c_str()) == 0;
+  }
   std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: delete confirmation unavailable for preset '%s'.\n", presetName.c_str());
   return false;
 }
 
 DeleteTarget choosePresetTargetDialog(const char* actionVerb) {
+  const std::string action = actionVerb ? actionVerb : "Apply";
+  if (linuxCommandExists("zenity")) {
+    std::string safe = action;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "zenity --question --title=\"ME_OpenDRT\" "
+        "--ok-label=\"" + safe + " Look\" --cancel-label=\"" + safe +
+        " Tonescale\" "
+        "--text=\"Both selected Look and Tonescale are user presets.\" 2>/dev/null";
+    const int rc = std::system(cmd.c_str());
+    if (rc == 0) return DeleteTarget::Look;
+    if (rc == 256) return DeleteTarget::Tonescale;
+    return DeleteTarget::Cancel;
+  }
+  if (linuxCommandExists("kdialog")) {
+    std::string safe = action;
+    for (char& c : safe) if (c == '"') c = '\'';
+    const std::string cmd =
+        "kdialog --yesnocancel \"Both selected Look and Tonescale are user presets.\\n\\nYes = " + safe +
+        " Look\\nNo = " + safe + " Tonescale\\nCancel = Cancel\" 2>/dev/null";
+    const int rc = std::system(cmd.c_str());
+    if (rc == 0) return DeleteTarget::Look;
+    if (rc == 256) return DeleteTarget::Tonescale;
+    return DeleteTarget::Cancel;
+  }
   std::fprintf(
       stderr,
       "[ME_OpenDRT] Linux fallback: preset target chooser unavailable for action '%s'.\n",
-      actionVerb ? actionVerb : "Apply");
+      action.c_str());
   return DeleteTarget::Cancel;
 }
 
 bool openExternalUrl(const std::string& url) {
   if (url.empty()) return false;
-  if (std::system("command -v xdg-open >/dev/null 2>&1") != 0) {
+  if (!linuxCommandExists("xdg-open")) {
     std::fprintf(stderr, "[ME_OpenDRT] Linux fallback: xdg-open not found.\n");
     return false;
   }

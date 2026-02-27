@@ -109,6 +109,8 @@ endif()
 if(UNIX AND NOT APPLE)
   find_package(OpenCL REQUIRED)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE OpenCL::OpenCL)
+  # Improve runtime compatibility with hosts that bundle older libstdc++/libgcc.
+  target_link_options(${PLUGIN_BASENAME} PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 if(APPLE)
