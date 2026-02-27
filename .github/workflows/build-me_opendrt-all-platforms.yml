@@ -58,17 +58,11 @@ jobs:
           strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
           xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
 
-      - name: Package macOS portable bundle
-        run: |
-          ditto -c -k --sequesterRsrc --keepParent \
-            bundle/ME_OpenDRT.ofx.bundle \
-            ../../${{ matrix.zip_name }}
-
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.zip_name }}
+          name: ${{ matrix.artifact_name }}-bundle
+          path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
 
   build-linux:
     strategy:
@@ -116,16 +110,11 @@ jobs:
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
 
-      - name: Package Linux portable bundle
-        run: |
-          tar -czf ../../${{ matrix.variant.archive_name }} \
-            -C bundle ME_OpenDRT.ofx.bundle
-
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.variant.artifact_name }}
-          path: ${{ matrix.variant.archive_name }}
+          name: ${{ matrix.variant.artifact_name }}-bundle
+          path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
 
   build-windows:
     runs-on: windows-2022
@@ -191,17 +180,11 @@ jobs:
             throw "Missing Windows plugin binary"
           }
 
-      - name: Package Windows portable bundle
-        run: |
-          $zipName = "ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip"
-          if (Test-Path "..\..\$zipName") { Remove-Item "..\..\$zipName" -Force }
-          Compress-Archive -Path "bundle/ME_OpenDRT.ofx.bundle" -DestinationPath "..\..\$zipName" -CompressionLevel Optimal
-
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ME_OpenDRT-v1.1.0-rc1-windows-x86_64
-          path: ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
+          name: ME_OpenDRT-v1.1.0-rc1-windows-x86_64-bundle
+          path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
 
   bundle-all-platforms:
     runs-on: ubuntu-22.04
@@ -215,59 +198,26 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: all-artifacts
-          merge-multiple: true
+          merge-multiple: false
 
       - name: Build flat all-platform package (no nested archives)
         run: |
           set -euo pipefail
           mkdir -p package-out
 
-          # Expand every portable archive and rename bundle root with platform suffix
-          # so all variants can coexist in one final zip.
-          for f in all-artifacts/*; do
-            [ -f "$f" ] || continue
-            bn="$(basename "$f")"
-            work="work-${bn%.*}"
-            mkdir -p "$work"
-
-            case "$bn" in
-              *.zip)
-                python3 -c 'import os, re, sys, zipfile
-zip_path, out_dir = sys.argv[1], sys.argv[2]
-os.makedirs(out_dir, exist_ok=True)
-with zipfile.ZipFile(zip_path) as zf:
-    for info in zf.infolist():
-        name = info.filename.replace("\\", "/")
-        name = re.sub(r"^[A-Za-z]:", "", name).lstrip("/")
-        if not name:
-            continue
-        parts = [p for p in name.split("/") if p not in ("", ".", "..")]
-        if not parts:
-            continue
-        dst = os.path.join(out_dir, *parts)
-        if info.is_dir() or name.endswith("/"):
-            os.makedirs(dst, exist_ok=True)
-            continue
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        with zf.open(info) as src, open(dst, "wb") as out:
-            out.write(src.read())' "$f" "$work"
-                if [ -z "$(find "$work" -mindepth 1 -print -quit)" ]; then
-                  echo "Zip extraction produced no files: $bn"
-                  exit 1
-                fi
-                ;;
-              *.tar.gz)
-                tar -xzf "$f" -C "$work"
-                ;;
-              *)
-                continue
-                ;;
-            esac
-
-            if [ -d "$work/ME_OpenDRT.ofx.bundle" ]; then
-              cp -a "$work/ME_OpenDRT.ofx.bundle" "package-out/ME_OpenDRT_${bn%.*}.ofx.bundle"
+          # Each downloaded artifact folder contains ME_OpenDRT.ofx.bundle directly.
+          for d in all-artifacts/*; do
+            [ -d "$d" ] || continue
+            bn="$(basename "$d")"
+            if [ -d "$d/ME_OpenDRT.ofx.bundle" ]; then
+              cp -a "$d/ME_OpenDRT.ofx.bundle" "package-out/ME_OpenDRT_${bn}.ofx.bundle"
             fi
           done
+
+          if [ -z "$(find package-out -mindepth 1 -print -quit)" ]; then
+            echo "No bundles found in downloaded artifacts."
+            exit 1
+          fi
 
           (cd package-out && zip -r ../ME_OpenDRT_v1.1.0-rc1_all_platforms.zip .)
 
