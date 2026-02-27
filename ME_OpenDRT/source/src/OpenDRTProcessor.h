@@ -14,7 +14,7 @@
 
 #include "OpenDRTParams.h"
 
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
 #define ME_OPENDRT_HAS_CUDA 1
 #endif
 
@@ -94,7 +94,7 @@ class OpenDRTProcessor {
     computeDerivedParams();
     // Backend dispatch policy:
     // - macOS: Metal first, then CPU fallback.
-    // - Windows: CUDA first (unless forced OpenCL), then OpenCL, then CPU fallback.
+    // - CUDA builds (Windows/Linux): CUDA first (unless forced OpenCL), then OpenCL, then CPU fallback.
 #if defined(__APPLE__)
     if (renderMetal(src, dst, width, height, srcRowBytes, dstRowBytes)) {
       return true;

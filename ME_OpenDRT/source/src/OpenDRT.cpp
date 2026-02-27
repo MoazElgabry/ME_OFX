@@ -20,7 +20,7 @@
 
 #include "ofxsImageEffect.h"
 
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
 #include <cuda_runtime.h>
 #endif
 
@@ -92,7 +92,7 @@ CudaRenderMode selectedCudaRenderMode() {
       return CudaRenderMode::HostPreferred;
     }
 
-    // Default on Windows: host-CUDA preferred for fastest playback.
+    // Default when CUDA host render is available: host-CUDA preferred for fastest playback.
     return CudaRenderMode::HostPreferred;
   }();
   return mode;
@@ -145,6 +145,29 @@ void perfLog(const char* stage, const std::chrono::steady_clock::time_point& sta
     std::ofstream ofs(logPath, std::ios::app);
     if (ofs.is_open()) {
       ofs << "[ME_OpenDRT][PERF] " << stage << ": " << ms << " ms\n";
+    }
+  }
+#elif defined(__linux__)
+  static bool pathInit = false;
+  static std::string logPath;
+  if (!pathInit) {
+    pathInit = true;
+    const char* home = std::getenv("HOME");
+    if (home && *home) {
+      const std::string cacheDir = std::string(home) + "/.cache";
+      const std::string pluginDir = cacheDir + "/ME_OpenDRT";
+      (void)::mkdir(cacheDir.c_str(), 0755);
+      (void)::mkdir(pluginDir.c_str(), 0755);
+      logPath = pluginDir + "/perf.log";
+    } else {
+      logPath = "/tmp/ME_OpenDRT_perf.log";
+    }
+  }
+  if (!logPath.empty()) {
+    FILE* f = std::fopen(logPath.c_str(), "a");
+    if (f != nullptr) {
+      std::fprintf(f, "[ME_OpenDRT][PERF] %s: %.3f ms\n", stage, ms);
+      std::fclose(f);
     }
   }
 #endif
@@ -1205,7 +1228,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
   }
 
   ~OpenDRTEffect() override {
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     if (stageSrcPinned_ != nullptr) {
       cudaFreeHost(stageSrcPinned_);
       stageSrcPinned_ = nullptr;
@@ -1291,7 +1314,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       processor_->setParams(params);
     }
 
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     // Optional OFX host CUDA mode:
     // - Controlled by selectedCudaRenderMode().
     // - Uses host-provided CUDA stream and device pointers from fetchImage().
@@ -1507,6 +1530,58 @@ class OpenDRTEffect : public OFX::ImageEffect {
         writeDisplayPresetToParams(preset, *this);
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
+        return;
+      }
+
+      if (paramName == "discardPresetChanges") {
+        OpenDRTParams expected{};
+        if (!buildPresetBaseline(args.time, &expected)) return;
+        FlagScope scope(suppressParamChanged_);
+        applyTonescaleFromBaseline(expected);
+        applyRenderSpaceFromBaseline(expected);
+        applyMidPurityFromBaseline(expected);
+        applyPurityCompressionFromBaseline(expected);
+        applyBrillianceFromBaseline(expected);
+        applyHueFromBaseline(expected);
+        setBool("clamp", expected.clamp != 0);
+        setChoice("tn_su", expected.tn_su);
+        setChoice("display_gamut", expected.display_gamut);
+        setChoice("eotf", expected.eotf);
+        setInt("cwp", expected.cwp);
+        setDouble("cwp_lm", expected.cwp_lm);
+        updateToggleVisibility(args.time);
+        updatePresetManagerActionState(args.time);
+        updateReadonlyDisplayLabels(args.time);
+        updatePresetStateFromCurrent(args.time);
+        return;
+      }
+
+      if (paramName == "reset_tonescale" ||
+          paramName == "reset_render_space" ||
+          paramName == "reset_mid_purity" ||
+          paramName == "reset_purity_compression" ||
+          paramName == "reset_brilliance" ||
+          paramName == "reset_hue") {
+        OpenDRTParams expected{};
+        if (!buildPresetBaseline(args.time, &expected)) return;
+        FlagScope scope(suppressParamChanged_);
+        if (paramName == "reset_tonescale") {
+          applyTonescaleFromBaseline(expected);
+        } else if (paramName == "reset_render_space") {
+          applyRenderSpaceFromBaseline(expected);
+        } else if (paramName == "reset_mid_purity") {
+          applyMidPurityFromBaseline(expected);
+        } else if (paramName == "reset_purity_compression") {
+          applyPurityCompressionFromBaseline(expected);
+        } else if (paramName == "reset_brilliance") {
+          applyBrillianceFromBaseline(expected);
+        } else if (paramName == "reset_hue") {
+          applyHueFromBaseline(expected);
+        }
+        updateToggleVisibility(args.time);
+        updatePresetManagerActionState(args.time);
+        updateReadonlyDisplayLabels(args.time);
+        updatePresetStateFromCurrent(args.time);
         return;
       }
 
@@ -1902,7 +1977,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
   };
 
   bool ensureStageBuffers(size_t pixelCount) {
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     // Prefer pinned host buffers for staged path to improve CUDA transfer throughput.
     if (stageSrcPinned_ != nullptr && stageDstPinned_ != nullptr && stagePinnedCapacityFloats_ == pixelCount) return true;
     if (stageSrcPinned_ != nullptr) {
@@ -1936,14 +2011,14 @@ class OpenDRTEffect : public OFX::ImageEffect {
   }
 
   float* stageSrcPtr() {
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     if (stageSrcPinned_ != nullptr) return stageSrcPinned_;
 #endif
     return srcPixels_.empty() ? nullptr : srcPixels_.data();
   }
 
   float* stageDstPtr() {
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     if (stageDstPinned_ != nullptr) return stageDstPinned_;
 #endif
     return dstPixels_.empty() ? nullptr : dstPixels_.data();
@@ -2092,12 +2167,13 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return v;
   }
 
-  bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
+  bool buildPresetBaseline(double time, OpenDRTParams* expected) const {
+    if (expected == nullptr) return false;
     const int look = getChoice("lookPreset", time, 0);
     const int tsPreset = getChoice("tonescalePreset", time, 0);
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
     const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
-    OpenDRTParams expected{};
+    OpenDRTParams out{};
     if (isUserLookPresetIndex(look)) {
       int userIdx = -1;
       if (!userLookIndexFromPresetIndex(look, &userIdx)) return false;
@@ -2105,9 +2181,9 @@ class OpenDRTEffect : public OFX::ImageEffect {
       ensureUserPresetStoreLoadedLocked();
       if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return false;
       const auto& s = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
-      applyLookValuesToResolved(expected, s.values);
+      applyLookValuesToResolved(out, s.values);
     } else {
-      applyLookPresetToResolved(expected, look);
+      applyLookPresetToResolved(out, look);
     }
 
     if (isUserTonescalePresetIndex(tsPreset)) {
@@ -2117,20 +2193,105 @@ class OpenDRTEffect : public OFX::ImageEffect {
       ensureUserPresetStoreLoadedLocked();
       if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return false;
       const auto& s = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
-      applyTonescaleValuesToResolved(expected, s.values);
+      applyTonescaleValuesToResolved(out, s.values);
     } else if (tsPreset == 0) {
-      // "USE LOOK PRESET" must compare against the selected look's baseline tonescale
-      // (built-in or user look), otherwise this path always appears modified.
       const TonescalePresetValues fromLook = selectedLookBaseTonescale(time);
-      applyTonescaleValuesToResolved(expected, fromLook);
+      applyTonescaleValuesToResolved(out, fromLook);
     } else {
-      applyTonescalePresetToResolved(expected, tsPreset);
+      applyTonescalePresetToResolved(out, tsPreset);
     }
 
-    applyDisplayEncodingPreset(expected, displayPreset);
-    // Preset-mode baseline uses clamp enabled by default.
-    expected.clamp = 1;
-    if (cwpPreset > 0) expected.cwp = cwpPreset - 1;
+    applyDisplayEncodingPreset(out, displayPreset);
+    out.clamp = 1;
+    if (cwpPreset > 0) out.cwp = cwpPreset - 1;
+
+    *expected = out;
+    return true;
+  }
+
+  void applyTonescaleFromBaseline(const OpenDRTParams& p) {
+    setDouble("tn_con", p.tn_con);
+    setDouble("tn_sh", p.tn_sh);
+    setDouble("tn_toe", p.tn_toe);
+    setDouble("tn_off", p.tn_off);
+    setBool("tn_hcon_enable", p.tn_hcon_enable != 0);
+    setDouble("tn_hcon", p.tn_hcon);
+    setDouble("tn_hcon_pv", p.tn_hcon_pv);
+    setDouble("tn_hcon_st", p.tn_hcon_st);
+    setBool("tn_lcon_enable", p.tn_lcon_enable != 0);
+    setDouble("tn_lcon", p.tn_lcon);
+    setDouble("tn_lcon_w", p.tn_lcon_w);
+  }
+
+  void applyRenderSpaceFromBaseline(const OpenDRTParams& p) {
+    setDouble("rs_sa", p.rs_sa);
+    setDouble("rs_rw", p.rs_rw);
+    setDouble("rs_bw", p.rs_bw);
+  }
+
+  void applyMidPurityFromBaseline(const OpenDRTParams& p) {
+    setBool("ptm_enable", p.ptm_enable != 0);
+    setDouble("ptm_low", p.ptm_low);
+    setDouble("ptm_low_rng", p.ptm_low_rng);
+    setDouble("ptm_low_st", p.ptm_low_st);
+    setDouble("ptm_high", p.ptm_high);
+    setDouble("ptm_high_rng", p.ptm_high_rng);
+    setDouble("ptm_high_st", p.ptm_high_st);
+  }
+
+  void applyPurityCompressionFromBaseline(const OpenDRTParams& p) {
+    setBool("pt_enable", p.pt_enable != 0);
+    setDouble("pt_lml", p.pt_lml);
+    setDouble("pt_lml_r", p.pt_lml_r);
+    setDouble("pt_lml_g", p.pt_lml_g);
+    setDouble("pt_lml_b", p.pt_lml_b);
+    setDouble("pt_lmh", p.pt_lmh);
+    setDouble("pt_lmh_r", p.pt_lmh_r);
+    setDouble("pt_lmh_b", p.pt_lmh_b);
+    setBool("ptl_enable", p.ptl_enable != 0);
+    setDouble("ptl_c", p.ptl_c);
+    setDouble("ptl_m", p.ptl_m);
+    setDouble("ptl_y", p.ptl_y);
+  }
+
+  void applyBrillianceFromBaseline(const OpenDRTParams& p) {
+    setBool("brl_enable", p.brl_enable != 0);
+    setDouble("brl", p.brl);
+    setDouble("brl_r", p.brl_r);
+    setDouble("brl_g", p.brl_g);
+    setDouble("brl_b", p.brl_b);
+    setDouble("brl_rng", p.brl_rng);
+    setDouble("brl_st", p.brl_st);
+    setBool("brlp_enable", p.brlp_enable != 0);
+    setDouble("brlp", p.brlp);
+    setDouble("brlp_r", p.brlp_r);
+    setDouble("brlp_g", p.brlp_g);
+    setDouble("brlp_b", p.brlp_b);
+  }
+
+  void applyHueFromBaseline(const OpenDRTParams& p) {
+    setBool("hc_enable", p.hc_enable != 0);
+    setDouble("hc_r", p.hc_r);
+    setDouble("hc_r_rng", p.hc_r_rng);
+    setBool("hs_rgb_enable", p.hs_rgb_enable != 0);
+    setDouble("hs_r", p.hs_r);
+    setDouble("hs_r_rng", p.hs_r_rng);
+    setDouble("hs_g", p.hs_g);
+    setDouble("hs_g_rng", p.hs_g_rng);
+    setDouble("hs_b", p.hs_b);
+    setDouble("hs_b_rng", p.hs_b_rng);
+    setBool("hs_cmy_enable", p.hs_cmy_enable != 0);
+    setDouble("hs_c", p.hs_c);
+    setDouble("hs_c_rng", p.hs_c_rng);
+    setDouble("hs_m", p.hs_m);
+    setDouble("hs_m_rng", p.hs_m_rng);
+    setDouble("hs_y", p.hs_y);
+    setDouble("hs_y_rng", p.hs_y_rng);
+  }
+
+  bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
+    OpenDRTParams expected{};
+    if (!buildPresetBaseline(time, &expected)) return false;
 
     const bool tonescaleClean =
       almostEqual(getDouble("tn_con", time, expected.tn_con), expected.tn_con) &&
@@ -2212,6 +2373,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     bool tonescaleClean = true;
     const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean);
     setInt("presetState", clean ? 0 : 1);
+    if (auto* p = fetchPushButtonParam("discardPresetChanges")) p->setEnabled(!clean);
     applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean);
   }
 
@@ -2242,6 +2404,12 @@ class OpenDRTEffect : public OFX::ImageEffect {
       return v;
     }
     return def;
+  }
+  void setBool(const char* name, bool v) {
+    if (auto* p = fetchBooleanParam(name)) p->setValue(v);
+  }
+  void setDouble(const char* name, double v) {
+    if (auto* p = fetchDoubleParam(name)) p->setValue(v);
   }
   void setChoice(const char* name, int v) {
     if (auto* p = fetchChoiceParam(name)) p->setValue(v);
@@ -2665,7 +2833,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
   std::unique_ptr<OpenDRTProcessor> processor_;
   std::vector<float> srcPixels_;
   std::vector<float> dstPixels_;
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
   float* stageSrcPinned_ = nullptr;
   float* stageDstPinned_ = nullptr;
   size_t stagePinnedCapacityFloats_ = 0;
@@ -2707,7 +2875,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     d.setSupportsMultiResolution(false);
     d.setTemporalClipAccess(false);
     d.setSupportsOpenCLBuffersRender(false);
-#if defined(_WIN32)
+#if defined(OFX_SUPPORTS_CUDARENDER)
     const bool advertiseHostCuda = (selectedCudaRenderMode() == CudaRenderMode::HostPreferred);
     d.setSupportsCudaRender(advertiseHostCuda);
     d.setSupportsCudaStream(advertiseHostCuda);
@@ -2732,10 +2900,9 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     dst->addSupportedComponent(OFX::ePixelComponentRGBA);
     dst->setSupportsTiles(false);
 
-    auto* pInput = d.definePageParam("Input");
     auto* pLook = d.definePageParam("Look");
-    auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pOverlay = d.definePageParam("Overlay");
+    auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pUserPresets = d.definePageParam("User Preset Manager");
     auto* grpUserPresetsRoot = d.defineGroupParam("grp_user_presets_root");
     grpUserPresetsRoot->setLabel("User Preset Manager");
@@ -2761,7 +2928,6 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
 
     auto* inGamut = addChoice("in_gamut", "Input Gamut", 14, {"XYZ","ACES 2065-1","ACEScg","P3D65","Rec.2020","Rec.709","Arri Wide Gamut 3","Arri Wide Gamut 4","Red Wide Gamut RGB","Sony SGamut3","Sony SGamut3Cine","Panasonic V-Gamut","Filmlight E-Gamut","Filmlight E-Gamut2","DaVinci Wide Gamut"});
     auto* inOetf = addChoice("in_oetf", "Input Transfer Function", 1, {"Linear","DaVinci Intermediate","Filmlight T-Log","ACEScct","Arri LogC3","Arri LogC4","RedLog3G10","Panasonic V-Log","Sony S-Log3","Fuji F-Log2"});
-    pInput->addChild(*inGamut); pInput->addChild(*inOetf);
 
     auto* dep = addChoice("displayEncodingPreset", "Display Encoding Preset", 0, {"Rec.1886 - 2.4 Power / Rec.709","sRGB Display - 2.2 Power / Rec.709","Display P3 - 2.2 Power / P3-D65","DCI - 2.6 Power / P3-D60","DCI - 2.6 Power / P3-DCI","DCI - 2.6 Power / XYZ","Rec.2100 - PQ / Rec.2020","Rec.2100 - HLG / Rec.2020","Dolby - PQ / P3-D65"});
     auto* lookPreset = addChoice("lookPreset", "Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
@@ -2775,20 +2941,47 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     auto* cwpPreset = addChoice("creativeWhitePreset", "Creative White", 0, {"USE LOOK PRESET","D93","D75","D65","D60","D55","D50"});
     auto* cwpLm = addDouble("cwp_lm", "Creative White Limit", 0.25, 0.0, 1.0);
     auto* baseWpLabel = d.defineStringParam("baseWhitepointLabel");
-    baseWpLabel->setLabel("Base Whitepoint");
+    baseWpLabel->setLabel("Effective Whitepoint");
     baseWpLabel->setDefault("D65");
     baseWpLabel->setEnabled(false);
     auto* surroundLabel = d.defineStringParam("surroundLabel");
-    surroundLabel->setLabel("Selected Surround");
+    surroundLabel->setLabel("Effective Surround");
     surroundLabel->setDefault("Dim");
     surroundLabel->setEnabled(false);
-    pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel);
+    auto* grpLookBasic = d.defineGroupParam("grp_look_basic");
+    grpLookBasic->setLabel("Basic");
+    grpLookBasic->setOpen(true);
+    inGamut->setParent(*grpLookBasic);
+    inOetf->setParent(*grpLookBasic);
+    dep->setParent(*grpLookBasic);
+    lookPreset->setParent(*grpLookBasic);
+    presetState->setParent(*grpLookBasic);
+    cwpHidden->setParent(*grpLookBasic);
+    activeUserLookSlot->setParent(*grpLookBasic);
+    activeUserToneSlot->setParent(*grpLookBasic);
+    tonescalePreset->setParent(*grpLookBasic);
+    cwpPreset->setParent(*grpLookBasic);
+    cwpLm->setParent(*grpLookBasic);
+    baseWpLabel->setParent(*grpLookBasic);
+    surroundLabel->setParent(*grpLookBasic);
+    auto* discardPresetChanges = d.definePushButtonParam("discardPresetChanges");
+    discardPresetChanges->setLabel("Discard Changes");
+    discardPresetChanges->setEnabled(false);
+    discardPresetChanges->setParent(*grpLookBasic);
+    pLook->addChild(*grpLookBasic); pLook->addChild(*inGamut); pLook->addChild(*inOetf); pLook->addChild(*dep); pLook->addChild(*lookPreset); pLook->addChild(*presetState); pLook->addChild(*cwpHidden); pLook->addChild(*activeUserLookSlot); pLook->addChild(*activeUserToneSlot); pLook->addChild(*tonescalePreset); pLook->addChild(*cwpPreset); pLook->addChild(*cwpLm); pLook->addChild(*baseWpLabel); pLook->addChild(*surroundLabel); pLook->addChild(*discardPresetChanges);
+
+    auto* overlay = d.defineBooleanParam("crv_enable");
+    overlay->setLabel("Tonescale Overlay");
+    overlay->setDefault(false);
+    if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
+    pOverlay->addChild(*overlay);
 
     auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
-    auto* grpDisplayMapping = d.defineGroupParam("grp_display_mapping"); grpDisplayMapping->setLabel("Display mapping"); grpDisplayMapping->setOpen(false); grpDisplayMapping->setParent(*grpAdvancedRoot);
+    auto* grpDisplayMapping = d.defineGroupParam("grp_display_mapping"); grpDisplayMapping->setLabel("Display Mapping"); grpDisplayMapping->setOpen(false); grpDisplayMapping->setParent(*grpAdvancedRoot);
     auto* grpTone = d.defineGroupParam("grp_tonescale"); grpTone->setLabel("Tonescale"); grpTone->setOpen(false); grpTone->setParent(*grpAdvancedRoot);
     auto* grpRender = d.defineGroupParam("grp_render"); grpRender->setLabel("Render Space"); grpRender->setOpen(false); grpRender->setParent(*grpAdvancedRoot);
-    auto* grpPurity = d.defineGroupParam("grp_purity"); grpPurity->setLabel("Purity"); grpPurity->setOpen(false); grpPurity->setParent(*grpAdvancedRoot);
+    auto* grpMidPurity = d.defineGroupParam("grp_mid_purity"); grpMidPurity->setLabel("Mid Purity"); grpMidPurity->setOpen(false); grpMidPurity->setParent(*grpAdvancedRoot);
+    auto* grpPurityCompression = d.defineGroupParam("grp_purity_compression"); grpPurityCompression->setLabel("Purity Compression"); grpPurityCompression->setOpen(false); grpPurityCompression->setParent(*grpAdvancedRoot);
     auto* grpBrl = d.defineGroupParam("grp_brl"); grpBrl->setLabel("Brilliance"); grpBrl->setOpen(false); grpBrl->setParent(*grpAdvancedRoot);
     auto* grpHue = d.defineGroupParam("grp_hue"); grpHue->setLabel("Hue"); grpHue->setOpen(false); grpHue->setParent(*grpAdvancedRoot);
     auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Overrides"); grpDisplay->setOpen(false); grpDisplay->setParent(*grpAdvancedRoot);
@@ -2798,11 +2991,14 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     auto addAdvC = [&d](const char* n, const char* l, int df, const std::vector<const char*>& o, OFX::GroupParamDescriptor* g){ auto* p=d.defineChoiceParam(n); p->setLabel(l); for(auto* s:o)p->appendOption(s); p->setDefault(df); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
 
     pAdvanced->addChild(*grpAdvancedRoot);
-    addAdvD("tn_Lp", "Display Peak Luminance", 100.0, 100.0, 1000.0, grpDisplayMapping);
-    addAdvD("tn_Lg", "Display Grey Luminance", 10.0, 3.0, 25.0, grpDisplayMapping);
+    addAdvD("tn_Lp", "Peak Luminance", 100.0, 100.0, 1000.0, grpDisplayMapping);
+    addAdvD("tn_Lg", "Grey Luminance", 10.0, 3.0, 25.0, grpDisplayMapping);
     addAdvD("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0, grpDisplayMapping);
     addAdvD("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0, grpDisplayMapping);
 
+    auto* resetTonescale = d.definePushButtonParam("reset_tonescale");
+    resetTonescale->setLabel("Reset Tonescale");
+    resetTonescale->setParent(*grpTone);
     addAdvD("tn_con","Contrast",1.66,1.0,2.0,grpTone);
     addAdvD("tn_sh","Shoulder Clip",0.5,0.0,1.0,grpTone);
     addAdvD("tn_toe","Toe",0.003,0.0,0.1,grpTone);
@@ -2815,31 +3011,44 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     addAdvD("tn_lcon","Contrast Low",0.0,0.0,3.0,grpTone);
     addAdvD("tn_lcon_w","Contrast Low Width",0.5,0.0,2.0,grpTone);
 
+    auto* resetRenderSpace = d.definePushButtonParam("reset_render_space");
+    resetRenderSpace->setLabel("Reset Render Space");
+    resetRenderSpace->setParent(*grpRender);
     addAdvD("rs_sa","Render Space Strength",0.35,0.0,0.6,grpRender);
     addAdvD("rs_rw","Render Space Weight R",0.25,0.0,0.8,grpRender);
     addAdvD("rs_bw","Render Space Weight B",0.55,0.0,0.8,grpRender);
 
-    auto* ptEnable = addAdvBool("pt_enable","Purity Compress High (Always On)",true,grpPurity);
-    ptEnable->setEnabled(false);
-    addAdvD("pt_lml","Purity Limit Low",0.25,0.0,1.0,grpPurity);
-    addAdvD("pt_lml_r","Purity Limit Low R",0.5,0.0,1.0,grpPurity);
-    addAdvD("pt_lml_g","Purity Limit Low G",0.0,0.0,1.0,grpPurity);
-    addAdvD("pt_lml_b","Purity Limit Low B",0.1,0.0,1.0,grpPurity);
-    addAdvD("pt_lmh","Purity Limit High",0.25,0.0,1.0,grpPurity);
-    addAdvD("pt_lmh_r","Purity Limit High R",0.5,0.0,1.0,grpPurity);
-    addAdvD("pt_lmh_b","Purity Limit High B",0.0,0.0,1.0,grpPurity);
-    addAdvBool("ptl_enable","Enable Purity Softclip",true,grpPurity);
-    addAdvD("ptl_c","Purity Softclip C",0.06,0.0,0.25,grpPurity);
-    addAdvD("ptl_m","Purity Softclip M",0.08,0.0,0.25,grpPurity);
-    addAdvD("ptl_y","Purity Softclip Y",0.06,0.0,0.25,grpPurity);
-    addAdvBool("ptm_enable","Enable Mid Purity",true,grpPurity);
-    addAdvD("ptm_low","Mid Purity Low",0.4,0.0,2.0,grpPurity);
-    addAdvD("ptm_low_rng","Mid Purity Low Range",0.25,0.0,1.0,grpPurity);
-    addAdvD("ptm_low_st","Mid Purity Low Strength",0.5,0.1,1.0,grpPurity);
-    addAdvD("ptm_high","Mid Purity High",-0.8,-0.9,0.0,grpPurity);
-    addAdvD("ptm_high_rng","Mid Purity High Range",0.35,0.0,1.0,grpPurity);
-    addAdvD("ptm_high_st","Mid Purity High Strength",0.4,0.1,1.0,grpPurity);
+    auto* resetMidPurity = d.definePushButtonParam("reset_mid_purity");
+    resetMidPurity->setLabel("Reset Mid Purity");
+    resetMidPurity->setParent(*grpMidPurity);
+    addAdvBool("ptm_enable","Enable Mid Purity",true,grpMidPurity);
+    addAdvD("ptm_low","Mid Purity Low",0.4,0.0,2.0,grpMidPurity);
+    addAdvD("ptm_low_rng","Mid Purity Low Range",0.25,0.0,1.0,grpMidPurity);
+    addAdvD("ptm_low_st","Mid Purity Low Strength",0.5,0.1,1.0,grpMidPurity);
+    addAdvD("ptm_high","Mid Purity High",-0.8,-0.9,0.0,grpMidPurity);
+    addAdvD("ptm_high_rng","Mid Purity High Range",0.35,0.0,1.0,grpMidPurity);
+    addAdvD("ptm_high_st","Mid Purity High Strength",0.4,0.1,1.0,grpMidPurity);
 
+    auto* resetPurityCompression = d.definePushButtonParam("reset_purity_compression");
+    resetPurityCompression->setLabel("Reset Purity Compression");
+    resetPurityCompression->setParent(*grpPurityCompression);
+    auto* ptEnable = addAdvBool("pt_enable","Purity Compress High (Always On)",true,grpPurityCompression);
+    ptEnable->setEnabled(false);
+    addAdvD("pt_lml","Purity Limit Low",0.25,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_r","Purity Limit Low R",0.5,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_g","Purity Limit Low G",0.0,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lml_b","Purity Limit Low B",0.1,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh","Purity Limit High",0.25,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh_r","Purity Limit High R",0.5,0.0,1.0,grpPurityCompression);
+    addAdvD("pt_lmh_b","Purity Limit High B",0.0,0.0,1.0,grpPurityCompression);
+    addAdvBool("ptl_enable","Enable Purity Softclip",true,grpPurityCompression);
+    addAdvD("ptl_c","Purity Softclip C",0.06,0.0,0.25,grpPurityCompression);
+    addAdvD("ptl_m","Purity Softclip M",0.08,0.0,0.25,grpPurityCompression);
+    addAdvD("ptl_y","Purity Softclip Y",0.06,0.0,0.25,grpPurityCompression);
+
+    auto* resetBrilliance = d.definePushButtonParam("reset_brilliance");
+    resetBrilliance->setLabel("Reset Brilliance");
+    resetBrilliance->setParent(*grpBrl);
     addAdvBool("brl_enable","Enable Brilliance",true,grpBrl);
     addAdvD("brl","Brilliance",0.0,-6.0,2.0,grpBrl);
     addAdvD("brl_r","Brilliance R",-2.5,-6.0,2.0,grpBrl);
@@ -2853,6 +3062,9 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     addAdvD("brlp_g","Post Brilliance G",-1.25,-3.0,0.0,grpBrl);
     addAdvD("brlp_b","Post Brilliance B",-0.25,-3.0,0.0,grpBrl);
 
+    auto* resetHue = d.definePushButtonParam("reset_hue");
+    resetHue->setLabel("Reset Hue");
+    resetHue->setParent(*grpHue);
     addAdvBool("hc_enable","Enable Hue Contrast",true,grpHue);
     addAdvD("hc_r","Hue Contrast R",1.0,0.0,2.0,grpHue);
     addAdvD("hc_r_rng","Hue Contrast R Range",0.3,0.0,1.0,grpHue);
@@ -2875,12 +3087,6 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
     addAdvC("tn_su","Surround",1,{"Dark","Dim","Bright"},grpDisplay);
     addAdvC("display_gamut","Display Gamut",0,{"Rec.709","P3-D65","Rec.2020","P3-D60","P3-DCI","XYZ"},grpDisplay);
     addAdvC("eotf","Display EOTF",2,{"Linear","2.2 Power sRGB","2.4 Power Rec.1886","2.6 Power DCI","ST 2084 PQ","HLG"},grpDisplay);
-
-    auto* overlay = d.defineBooleanParam("crv_enable");
-    overlay->setLabel("Tonescale Overlay");
-    overlay->setDefault(false);
-    if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
-    pOverlay->addChild(*overlay);
 
     auto* userPresetName = d.defineStringParam("userPresetName");
     userPresetName->setLabel("User Preset Name");

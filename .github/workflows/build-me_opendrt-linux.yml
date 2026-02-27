@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT Linux (x86_64 OpenCL/CPU)
+name: Build ME_OpenDRT Linux (x86_64 CUDA/OpenCL/CPU)
 
 on:
   workflow_dispatch:
@@ -8,6 +8,18 @@ on:
 
 jobs:
   build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - id: opencl-cpu
+            linux_cuda: "OFF"
+            artifact_name: ME_OpenDRT-linux-x86_64-opencl-cpu
+            archive_name: ME_OpenDRT_linux_x86_64_opencl_cpu_portable.tar.gz
+          - id: cuda-opencl-cpu
+            linux_cuda: "ON"
+            artifact_name: ME_OpenDRT-linux-x86_64-cuda-opencl-cpu
+            archive_name: ME_OpenDRT_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
     runs-on: ubuntu-22.04
 
     defaults:
@@ -22,10 +34,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev nvidia-cuda-toolkit
 
       - name: Configure
-        run: cmake -S . -B build-linux -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DME_OPENDRT_LINUX_CUDA=${{ matrix.variant.linux_cuda }}
 
       - name: Build
         run: cmake --build build-linux --config Release -j
@@ -36,13 +51,13 @@ jobs:
 
       - name: Package Linux portable bundle
         run: |
-          tar -czf ../../ME_OpenDRT_linux_x86_64_portable.tar.gz \
+          tar -czf ../../${{ matrix.variant.archive_name }} \
             -C bundle ME_OpenDRT.ofx.bundle
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ME_OpenDRT-linux-x86_64
+          name: ${{ matrix.variant.artifact_name }}
           path: |
-            ME_OpenDRT_linux_x86_64_portable.tar.gz
+            ${{ matrix.variant.archive_name }}
             ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle

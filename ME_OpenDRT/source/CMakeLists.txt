@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.20)
 project(ME_OpenDRT VERSION 1.1.0 LANGUAGES CXX)
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
+option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,22 +24,28 @@ set(PLUGIN_SOURCES
   ${OFX_SUPPORT_SOURCES}
 )
 
-if(WIN32)
+if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-  set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 86 89)
+  endif()
   # VS 2026 toolset is newer than nvcc's supported host-compiler list.
   # This keeps local Windows builds working with newer MSVC installations.
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+  if(WIN32)
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -allow-unsupported-compiler")
+  endif()
   find_package(CUDAToolkit REQUIRED)
 
-  set(OPENCL_LIB "${CUDAToolkit_LIBRARY_DIR}/OpenCL.lib")
-  if(NOT EXISTS "${OPENCL_LIB}")
-    set(OPENCL_LIB "${CUDAToolkit_LIBRARY_ROOT}/lib/x64/OpenCL.lib")
-  endif()
-  if(NOT EXISTS "${OPENCL_LIB}")
-    message(FATAL_ERROR "OpenCL.lib not found in CUDA Toolkit")
+  if(WIN32)
+    set(OPENCL_LIB "${CUDAToolkit_LIBRARY_DIR}/OpenCL.lib")
+    if(NOT EXISTS "${OPENCL_LIB}")
+      set(OPENCL_LIB "${CUDAToolkit_LIBRARY_ROOT}/lib/x64/OpenCL.lib")
+    endif()
+    if(NOT EXISTS "${OPENCL_LIB}")
+      message(FATAL_ERROR "OpenCL.lib not found in CUDA Toolkit")
+    endif()
   endif()
 
   list(APPEND PLUGIN_SOURCES src/cuda/OpenDRT.cu)
@@ -90,12 +97,16 @@ target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
   _CRT_SECURE_NO_WARNINGS
 )
 
-if(WIN32)
+if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
   target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
     OFX_SUPPORTS_CUDARENDER
-    WINDOWS
-    _WINDOWS
   )
+  if(WIN32)
+    target_compile_definitions(${PLUGIN_BASENAME} PRIVATE
+      WINDOWS
+      _WINDOWS
+    )
+  endif()
 endif()
 
 if(MSVC)
@@ -104,6 +115,10 @@ endif()
 
 if(WIN32)
   target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart_static "${OPENCL_LIB}")
+  target_include_directories(${PLUGIN_BASENAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+endif()
+if(UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA)
+  target_link_libraries(${PLUGIN_BASENAME} PRIVATE CUDA::cudart)
   target_include_directories(${PLUGIN_BASENAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 if(UNIX AND NOT APPLE)
