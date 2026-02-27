@@ -1,0 +1,88 @@
+name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-windows:
+    env:
+      OPENDRT_VERSION: v1.1.0-rc1
+      ZIP_NAME: ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
+      ARTIFACT_NAME: ME_OpenDRT-v1.1.0-rc1-windows-x86_64
+
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC dev command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Detect preinstalled CUDA
+        id: detect_cuda
+        run: |
+          $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+          if ($null -ne $nvcc) {
+            "has_cuda=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Found preinstalled nvcc at $($nvcc.Source)"
+            & nvcc --version
+          } else {
+            "has_cuda=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "No preinstalled nvcc found; CUDA toolkit install will run."
+          }
+
+      - name: Setup CUDA Toolkit
+        if: steps.detect_cuda.outputs.has_cuda != 'true'
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: "12.5.0"
+          method: "network"
+
+      - name: Detect preinstalled Ninja
+        id: detect_ninja
+        run: |
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if ($null -ne $ninja) {
+            "has_ninja=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Found preinstalled ninja at $($ninja.Source)"
+            & ninja --version
+          } else {
+            "has_ninja=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "No preinstalled ninja found; install will run."
+          }
+
+      - name: Install Ninja
+        if: steps.detect_ninja.outputs.has_ninja != 'true'
+        run: choco install ninja --no-progress -y
+
+      - name: Configure
+        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-win --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT.ofx")) {
+            throw "Missing Windows plugin binary"
+          }
+
+      - name: Package Windows portable bundle
+        run: |
+          if (Test-Path "..\..\$env:ZIP_NAME") { Remove-Item "..\..\$env:ZIP_NAME" -Force }
+          Compress-Archive -Path "bundle/ME_OpenDRT.ofx.bundle" -DestinationPath "..\..\$env:ZIP_NAME" -CompressionLevel Optimal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ZIP_NAME }}

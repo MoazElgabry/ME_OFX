@@ -157,9 +157,10 @@ jobs:
 
       - name: Setup CUDA Toolkit
         if: steps.detect_cuda.outputs.has_cuda != 'true'
-        uses: Jimver/cuda-toolkit@v0.2.17
+        uses: Jimver/cuda-toolkit@v0.2.29
         with:
           cuda: "12.5.0"
+          method: "network"
 
       - name: Detect preinstalled Ninja
         id: detect_ninja
@@ -231,9 +232,25 @@ jobs:
 
             case "$bn" in
               *.zip)
-                unzip -q "$f" -d "$work" || true
-                # Some Windows-created zips emit a non-fatal backslash warning in unzip.
-                # Treat it as success when files were extracted.
+                python3 -c 'import os, re, sys, zipfile
+zip_path, out_dir = sys.argv[1], sys.argv[2]
+os.makedirs(out_dir, exist_ok=True)
+with zipfile.ZipFile(zip_path) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        name = re.sub(r"^[A-Za-z]:", "", name).lstrip("/")
+        if not name:
+            continue
+        parts = [p for p in name.split("/") if p not in ("", ".", "..")]
+        if not parts:
+            continue
+        dst = os.path.join(out_dir, *parts)
+        if info.is_dir() or name.endswith("/"):
+            os.makedirs(dst, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with zf.open(info) as src, open(dst, "wb") as out:
+            out.write(src.read())' "$f" "$work"
                 if [ -z "$(find "$work" -mindepth 1 -print -quit)" ]; then
                   echo "Zip extraction produced no files: $bn"
                   exit 1
