@@ -1,4 +1,4 @@
-name: Build ME_OpenDRT macOS + Linux + Windows (one run)
+name: Build ME_OpenDRT All Platforms (macOS + Linux + Windows)
 
 on:
   workflow_dispatch:
