@@ -34,8 +34,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Ninja
-        run: brew install ninja || true
+      - name: Ensure Ninja is available
+        run: |
+          if command -v ninja >/dev/null 2>&1; then
+            echo "ninja already available: $(command -v ninja)"
+            ninja --version
+          else
+            brew install ninja
+          fi
 
       - name: Configure
         run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0

@@ -35,8 +35,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Ninja
-        run: brew install ninja || true
+      - name: Ensure Ninja is available
+        run: |
+          if command -v ninja >/dev/null 2>&1; then
+            echo "ninja already available: $(command -v ninja)"
+            ninja --version
+          else
+            brew install ninja
+          fi
 
       - name: Configure
         run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
@@ -92,7 +98,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev nvidia-cuda-toolkit
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev
+          if [ "${{ matrix.variant.linux_cuda }}" = "ON" ]; then
+            sudo apt-get install -y nvidia-cuda-toolkit
+          fi
 
       - name: Configure
         run: |
@@ -133,12 +142,40 @@ jobs:
       - name: Setup MSVC dev command prompt
         uses: ilammy/msvc-dev-cmd@v1
 
+      - name: Detect preinstalled CUDA
+        id: detect_cuda
+        run: |
+          $nvcc = Get-Command nvcc -ErrorAction SilentlyContinue
+          if ($null -ne $nvcc) {
+            "has_cuda=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Found preinstalled nvcc at $($nvcc.Source)"
+            & nvcc --version
+          } else {
+            "has_cuda=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "No preinstalled nvcc found; CUDA toolkit install will run."
+          }
+
       - name: Setup CUDA Toolkit
+        if: steps.detect_cuda.outputs.has_cuda != 'true'
         uses: Jimver/cuda-toolkit@v0.2.17
         with:
           cuda: "12.5.0"
 
+      - name: Detect preinstalled Ninja
+        id: detect_ninja
+        run: |
+          $ninja = Get-Command ninja -ErrorAction SilentlyContinue
+          if ($null -ne $ninja) {
+            "has_ninja=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "Found preinstalled ninja at $($ninja.Source)"
+            & ninja --version
+          } else {
+            "has_ninja=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "No preinstalled ninja found; install will run."
+          }
+
       - name: Install Ninja
+        if: steps.detect_ninja.outputs.has_ninja != 'true'
         run: choco install ninja --no-progress -y
 
       - name: Configure
