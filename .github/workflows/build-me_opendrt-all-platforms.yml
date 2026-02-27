@@ -231,25 +231,13 @@ jobs:
 
             case "$bn" in
               *.zip)
-                python3 - "$f" "$work" <<'PY'
-import os
-import sys
-import zipfile
-
-zip_path, out_dir = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(zip_path) as zf:
-    for info in zf.infolist():
-        name = info.filename.replace("\\", "/")
-        if not name:
-            continue
-        target = os.path.join(out_dir, name)
-        if info.is_dir() or name.endswith("/"):
-            os.makedirs(target, exist_ok=True)
-            continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
-        with zf.open(info) as src, open(target, "wb") as dst:
-            dst.write(src.read())
-PY
+                unzip -q "$f" -d "$work" || true
+                # Some Windows-created zips emit a non-fatal backslash warning in unzip.
+                # Treat it as success when files were extracted.
+                if [ -z "$(find "$work" -mindepth 1 -print -quit)" ]; then
+                  echo "Zip extraction produced no files: $bn"
+                  exit 1
+                fi
                 ;;
               *.tar.gz)
                 tar -xzf "$f" -C "$work"
