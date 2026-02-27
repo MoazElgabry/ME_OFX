@@ -123,6 +123,14 @@ bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defau
   // Metallib is packaged into Contents/Resources during CMake build.
   const std::string libPathStr = metallibPath();
   if (libPathStr.empty()) return false;
+  if (debugLogEnabled()) {
+    NSOperatingSystemVersion osv = [[NSProcessInfo processInfo] operatingSystemVersion];
+    NSLog(@"ME_OpenDRT Metal: runtime macOS %ld.%ld.%ld, metallib path: %s",
+          (long)osv.majorVersion,
+          (long)osv.minorVersion,
+          (long)osv.patchVersion,
+          libPathStr.c_str());
+  }
   NSString* libPath = [NSString stringWithUTF8String:libPathStr.c_str()];
   if (libPath == nil) return false;
   NSError* error = nil;

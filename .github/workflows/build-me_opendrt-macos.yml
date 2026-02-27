@@ -36,7 +36,7 @@ jobs:
         run: brew install ninja || true
 
       - name: Configure
-        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
 
       - name: Build
         run: cmake --build build-mac --config Release
@@ -45,6 +45,8 @@ jobs:
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
           xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
 
       - name: Package macOS portable bundle
