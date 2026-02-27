@@ -17,11 +17,11 @@ jobs:
           - id: opencl-cpu
             linux_cuda: "OFF"
             artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-opencl-cpu
-            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_opencl_cpu_portable.zip
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_opencl_cpu_portable.tar.gz
           - id: cuda-opencl-cpu
             linux_cuda: "ON"
             artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-cuda-opencl-cpu
-            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_cuda_opencl_cpu_portable.zip
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
     runs-on: ubuntu-22.04
 
     defaults:
@@ -36,7 +36,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev zip
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev
           if [ "${{ matrix.variant.linux_cuda }}" = "ON" ]; then
             sudo apt-get install -y nvidia-cuda-toolkit
           fi
@@ -56,7 +56,8 @@ jobs:
 
       - name: Package Linux portable bundle
         run: |
-          (cd bundle && zip -r ../../${{ matrix.variant.archive_name }} ME_OpenDRT.ofx.bundle)
+          tar -czf ../../${{ matrix.variant.archive_name }} \
+            -C bundle ME_OpenDRT.ofx.bundle
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
