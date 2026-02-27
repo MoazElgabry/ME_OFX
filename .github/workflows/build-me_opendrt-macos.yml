@@ -8,18 +8,20 @@ on:
 
 jobs:
   build-macos:
+    env:
+      OPENDRT_VERSION: v1.1.0-rc1
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
             runner: macos-14
-            zip_name: ME_OpenDRT_macOS_arm64_portable.zip
-            artifact_name: ME_OpenDRT-macos-arm64
+            zip_name: ME_OpenDRT_v1.1.0-rc1_macOS_arm64_portable.zip
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-macos-arm64
           - arch: x86_64
             runner: macos-15-intel
-            zip_name: ME_OpenDRT_macOS_x86_64_portable.zip
-            artifact_name: ME_OpenDRT-macos-x86_64
+            zip_name: ME_OpenDRT_v1.1.0-rc1_macOS_x86_64_portable.zip
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 

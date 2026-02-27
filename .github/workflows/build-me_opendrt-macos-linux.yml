@@ -1,0 +1,195 @@
+name: Build ME_OpenDRT macOS + Linux (one run)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  OPENDRT_VERSION: v1.1.0-rc1
+
+jobs:
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+            zip_name: ME_OpenDRT_v1.1.0-rc1_macOS_arm64_portable.zip
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-macos-arm64
+          - arch: x86_64
+            runner: macos-15-intel
+            zip_name: ME_OpenDRT_v1.1.0-rc1_macOS_x86_64_portable.zip
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-macos-x86_64
+
+    runs-on: ${{ matrix.runner }}
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Ninja
+        run: brew install ninja || true
+
+      - name: Configure
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+
+      - name: Build
+        run: cmake --build build-mac --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
+          xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
+
+      - name: Package macOS portable bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            bundle/ME_OpenDRT.ofx.bundle \
+            ../../${{ matrix.zip_name }}
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.zip_name }}
+            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+
+  build-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - id: opencl-cpu
+            linux_cuda: "OFF"
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-opencl-cpu
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_opencl_cpu_portable.tar.gz
+          - id: cuda-opencl-cpu
+            linux_cuda: "ON"
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-cuda-opencl-cpu
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
+
+    runs-on: ubuntu-22.04
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev nvidia-cuda-toolkit
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DME_OPENDRT_LINUX_CUDA=${{ matrix.variant.linux_cuda }}
+
+      - name: Build
+        run: cmake --build build-linux --config Release -j
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Linux-x86-64/ME_OpenDRT.ofx
+
+      - name: Package Linux portable bundle
+        run: |
+          tar -czf ../../${{ matrix.variant.archive_name }} \
+            -C bundle ME_OpenDRT.ofx.bundle
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.variant.artifact_name }}
+          path: |
+            ${{ matrix.variant.archive_name }}
+            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+
+  build-windows:
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC dev command prompt
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.17
+        with:
+          cuda: "12.5.0"
+
+      - name: Install Ninja
+        run: choco install ninja --no-progress -y
+
+      - name: Configure
+        run: cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build-win --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          if (!(Test-Path "bundle/ME_OpenDRT.ofx.bundle/Contents/Win64/ME_OpenDRT.ofx")) {
+            throw "Missing Windows plugin binary"
+          }
+
+      - name: Package Windows portable bundle
+        run: |
+          $zipName = "ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip"
+          if (Test-Path "..\..\$zipName") { Remove-Item "..\..\$zipName" -Force }
+          Compress-Archive -Path "bundle/ME_OpenDRT.ofx.bundle" -DestinationPath "..\..\$zipName" -CompressionLevel Optimal
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ME_OpenDRT-v1.1.0-rc1-windows-x86_64
+          path: |
+            ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
+            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+
+  bundle-all-platforms:
+    runs-on: ubuntu-22.04
+    needs:
+      - build-macos
+      - build-linux
+      - build-windows
+
+    steps:
+      - name: Download all workflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Create single all-platform archive
+        run: |
+          tar -czf ME_OpenDRT_v1.1.0-rc1_all_platforms.tar.gz -C all-artifacts .
+
+      - name: Upload single all-platform artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ME_OpenDRT-v1.1.0-rc1-all-platforms
+          path: ME_OpenDRT_v1.1.0-rc1_all_platforms.tar.gz

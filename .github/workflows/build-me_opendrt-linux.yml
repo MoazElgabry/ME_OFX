@@ -8,18 +8,20 @@ on:
 
 jobs:
   build-linux:
+    env:
+      OPENDRT_VERSION: v1.1.0-rc1
     strategy:
       fail-fast: false
       matrix:
         variant:
           - id: opencl-cpu
             linux_cuda: "OFF"
-            artifact_name: ME_OpenDRT-linux-x86_64-opencl-cpu
-            archive_name: ME_OpenDRT_linux_x86_64_opencl_cpu_portable.tar.gz
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-opencl-cpu
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_opencl_cpu_portable.tar.gz
           - id: cuda-opencl-cpu
             linux_cuda: "ON"
-            artifact_name: ME_OpenDRT-linux-x86_64-cuda-opencl-cpu
-            archive_name: ME_OpenDRT_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
+            artifact_name: ME_OpenDRT-v1.1.0-rc1-linux-x86_64-cuda-opencl-cpu
+            archive_name: ME_OpenDRT_v1.1.0-rc1_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
     runs-on: ubuntu-22.04
 
     defaults:
