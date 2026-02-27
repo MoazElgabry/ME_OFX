@@ -128,7 +128,7 @@ jobs:
           path: ${{ matrix.variant.archive_name }}
 
   build-windows:
-    runs-on: windows-2022
+    runs-on: [self-hosted, windows, x64]
 
     defaults:
       run:
