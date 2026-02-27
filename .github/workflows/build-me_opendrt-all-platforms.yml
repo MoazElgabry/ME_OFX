@@ -205,16 +205,19 @@ jobs:
           set -euo pipefail
           mkdir -p package-out
 
-          # Each downloaded artifact folder contains ME_OpenDRT.ofx.bundle directly.
+          # Locate bundle directories recursively inside each downloaded artifact.
           for d in all-artifacts/*; do
             [ -d "$d" ] || continue
             bn="$(basename "$d")"
-            if [ -d "$d/ME_OpenDRT.ofx.bundle" ]; then
-              cp -a "$d/ME_OpenDRT.ofx.bundle" "package-out/ME_OpenDRT_${bn}.ofx.bundle"
+            src_bundle="$(find "$d" -type d -name 'ME_OpenDRT.ofx.bundle' -print -quit || true)"
+            if [ -n "$src_bundle" ]; then
+              cp -a "$src_bundle" "package-out/ME_OpenDRT_${bn}.ofx.bundle"
             fi
           done
 
           if [ -z "$(find package-out -mindepth 1 -print -quit)" ]; then
+            echo "Artifact tree for debugging:"
+            find all-artifacts -maxdepth 6 -print || true
             echo "No bundles found in downloaded artifacts."
             exit 1
           fi
