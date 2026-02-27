@@ -231,7 +231,25 @@ jobs:
 
             case "$bn" in
               *.zip)
-                unzip -q "$f" -d "$work"
+                python3 - "$f" "$work" <<'PY'
+import os
+import sys
+import zipfile
+
+zip_path, out_dir = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(zip_path) as zf:
+    for info in zf.infolist():
+        name = info.filename.replace("\\", "/")
+        if not name:
+            continue
+        target = os.path.join(out_dir, name)
+        if info.is_dir() or name.endswith("/"):
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with zf.open(info) as src, open(target, "wb") as dst:
+            dst.write(src.read())
+PY
                 ;;
               *.tar.gz)
                 tar -xzf "$f" -C "$work"
