@@ -62,9 +62,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.zip_name }}
-            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: ${{ matrix.zip_name }}
 
   build-linux:
     strategy:
@@ -118,9 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.variant.artifact_name }}
-          path: |
-            ${{ matrix.variant.archive_name }}
-            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: ${{ matrix.variant.archive_name }}
 
   build-windows:
     runs-on: windows-2022
@@ -167,9 +163,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ME_OpenDRT-v1.1.0-rc1-windows-x86_64
-          path: |
-            ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
-            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: ME_OpenDRT_v1.1.0-rc1_windows_x86_64_portable.zip
 
   bundle-all-platforms:
     runs-on: ubuntu-22.04

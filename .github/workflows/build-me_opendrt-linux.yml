@@ -60,6 +60,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.variant.artifact_name }}
-          path: |
-            ${{ matrix.variant.archive_name }}
-            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: ${{ matrix.variant.archive_name }}

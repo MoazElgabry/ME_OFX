@@ -61,6 +61,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact_name }}
-          path: |
-            ${{ matrix.zip_name }}
-            ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
+          path: ${{ matrix.zip_name }}
