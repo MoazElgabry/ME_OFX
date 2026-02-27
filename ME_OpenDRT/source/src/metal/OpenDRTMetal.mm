@@ -137,6 +137,17 @@ bool initializePipelineForDevice(id<MTLDevice> device, id<MTLCommandQueue> defau
 
   id<MTLFunction> function = [library newFunctionWithName:@"OpenDRTKernel"];
   if (function == nil) {
+    NSArray<NSString*>* names = [library functionNames];
+    if (names != nil && names.count > 0) {
+      NSMutableString* joined = [NSMutableString string];
+      for (NSUInteger i = 0; i < names.count; ++i) {
+        if (i > 0) [joined appendString:@", "];
+        [joined appendString:names[i]];
+      }
+      NSLog(@"ME_OpenDRT Metal: available metallib functions: %@", joined);
+    } else {
+      NSLog(@"ME_OpenDRT Metal: metallib contains no discoverable functions");
+    }
     NSLog(@"ME_OpenDRT Metal: OpenDRTKernel entry not found in metallib");
     return false;
   }

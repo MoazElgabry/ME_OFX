@@ -45,6 +45,7 @@ jobs:
         run: |
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
           test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+          xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
 
       - name: Package macOS portable bundle
         run: |
