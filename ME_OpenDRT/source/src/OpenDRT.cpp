@@ -2,7 +2,9 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#if !defined(__linux__)
 #include <filesystem>
+#endif
 #include <fstream>
 #include <cstdio>
 #include <mutex>
@@ -11,6 +13,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#if defined(__linux__)
+#include <cerrno>
+#include <sys/stat.h>
+#endif
 
 #include "ofxsImageEffect.h"
 
@@ -280,6 +286,58 @@ std::string jsonUnescape(const std::string& in) {
 
 // Resolve user-level preset location.
 // Keep path logic centralized so save/import/refresh always resolve consistently.
+#if defined(__linux__)
+std::string userPresetDirPath() {
+  const char* home = std::getenv("HOME");
+  if (home && *home) return std::string(home) + "/.config/ME_OpenDRT";
+  return ".";
+}
+
+std::string userPresetFilePathV2() {
+  return userPresetDirPath() + "/presets_v2.json";
+}
+
+std::string userPresetFilePathV1Legacy() {
+  return userPresetDirPath() + "/user_presets_v1.txt";
+}
+
+bool fileExists(const std::string& path) {
+  struct stat st {};
+  return !path.empty() && ::stat(path.c_str(), &st) == 0;
+}
+
+std::string parentPath(const std::string& path) {
+  const size_t pos = path.find_last_of("/\\");
+  if (pos == std::string::npos) return ".";
+  if (pos == 0) return "/";
+  return path.substr(0, pos);
+}
+
+bool ensureDirectoryExists(const std::string& dir) {
+  if (dir.empty()) return false;
+  std::string normalized = dir;
+  for (char& c : normalized) {
+    if (c == '\\') c = '/';
+  }
+  std::string current;
+  if (!normalized.empty() && normalized[0] == '/') current = "/";
+  size_t i = (current == "/") ? 1 : 0;
+  while (i < normalized.size()) {
+    const size_t slash = normalized.find('/', i);
+    const std::string part = normalized.substr(i, slash == std::string::npos ? std::string::npos : slash - i);
+    if (!part.empty()) {
+      if (!current.empty() && current.back() != '/') current.push_back('/');
+      current += part;
+      if (::mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+        return false;
+      }
+    }
+    if (slash == std::string::npos) break;
+    i = slash + 1;
+  }
+  return true;
+}
+#else
 std::filesystem::path userPresetDirPath() {
 #ifdef _WIN32
   const char* base = std::getenv("APPDATA");
@@ -302,6 +360,7 @@ std::filesystem::path userPresetFilePathV2() {
 std::filesystem::path userPresetFilePathV1Legacy() {
   return userPresetDirPath() / "user_presets_v1.txt";
 }
+#endif
 
 enum class DeleteTarget {
   Cancel = 0,
@@ -680,8 +739,12 @@ std::string jsonField(const std::string& line, const std::string& key) {
 
 void saveUserPresetStoreLocked() {
   const auto path = userPresetFilePathV2();
+#if defined(__linux__)
+  (void)ensureDirectoryExists(parentPath(path));
+#else
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
+#endif
   std::ofstream os(path, std::ios::binary | std::ios::trunc);
   if (!os.is_open()) return;
 
@@ -719,7 +782,11 @@ void saveUserPresetStoreLocked() {
 // One-time compatibility migration from legacy v1 format when v2 does not exist.
 void migrateLegacyV1IfNeededLocked() {
   const auto v2 = userPresetFilePathV2();
+#if defined(__linux__)
+  if (fileExists(v2)) return;
+#else
   if (std::filesystem::exists(v2)) return;
+#endif
   std::ifstream is(userPresetFilePathV1Legacy(), std::ios::binary);
   if (!is.is_open()) return;
 
