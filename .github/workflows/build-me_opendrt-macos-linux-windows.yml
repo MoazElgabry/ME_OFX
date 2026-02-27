@@ -214,13 +214,42 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: all-artifacts
+          merge-multiple: true
 
-      - name: Create single all-platform archive
+      - name: Build flat all-platform package (no nested archives)
         run: |
-          tar -czf ME_OpenDRT_v1.1.0-rc1_all_platforms.tar.gz -C all-artifacts .
+          set -euo pipefail
+          mkdir -p package-out
+
+          # Expand every portable archive and rename bundle root with platform suffix
+          # so all variants can coexist in one final zip.
+          for f in all-artifacts/*; do
+            [ -f "$f" ] || continue
+            bn="$(basename "$f")"
+            work="work-${bn%.*}"
+            mkdir -p "$work"
+
+            case "$bn" in
+              *.zip)
+                unzip -q "$f" -d "$work"
+                ;;
+              *.tar.gz)
+                tar -xzf "$f" -C "$work"
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            if [ -d "$work/ME_OpenDRT.ofx.bundle" ]; then
+              cp -a "$work/ME_OpenDRT.ofx.bundle" "package-out/ME_OpenDRT_${bn%.*}.ofx.bundle"
+            fi
+          done
+
+          (cd package-out && zip -r ../ME_OpenDRT_v1.1.0-rc1_all_platforms.zip .)
 
       - name: Upload single all-platform artifact
         uses: actions/upload-artifact@v4
         with:
           name: ME_OpenDRT-v1.1.0-rc1-all-platforms
-          path: ME_OpenDRT_v1.1.0-rc1_all_platforms.tar.gz
+          path: ME_OpenDRT_v1.1.0-rc1_all_platforms.zip
