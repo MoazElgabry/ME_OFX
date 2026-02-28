@@ -63,7 +63,7 @@ sudo chown -R root:wheel /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 sudo codesign --force --deep --sign - /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 ```
-*If you're prompted for tour Mac login password usually there is jo indication or cursor
+*If you're prompted for your Mac login password, usually there is no indication or cursor
 simply imput the password and hit enter.
 
 Then relaunch DaVinci Resolve.
