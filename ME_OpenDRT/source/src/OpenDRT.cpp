@@ -37,6 +37,9 @@
 
 namespace {
 
+// ===== Startup Mode/Logging Switches =====
+// These helpers read env toggles once (static cache) to keep render-time behavior deterministic
+// and avoid repeated getenv/string parsing in hot paths.
 bool perfLogEnabled() {
   static const bool enabled = []() {
     const char* v = std::getenv("ME_OPENDRT_PERF_LOG");
@@ -69,10 +72,9 @@ enum class MetalRenderMode {
 // - ME_OPENDRT_RENDER_MODE=HOST|AUTO -> host preferred
 // - ME_OPENDRT_RENDER_MODE=INTERNAL  -> internal only
 // Legacy env vars remain as compatibility fallback.
-// Note-to-self:
-// Keep this selector stable because both describe() capability advertisement
-// and render() routing depend on it. If these drift, Resolve may expose
-// CUDA host mode but runtime silently falls back (or vice versa).
+// Important coupling:
+// describe() advertises host-CUDA capability from this selector and render() routes from it.
+// Keeping both on the same selector avoids host UI/runtime mismatch.
 CudaRenderMode selectedCudaRenderMode() {
   static const CudaRenderMode mode = []() {
     const char* modeVar = std::getenv("ME_OPENDRT_RENDER_MODE");
@@ -92,7 +94,7 @@ CudaRenderMode selectedCudaRenderMode() {
       return CudaRenderMode::HostPreferred;
     }
 
-    // Default when CUDA host render is available: host-CUDA preferred for fastest playback.
+    // Default policy: prefer host-CUDA because it avoids plugin-side staging/copy overhead.
     return CudaRenderMode::HostPreferred;
   }();
   return mode;
@@ -101,6 +103,7 @@ CudaRenderMode selectedCudaRenderMode() {
 // Deterministic Metal mode selector:
 // - ME_OPENDRT_METAL_RENDER_MODE=HOST|AUTO -> host preferred
 // - ME_OPENDRT_METAL_RENDER_MODE=INTERNAL  -> internal-only path
+// Default policy mirrors CUDA: prefer host-Metal for lower staging overhead when available.
 MetalRenderMode selectedMetalRenderMode() {
   static const MetalRenderMode mode = []() {
     const char* modeVar = std::getenv("ME_OPENDRT_METAL_RENDER_MODE");
@@ -124,6 +127,8 @@ bool debugLogEnabled() {
   return enabled;
 }
 
+// Perf logging writes to stderr and platform-local file locations to help compare host/internal paths.
+// Logging is opt-in and non-fatal: any filesystem failures are ignored.
 void perfLog(const char* stage, const std::chrono::steady_clock::time_point& start) {
   if (!perfLogEnabled()) return;
   const auto now = std::chrono::steady_clock::now();
@@ -307,6 +312,7 @@ std::string jsonUnescape(const std::string& in) {
   return out;
 }
 
+// ===== Preset File Paths: per-platform storage locations =====
 // Resolve user-level preset location.
 // Keep path logic centralized so save/import/refresh always resolve consistently.
 #if defined(__linux__)
@@ -391,6 +397,7 @@ enum class DeleteTarget {
   Tonescale
 };
 
+// ===== Dialog + Shell Helpers: platform-specific picker/confirm/url utilities =====
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
@@ -662,6 +669,7 @@ bool openExternalUrl(const std::string& url) {
 }
 #endif
 
+// ===== Preset Payload Codec: compact canonical payload (schema anchor) =====
 // Compact payload serialization keeps files small and load fast.
 // Field ordering is versioned-by-convention and should remain stable.
 bool serializeLookValues(const LookPresetValues& v, std::string& out) {
@@ -738,6 +746,216 @@ bool parseTonescaleValues(const std::string& in, TonescalePresetValues* v) {
   );
 }
 
+// ===== Interop String Builders: named JSON + Nuke + DCTL representations =====
+std::string formatFloatLiteral(double v) {
+  std::ostringstream os;
+  os.setf(std::ios::fixed);
+  os.precision(9);
+  os << v;
+  return os.str();
+}
+
+std::string nukeEscapeToken(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() * 2);
+  for (char c : s) {
+    if (c == '\\' || c == ' ') out.push_back('\\');
+    out.push_back(c);
+  }
+  return out;
+}
+
+void appendJsonInt(std::ostringstream& os, bool& first, const char* k, int v) {
+  if (!first) os << ',';
+  first = false;
+  os << '\"' << k << "\":" << v;
+}
+
+void appendJsonFloat(std::ostringstream& os, bool& first, const char* k, double v) {
+  if (!first) os << ',';
+  first = false;
+  os << '\"' << k << "\":" << formatFloatLiteral(v);
+}
+
+void appendNukeInt(std::ostringstream& os, const char* k, int v) {
+  os << k << ' ' << v << ' ';
+}
+
+void appendNukeFloat(std::ostringstream& os, const char* k, double v) {
+  os << k << ' ' << formatFloatLiteral(v) << ' ';
+}
+
+void appendDctlInt(std::ostringstream& os, bool& first, const char* k, int v) {
+  if (!first) os << ", ";
+  first = false;
+  os << k << " = " << v;
+}
+
+void appendDctlFloat(std::ostringstream& os, bool& first, const char* k, double v) {
+  if (!first) os << ", ";
+  first = false;
+  os << k << " = " << formatFloatLiteral(v) << 'f';
+}
+
+std::string lookValuesAsNamedJson(const LookPresetValues& v) {
+  std::ostringstream os;
+  os << '{';
+  bool first = true;
+  appendJsonFloat(os, first, "tn_con", v.tn_con); appendJsonFloat(os, first, "tn_sh", v.tn_sh);
+  appendJsonFloat(os, first, "tn_toe", v.tn_toe); appendJsonFloat(os, first, "tn_off", v.tn_off);
+  appendJsonInt(os, first, "tn_hcon_enable", v.tn_hcon_enable); appendJsonFloat(os, first, "tn_hcon", v.tn_hcon);
+  appendJsonFloat(os, first, "tn_hcon_pv", v.tn_hcon_pv); appendJsonFloat(os, first, "tn_hcon_st", v.tn_hcon_st);
+  appendJsonInt(os, first, "tn_lcon_enable", v.tn_lcon_enable); appendJsonFloat(os, first, "tn_lcon", v.tn_lcon);
+  appendJsonFloat(os, first, "tn_lcon_w", v.tn_lcon_w); appendJsonInt(os, first, "cwp", v.cwp);
+  appendJsonFloat(os, first, "cwp_lm", v.cwp_lm); appendJsonFloat(os, first, "rs_sa", v.rs_sa);
+  appendJsonFloat(os, first, "rs_rw", v.rs_rw); appendJsonFloat(os, first, "rs_bw", v.rs_bw);
+  appendJsonInt(os, first, "pt_enable", v.pt_enable); appendJsonFloat(os, first, "pt_lml", v.pt_lml);
+  appendJsonFloat(os, first, "pt_lml_r", v.pt_lml_r); appendJsonFloat(os, first, "pt_lml_g", v.pt_lml_g);
+  appendJsonFloat(os, first, "pt_lml_b", v.pt_lml_b); appendJsonFloat(os, first, "pt_lmh", v.pt_lmh);
+  appendJsonFloat(os, first, "pt_lmh_r", v.pt_lmh_r); appendJsonFloat(os, first, "pt_lmh_b", v.pt_lmh_b);
+  appendJsonInt(os, first, "ptl_enable", v.ptl_enable); appendJsonFloat(os, first, "ptl_c", v.ptl_c);
+  appendJsonFloat(os, first, "ptl_m", v.ptl_m); appendJsonFloat(os, first, "ptl_y", v.ptl_y);
+  appendJsonInt(os, first, "ptm_enable", v.ptm_enable); appendJsonFloat(os, first, "ptm_low", v.ptm_low);
+  appendJsonFloat(os, first, "ptm_low_rng", v.ptm_low_rng); appendJsonFloat(os, first, "ptm_low_st", v.ptm_low_st);
+  appendJsonFloat(os, first, "ptm_high", v.ptm_high); appendJsonFloat(os, first, "ptm_high_rng", v.ptm_high_rng);
+  appendJsonFloat(os, first, "ptm_high_st", v.ptm_high_st); appendJsonInt(os, first, "brl_enable", v.brl_enable);
+  appendJsonFloat(os, first, "brl", v.brl); appendJsonFloat(os, first, "brl_r", v.brl_r);
+  appendJsonFloat(os, first, "brl_g", v.brl_g); appendJsonFloat(os, first, "brl_b", v.brl_b);
+  appendJsonFloat(os, first, "brl_rng", v.brl_rng); appendJsonFloat(os, first, "brl_st", v.brl_st);
+  appendJsonInt(os, first, "brlp_enable", v.brlp_enable); appendJsonFloat(os, first, "brlp", v.brlp);
+  appendJsonFloat(os, first, "brlp_r", v.brlp_r); appendJsonFloat(os, first, "brlp_g", v.brlp_g);
+  appendJsonFloat(os, first, "brlp_b", v.brlp_b); appendJsonInt(os, first, "hc_enable", v.hc_enable);
+  appendJsonFloat(os, first, "hc_r", v.hc_r); appendJsonFloat(os, first, "hc_r_rng", v.hc_r_rng);
+  appendJsonInt(os, first, "hs_rgb_enable", v.hs_rgb_enable); appendJsonFloat(os, first, "hs_r", v.hs_r);
+  appendJsonFloat(os, first, "hs_r_rng", v.hs_r_rng); appendJsonFloat(os, first, "hs_g", v.hs_g);
+  appendJsonFloat(os, first, "hs_g_rng", v.hs_g_rng); appendJsonFloat(os, first, "hs_b", v.hs_b);
+  appendJsonFloat(os, first, "hs_b_rng", v.hs_b_rng); appendJsonInt(os, first, "hs_cmy_enable", v.hs_cmy_enable);
+  appendJsonFloat(os, first, "hs_c", v.hs_c); appendJsonFloat(os, first, "hs_c_rng", v.hs_c_rng);
+  appendJsonFloat(os, first, "hs_m", v.hs_m); appendJsonFloat(os, first, "hs_m_rng", v.hs_m_rng);
+  appendJsonFloat(os, first, "hs_y", v.hs_y); appendJsonFloat(os, first, "hs_y_rng", v.hs_y_rng);
+  os << '}';
+  return os.str();
+}
+
+std::string tonescaleValuesAsNamedJson(const TonescalePresetValues& v) {
+  std::ostringstream os;
+  os << '{';
+  bool first = true;
+  appendJsonFloat(os, first, "tn_con", v.tn_con); appendJsonFloat(os, first, "tn_sh", v.tn_sh);
+  appendJsonFloat(os, first, "tn_toe", v.tn_toe); appendJsonFloat(os, first, "tn_off", v.tn_off);
+  appendJsonInt(os, first, "tn_hcon_enable", v.tn_hcon_enable); appendJsonFloat(os, first, "tn_hcon", v.tn_hcon);
+  appendJsonFloat(os, first, "tn_hcon_pv", v.tn_hcon_pv); appendJsonFloat(os, first, "tn_hcon_st", v.tn_hcon_st);
+  appendJsonInt(os, first, "tn_lcon_enable", v.tn_lcon_enable); appendJsonFloat(os, first, "tn_lcon", v.tn_lcon);
+  appendJsonFloat(os, first, "tn_lcon_w", v.tn_lcon_w);
+  os << '}';
+  return os.str();
+}
+
+std::string lookValuesAsNukeCmd(const std::string& presetName, const LookPresetValues& v) {
+  std::ostringstream os;
+  os << "knobs this {";
+  appendNukeFloat(os, "tn_con", v.tn_con); appendNukeFloat(os, "tn_sh", v.tn_sh);
+  appendNukeFloat(os, "tn_toe", v.tn_toe); appendNukeFloat(os, "tn_off", v.tn_off);
+  appendNukeInt(os, "tn_hcon_enable", v.tn_hcon_enable); appendNukeFloat(os, "tn_hcon", v.tn_hcon);
+  appendNukeFloat(os, "tn_hcon_pv", v.tn_hcon_pv); appendNukeFloat(os, "tn_hcon_st", v.tn_hcon_st);
+  appendNukeInt(os, "tn_lcon_enable", v.tn_lcon_enable); appendNukeFloat(os, "tn_lcon", v.tn_lcon);
+  appendNukeFloat(os, "tn_lcon_w", v.tn_lcon_w); appendNukeInt(os, "cwp", v.cwp);
+  appendNukeFloat(os, "cwp_lm", v.cwp_lm); appendNukeFloat(os, "rs_sa", v.rs_sa);
+  appendNukeFloat(os, "rs_rw", v.rs_rw); appendNukeFloat(os, "rs_bw", v.rs_bw);
+  appendNukeInt(os, "pt_enable", v.pt_enable); appendNukeFloat(os, "pt_lml", v.pt_lml);
+  appendNukeFloat(os, "pt_lml_r", v.pt_lml_r); appendNukeFloat(os, "pt_lml_g", v.pt_lml_g);
+  appendNukeFloat(os, "pt_lml_b", v.pt_lml_b); appendNukeFloat(os, "pt_lmh", v.pt_lmh);
+  appendNukeFloat(os, "pt_lmh_r", v.pt_lmh_r); appendNukeFloat(os, "pt_lmh_b", v.pt_lmh_b);
+  appendNukeInt(os, "ptl_enable", v.ptl_enable); appendNukeFloat(os, "ptl_c", v.ptl_c);
+  appendNukeFloat(os, "ptl_m", v.ptl_m); appendNukeFloat(os, "ptl_y", v.ptl_y);
+  appendNukeInt(os, "ptm_enable", v.ptm_enable); appendNukeFloat(os, "ptm_low", v.ptm_low);
+  appendNukeFloat(os, "ptm_low_rng", v.ptm_low_rng); appendNukeFloat(os, "ptm_low_st", v.ptm_low_st);
+  appendNukeFloat(os, "ptm_high", v.ptm_high); appendNukeFloat(os, "ptm_high_rng", v.ptm_high_rng);
+  appendNukeFloat(os, "ptm_high_st", v.ptm_high_st); appendNukeInt(os, "brl_enable", v.brl_enable);
+  appendNukeFloat(os, "brl", v.brl); appendNukeFloat(os, "brl_r", v.brl_r);
+  appendNukeFloat(os, "brl_g", v.brl_g); appendNukeFloat(os, "brl_b", v.brl_b);
+  appendNukeFloat(os, "brl_rng", v.brl_rng); appendNukeFloat(os, "brl_st", v.brl_st);
+  appendNukeInt(os, "brlp_enable", v.brlp_enable); appendNukeFloat(os, "brlp", v.brlp);
+  appendNukeFloat(os, "brlp_r", v.brlp_r); appendNukeFloat(os, "brlp_g", v.brlp_g);
+  appendNukeFloat(os, "brlp_b", v.brlp_b); appendNukeInt(os, "hc_enable", v.hc_enable);
+  appendNukeFloat(os, "hc_r", v.hc_r); appendNukeFloat(os, "hc_r_rng", v.hc_r_rng);
+  appendNukeInt(os, "hs_rgb_enable", v.hs_rgb_enable); appendNukeFloat(os, "hs_r", v.hs_r);
+  appendNukeFloat(os, "hs_r_rng", v.hs_r_rng); appendNukeFloat(os, "hs_g", v.hs_g);
+  appendNukeFloat(os, "hs_g_rng", v.hs_g_rng); appendNukeFloat(os, "hs_b", v.hs_b);
+  appendNukeFloat(os, "hs_b_rng", v.hs_b_rng); appendNukeInt(os, "hs_cmy_enable", v.hs_cmy_enable);
+  appendNukeFloat(os, "hs_c", v.hs_c); appendNukeFloat(os, "hs_c_rng", v.hs_c_rng);
+  appendNukeFloat(os, "hs_m", v.hs_m); appendNukeFloat(os, "hs_m_rng", v.hs_m_rng);
+  appendNukeFloat(os, "hs_y", v.hs_y); appendNukeFloat(os, "hs_y_rng", v.hs_y_rng);
+  os << "look_name " << nukeEscapeToken(presetName) << "}";
+  return os.str();
+}
+
+std::string tonescaleValuesAsNukeCmd(const TonescalePresetValues& v) {
+  std::ostringstream os;
+  os << "knobs this {";
+  appendNukeFloat(os, "tn_con", v.tn_con); appendNukeFloat(os, "tn_sh", v.tn_sh);
+  appendNukeFloat(os, "tn_toe", v.tn_toe); appendNukeFloat(os, "tn_off", v.tn_off);
+  appendNukeInt(os, "tn_hcon_enable", v.tn_hcon_enable); appendNukeFloat(os, "tn_hcon", v.tn_hcon);
+  appendNukeFloat(os, "tn_hcon_pv", v.tn_hcon_pv); appendNukeFloat(os, "tn_hcon_st", v.tn_hcon_st);
+  appendNukeInt(os, "tn_lcon_enable", v.tn_lcon_enable); appendNukeFloat(os, "tn_lcon", v.tn_lcon);
+  appendNukeFloat(os, "tn_lcon_w", v.tn_lcon_w);
+  os << "}";
+  return os.str();
+}
+
+std::string lookValuesAsDctl(const LookPresetValues& v) {
+  std::ostringstream os;
+  bool first = true;
+  appendDctlFloat(os, first, "tn_con", v.tn_con); appendDctlFloat(os, first, "tn_sh", v.tn_sh);
+  appendDctlFloat(os, first, "tn_toe", v.tn_toe); appendDctlFloat(os, first, "tn_off", v.tn_off);
+  appendDctlInt(os, first, "tn_hcon_enable", v.tn_hcon_enable); appendDctlFloat(os, first, "tn_hcon", v.tn_hcon);
+  appendDctlFloat(os, first, "tn_hcon_pv", v.tn_hcon_pv); appendDctlFloat(os, first, "tn_hcon_st", v.tn_hcon_st);
+  appendDctlInt(os, first, "tn_lcon_enable", v.tn_lcon_enable); appendDctlFloat(os, first, "tn_lcon", v.tn_lcon);
+  appendDctlFloat(os, first, "tn_lcon_w", v.tn_lcon_w); appendDctlInt(os, first, "cwp", v.cwp);
+  appendDctlFloat(os, first, "cwp_lm", v.cwp_lm); appendDctlFloat(os, first, "rs_sa", v.rs_sa);
+  appendDctlFloat(os, first, "rs_rw", v.rs_rw); appendDctlFloat(os, first, "rs_bw", v.rs_bw);
+  appendDctlInt(os, first, "pt_enable", v.pt_enable); appendDctlFloat(os, first, "pt_lml", v.pt_lml);
+  appendDctlFloat(os, first, "pt_lml_r", v.pt_lml_r); appendDctlFloat(os, first, "pt_lml_g", v.pt_lml_g);
+  appendDctlFloat(os, first, "pt_lml_b", v.pt_lml_b); appendDctlFloat(os, first, "pt_lmh", v.pt_lmh);
+  appendDctlFloat(os, first, "pt_lmh_r", v.pt_lmh_r); appendDctlFloat(os, first, "pt_lmh_b", v.pt_lmh_b);
+  appendDctlInt(os, first, "ptl_enable", v.ptl_enable); appendDctlFloat(os, first, "ptl_c", v.ptl_c);
+  appendDctlFloat(os, first, "ptl_m", v.ptl_m); appendDctlFloat(os, first, "ptl_y", v.ptl_y);
+  appendDctlInt(os, first, "ptm_enable", v.ptm_enable); appendDctlFloat(os, first, "ptm_low", v.ptm_low);
+  appendDctlFloat(os, first, "ptm_low_rng", v.ptm_low_rng); appendDctlFloat(os, first, "ptm_low_st", v.ptm_low_st);
+  appendDctlFloat(os, first, "ptm_high", v.ptm_high); appendDctlFloat(os, first, "ptm_high_rng", v.ptm_high_rng);
+  appendDctlFloat(os, first, "ptm_high_st", v.ptm_high_st); appendDctlInt(os, first, "brl_enable", v.brl_enable);
+  appendDctlFloat(os, first, "brl", v.brl); appendDctlFloat(os, first, "brl_r", v.brl_r);
+  appendDctlFloat(os, first, "brl_g", v.brl_g); appendDctlFloat(os, first, "brl_b", v.brl_b);
+  appendDctlFloat(os, first, "brl_rng", v.brl_rng); appendDctlFloat(os, first, "brl_st", v.brl_st);
+  appendDctlInt(os, first, "brlp_enable", v.brlp_enable); appendDctlFloat(os, first, "brlp", v.brlp);
+  appendDctlFloat(os, first, "brlp_r", v.brlp_r); appendDctlFloat(os, first, "brlp_g", v.brlp_g);
+  appendDctlFloat(os, first, "brlp_b", v.brlp_b); appendDctlInt(os, first, "hc_enable", v.hc_enable);
+  appendDctlFloat(os, first, "hc_r", v.hc_r); appendDctlFloat(os, first, "hc_r_rng", v.hc_r_rng);
+  appendDctlInt(os, first, "hs_rgb_enable", v.hs_rgb_enable); appendDctlFloat(os, first, "hs_r", v.hs_r);
+  appendDctlFloat(os, first, "hs_r_rng", v.hs_r_rng); appendDctlFloat(os, first, "hs_g", v.hs_g);
+  appendDctlFloat(os, first, "hs_g_rng", v.hs_g_rng); appendDctlFloat(os, first, "hs_b", v.hs_b);
+  appendDctlFloat(os, first, "hs_b_rng", v.hs_b_rng); appendDctlInt(os, first, "hs_cmy_enable", v.hs_cmy_enable);
+  appendDctlFloat(os, first, "hs_c", v.hs_c); appendDctlFloat(os, first, "hs_c_rng", v.hs_c_rng);
+  appendDctlFloat(os, first, "hs_m", v.hs_m); appendDctlFloat(os, first, "hs_m_rng", v.hs_m_rng);
+  appendDctlFloat(os, first, "hs_y", v.hs_y); appendDctlFloat(os, first, "hs_y_rng", v.hs_y_rng);
+  os << ';';
+  return os.str();
+}
+
+std::string tonescaleValuesAsDctl(const TonescalePresetValues& v) {
+  std::ostringstream os;
+  bool first = true;
+  appendDctlFloat(os, first, "tn_con", v.tn_con); appendDctlFloat(os, first, "tn_sh", v.tn_sh);
+  appendDctlFloat(os, first, "tn_toe", v.tn_toe); appendDctlFloat(os, first, "tn_off", v.tn_off);
+  appendDctlInt(os, first, "tn_hcon_enable", v.tn_hcon_enable); appendDctlFloat(os, first, "tn_hcon", v.tn_hcon);
+  appendDctlFloat(os, first, "tn_hcon_pv", v.tn_hcon_pv); appendDctlFloat(os, first, "tn_hcon_st", v.tn_hcon_st);
+  appendDctlInt(os, first, "tn_lcon_enable", v.tn_lcon_enable); appendDctlFloat(os, first, "tn_lcon", v.tn_lcon);
+  appendDctlFloat(os, first, "tn_lcon_w", v.tn_lcon_w);
+  os << ';';
+  return os.str();
+}
+
+// ===== JSON Object Utilities: lightweight field extraction/pretty printing =====
 std::string jsonField(const std::string& line, const std::string& key) {
   const std::string token = "\"" + key + "\":\"";
   const size_t p = line.find(token);
@@ -760,6 +978,199 @@ std::string jsonField(const std::string& line, const std::string& key) {
   return jsonUnescape(out);
 }
 
+std::string jsonObjectField(const std::string& text, const std::string& key) {
+  const std::string token = "\"" + key + "\":";
+  const size_t p = text.find(token);
+  if (p == std::string::npos) return std::string();
+  size_t i = p + token.size();
+  while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i]))) ++i;
+  if (i >= text.size() || text[i] != '{') return std::string();
+  const size_t start = i;
+  int depth = 0;
+  bool inString = false;
+  bool esc = false;
+  for (; i < text.size(); ++i) {
+    const char c = text[i];
+    if (inString) {
+      if (esc) {
+        esc = false;
+      } else if (c == '\\') {
+        esc = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      continue;
+    }
+    if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0) return text.substr(start, i - start + 1);
+    }
+  }
+  return std::string();
+}
+
+std::string prettyJsonObject(const std::string& compact, const std::string& indent) {
+  if (compact.empty()) return "{}";
+  std::ostringstream out;
+  int depth = 0;
+  bool inString = false;
+  bool esc = false;
+  for (size_t i = 0; i < compact.size(); ++i) {
+    const char c = compact[i];
+    if (inString) {
+      out << c;
+      if (esc) {
+        esc = false;
+      } else if (c == '\\') {
+        esc = true;
+      } else if (c == '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      inString = true;
+      out << c;
+      continue;
+    }
+    if (c == '{') {
+      out << c;
+      ++depth;
+      out << '\n' << indent << std::string(depth * 2, ' ');
+      continue;
+    }
+    if (c == '}') {
+      --depth;
+      out << '\n' << indent << std::string(depth * 2, ' ') << c;
+      continue;
+    }
+    if (c == ',') {
+      out << c << '\n' << indent << std::string(depth * 2, ' ');
+      continue;
+    }
+    out << c;
+  }
+  return out.str();
+}
+
+bool extractJsonObjectFromStream(std::istream& is, const std::string& firstLine, std::string* outObj) {
+  if (!outObj) return false;
+  std::string obj = firstLine;
+  int depth = 0;
+  bool inString = false;
+  bool esc = false;
+  auto scan = [&](const std::string& s) {
+    for (char c : s) {
+      if (inString) {
+        if (esc) {
+          esc = false;
+        } else if (c == '\\') {
+          esc = true;
+        } else if (c == '"') {
+          inString = false;
+        }
+        continue;
+      }
+      if (c == '"') {
+        inString = true;
+      } else if (c == '{') {
+        ++depth;
+      } else if (c == '}') {
+        --depth;
+      }
+    }
+  };
+  scan(firstLine);
+  while (depth > 0 && is.good()) {
+    std::string next;
+    if (!std::getline(is, next)) break;
+    obj.append("\n");
+    obj.append(next);
+    scan(next);
+  }
+  if (depth != 0) return false;
+  *outObj = obj;
+  return true;
+}
+
+bool jsonNumberField(const std::string& obj, const char* key, double* out) {
+  if (!out || !key) return false;
+  const std::string token = std::string("\"") + key + "\":";
+  const size_t p = obj.find(token);
+  if (p == std::string::npos) return false;
+  size_t i = p + token.size();
+  while (i < obj.size() && std::isspace(static_cast<unsigned char>(obj[i]))) ++i;
+  if (i >= obj.size()) return false;
+  char* endp = nullptr;
+  const double v = std::strtod(obj.c_str() + i, &endp);
+  if (endp == obj.c_str() + i) return false;
+  *out = v;
+  return true;
+}
+
+template <typename T>
+bool jsonNumberFieldAs(const std::string& obj, const char* key, T* out) {
+  if (!out) return false;
+  double v = 0.0;
+  if (!jsonNumberField(obj, key, &v)) return false;
+  *out = static_cast<T>(v);
+  return true;
+}
+
+bool parseLookValuesFromNamedJson(const std::string& obj, LookPresetValues* v) {
+  if (!v || obj.empty()) return false;
+  auto reqD = [&](const char* k, auto* d) -> bool { return jsonNumberFieldAs(obj, k, d); };
+  auto reqI = [&](const char* k, int* d) -> bool {
+    double x = 0.0;
+    if (!jsonNumberField(obj, k, &x)) return false;
+    *d = static_cast<int>(std::llround(x));
+    return true;
+  };
+  return reqD("tn_con", &v->tn_con) && reqD("tn_sh", &v->tn_sh) && reqD("tn_toe", &v->tn_toe) && reqD("tn_off", &v->tn_off) &&
+         reqI("tn_hcon_enable", &v->tn_hcon_enable) && reqD("tn_hcon", &v->tn_hcon) && reqD("tn_hcon_pv", &v->tn_hcon_pv) && reqD("tn_hcon_st", &v->tn_hcon_st) &&
+         reqI("tn_lcon_enable", &v->tn_lcon_enable) && reqD("tn_lcon", &v->tn_lcon) && reqD("tn_lcon_w", &v->tn_lcon_w) &&
+         reqI("cwp", &v->cwp) && reqD("cwp_lm", &v->cwp_lm) &&
+         reqD("rs_sa", &v->rs_sa) && reqD("rs_rw", &v->rs_rw) && reqD("rs_bw", &v->rs_bw) &&
+         reqI("pt_enable", &v->pt_enable) &&
+         reqD("pt_lml", &v->pt_lml) && reqD("pt_lml_r", &v->pt_lml_r) && reqD("pt_lml_g", &v->pt_lml_g) && reqD("pt_lml_b", &v->pt_lml_b) &&
+         reqD("pt_lmh", &v->pt_lmh) && reqD("pt_lmh_r", &v->pt_lmh_r) && reqD("pt_lmh_b", &v->pt_lmh_b) &&
+         reqI("ptl_enable", &v->ptl_enable) && reqD("ptl_c", &v->ptl_c) && reqD("ptl_m", &v->ptl_m) && reqD("ptl_y", &v->ptl_y) &&
+         reqI("ptm_enable", &v->ptm_enable) && reqD("ptm_low", &v->ptm_low) && reqD("ptm_low_rng", &v->ptm_low_rng) && reqD("ptm_low_st", &v->ptm_low_st) &&
+         reqD("ptm_high", &v->ptm_high) && reqD("ptm_high_rng", &v->ptm_high_rng) && reqD("ptm_high_st", &v->ptm_high_st) &&
+         reqI("brl_enable", &v->brl_enable) && reqD("brl", &v->brl) && reqD("brl_r", &v->brl_r) && reqD("brl_g", &v->brl_g) && reqD("brl_b", &v->brl_b) &&
+         reqD("brl_rng", &v->brl_rng) && reqD("brl_st", &v->brl_st) &&
+         reqI("brlp_enable", &v->brlp_enable) && reqD("brlp", &v->brlp) && reqD("brlp_r", &v->brlp_r) && reqD("brlp_g", &v->brlp_g) && reqD("brlp_b", &v->brlp_b) &&
+         reqI("hc_enable", &v->hc_enable) && reqD("hc_r", &v->hc_r) && reqD("hc_r_rng", &v->hc_r_rng) &&
+         reqI("hs_rgb_enable", &v->hs_rgb_enable) && reqD("hs_r", &v->hs_r) && reqD("hs_r_rng", &v->hs_r_rng) &&
+         reqD("hs_g", &v->hs_g) && reqD("hs_g_rng", &v->hs_g_rng) && reqD("hs_b", &v->hs_b) && reqD("hs_b_rng", &v->hs_b_rng) &&
+         reqI("hs_cmy_enable", &v->hs_cmy_enable) && reqD("hs_c", &v->hs_c) && reqD("hs_c_rng", &v->hs_c_rng) &&
+         reqD("hs_m", &v->hs_m) && reqD("hs_m_rng", &v->hs_m_rng) && reqD("hs_y", &v->hs_y) && reqD("hs_y_rng", &v->hs_y_rng);
+}
+
+bool parseTonescaleValuesFromNamedJson(const std::string& obj, TonescalePresetValues* v) {
+  if (!v || obj.empty()) return false;
+  auto reqD = [&](const char* k, auto* d) -> bool { return jsonNumberFieldAs(obj, k, d); };
+  auto reqI = [&](const char* k, int* d) -> bool {
+    double x = 0.0;
+    if (!jsonNumberField(obj, k, &x)) return false;
+    *d = static_cast<int>(std::llround(x));
+    return true;
+  };
+  return reqD("tn_con", &v->tn_con) && reqD("tn_sh", &v->tn_sh) && reqD("tn_toe", &v->tn_toe) && reqD("tn_off", &v->tn_off) &&
+         reqI("tn_hcon_enable", &v->tn_hcon_enable) && reqD("tn_hcon", &v->tn_hcon) && reqD("tn_hcon_pv", &v->tn_hcon_pv) &&
+         reqD("tn_hcon_st", &v->tn_hcon_st) && reqI("tn_lcon_enable", &v->tn_lcon_enable) && reqD("tn_lcon", &v->tn_lcon) &&
+         reqD("tn_lcon_w", &v->tn_lcon_w);
+}
+
+// Persist the in-memory preset store to disk using schema v3.
+// payload stays canonical for backward compatibility; named/nuke/dctl are derived views.
+// ===== Preset Store: Serialize in-memory user presets to JSON on disk =====
 void saveUserPresetStoreLocked() {
   const auto path = userPresetFilePathV2();
 #if defined(__linux__)
@@ -773,17 +1184,31 @@ void saveUserPresetStoreLocked() {
 
   UserPresetStore& s = userPresetStore();
   os << "{\n";
-  os << "  \"schemaVersion\":2,\n";
+  os << "  \"schemaVersion\":3,\n";
   os << "  \"updatedAtUtc\":\"" << jsonEscape(nowUtcIso8601()) << "\",\n";
   os << "  \"lookPresets\":[\n";
   for (size_t i = 0; i < s.lookPresets.size(); ++i) {
     std::string payload;
     serializeLookValues(s.lookPresets[i].values, payload);
-    os << "    {\"id\":\"" << jsonEscape(s.lookPresets[i].id)
-       << "\",\"name\":\"" << jsonEscape(s.lookPresets[i].name)
-       << "\",\"createdAtUtc\":\"" << jsonEscape(s.lookPresets[i].createdAtUtc)
-       << "\",\"updatedAtUtc\":\"" << jsonEscape(s.lookPresets[i].updatedAtUtc)
-       << "\",\"payload\":\"" << jsonEscape(payload) << "\"}";
+    const std::string named = prettyJsonObject(lookValuesAsNamedJson(s.lookPresets[i].values), "      ");
+    const std::string nukeCmd = lookValuesAsNukeCmd(s.lookPresets[i].name, s.lookPresets[i].values);
+    const std::string nukeMenu = std::string("Look Presets/") + s.lookPresets[i].name;
+    const std::string dctl = lookValuesAsDctl(s.lookPresets[i].values);
+    os << "    {\n";
+    os << "      \"id\":\"" << jsonEscape(s.lookPresets[i].id) << "\",\n";
+    os << "      \"name\":\"" << jsonEscape(s.lookPresets[i].name) << "\",\n";
+    os << "      \"createdAtUtc\":\"" << jsonEscape(s.lookPresets[i].createdAtUtc) << "\",\n";
+    os << "      \"updatedAtUtc\":\"" << jsonEscape(s.lookPresets[i].updatedAtUtc) << "\",\n";
+    os << "      \"payload\":\"" << jsonEscape(payload) << "\",\n";
+    os << "      \"namedValues\":" << named << ",\n";
+    os << "      \"nuke\":{\n";
+    os << "        \"menuEntry\":\"" << jsonEscape(nukeMenu) << "\",\n";
+    os << "        \"presetCmd\":\"" << jsonEscape(nukeCmd) << "\"\n";
+    os << "      },\n";
+    os << "      \"dctl\":{\n";
+    os << "        \"preset\":\"" << jsonEscape(dctl) << "\"\n";
+    os << "      }\n";
+    os << "    }";
     os << (i + 1 < s.lookPresets.size() ? ",\n" : "\n");
   }
   os << "  ],\n";
@@ -791,11 +1216,25 @@ void saveUserPresetStoreLocked() {
   for (size_t i = 0; i < s.tonescalePresets.size(); ++i) {
     std::string payload;
     serializeTonescaleValues(s.tonescalePresets[i].values, payload);
-    os << "    {\"id\":\"" << jsonEscape(s.tonescalePresets[i].id)
-       << "\",\"name\":\"" << jsonEscape(s.tonescalePresets[i].name)
-       << "\",\"createdAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].createdAtUtc)
-       << "\",\"updatedAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].updatedAtUtc)
-       << "\",\"payload\":\"" << jsonEscape(payload) << "\"}";
+    const std::string named = prettyJsonObject(tonescaleValuesAsNamedJson(s.tonescalePresets[i].values), "      ");
+    const std::string nukeCmd = tonescaleValuesAsNukeCmd(s.tonescalePresets[i].values);
+    const std::string nukeMenu = std::string("Tonescale Presets/") + s.tonescalePresets[i].name;
+    const std::string dctl = tonescaleValuesAsDctl(s.tonescalePresets[i].values);
+    os << "    {\n";
+    os << "      \"id\":\"" << jsonEscape(s.tonescalePresets[i].id) << "\",\n";
+    os << "      \"name\":\"" << jsonEscape(s.tonescalePresets[i].name) << "\",\n";
+    os << "      \"createdAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].createdAtUtc) << "\",\n";
+    os << "      \"updatedAtUtc\":\"" << jsonEscape(s.tonescalePresets[i].updatedAtUtc) << "\",\n";
+    os << "      \"payload\":\"" << jsonEscape(payload) << "\",\n";
+    os << "      \"namedValues\":" << named << ",\n";
+    os << "      \"nuke\":{\n";
+    os << "        \"menuEntry\":\"" << jsonEscape(nukeMenu) << "\",\n";
+    os << "        \"presetCmd\":\"" << jsonEscape(nukeCmd) << "\"\n";
+    os << "      },\n";
+    os << "      \"dctl\":{\n";
+    os << "        \"preset\":\"" << jsonEscape(dctl) << "\"\n";
+    os << "      }\n";
+    os << "    }";
     os << (i + 1 < s.tonescalePresets.size() ? ",\n" : "\n");
   }
   os << "  ]\n";
@@ -860,8 +1299,10 @@ void migrateLegacyV1IfNeededLocked() {
   saveUserPresetStoreLocked();
 }
 
-// Lazy-load the v2 file into memory.
+// Lazy-load preset storage into memory.
+// Reader accepts v2/v3 style records and prefers payload parsing, then namedValues fallback.
 // Callers must hold userPresetMutex() before calling this helper.
+// ===== Preset Store: Load + migrate user presets into memory cache =====
 void ensureUserPresetStoreLoadedLocked() {
   UserPresetStore& s = userPresetStore();
   if (s.loaded) return;
@@ -883,21 +1324,30 @@ void ensureUserPresetStoreLoadedLocked() {
   while (std::getline(is, line)) {
     if (line.find("\"lookPresets\"") != std::string::npos) { sec = Section::Look; continue; }
     if (line.find("\"tonescalePresets\"") != std::string::npos) { sec = Section::Tone; continue; }
+    if (sec == Section::None) continue;
     if (line.find(']') != std::string::npos) { sec = Section::None; continue; }
-    if (line.find('{') == std::string::npos || line.find("\"id\"") == std::string::npos) continue;
+    if (line.find('{') == std::string::npos) continue;
 
-    const std::string id = jsonField(line, "id");
-    const std::string name = sanitizePresetName(jsonField(line, "name"), "User Preset");
-    const std::string created = jsonField(line, "createdAtUtc");
-    const std::string updated = jsonField(line, "updatedAtUtc");
-    const std::string payload = jsonField(line, "payload");
-    if (id.empty() || payload.empty()) continue;
+    std::string obj;
+    if (!extractJsonObjectFromStream(is, line, &obj)) continue;
+    if (obj.find("\"id\"") == std::string::npos) continue;
+
+    const std::string id = jsonField(obj, "id");
+    const std::string name = sanitizePresetName(jsonField(obj, "name"), "User Preset");
+    const std::string created = jsonField(obj, "createdAtUtc");
+    const std::string updated = jsonField(obj, "updatedAtUtc");
+    std::string payload = jsonField(obj, "payload");
+    const std::string namedValues = jsonObjectField(obj, "namedValues");
+    if (id.empty()) continue;
 
     if (sec == Section::Look) {
       const std::string key = normalizePresetNameKey(name);
       if (seenLookNames.find(key) != seenLookNames.end()) continue;
       LookPresetValues parsed{};
-      if (!parseLookValues(payload, &parsed)) continue;
+      bool parsedOk = false;
+      if (!payload.empty()) parsedOk = parseLookValues(payload, &parsed);
+      if (!parsedOk && !namedValues.empty()) parsedOk = parseLookValuesFromNamedJson(namedValues, &parsed);
+      if (!parsedOk) continue;
       UserLookPreset p{};
       p.id = id; p.name = name; p.createdAtUtc = created.empty() ? nowUtcIso8601() : created; p.updatedAtUtc = updated.empty() ? p.createdAtUtc : updated; p.values = parsed;
       s.lookPresets.push_back(p);
@@ -906,7 +1356,10 @@ void ensureUserPresetStoreLoadedLocked() {
       const std::string key = normalizePresetNameKey(name);
       if (seenToneNames.find(key) != seenToneNames.end()) continue;
       TonescalePresetValues parsed{};
-      if (!parseTonescaleValues(payload, &parsed)) continue;
+      bool parsedOk = false;
+      if (!payload.empty()) parsedOk = parseTonescaleValues(payload, &parsed);
+      if (!parsedOk && !namedValues.empty()) parsedOk = parseTonescaleValuesFromNamedJson(namedValues, &parsed);
+      if (!parsedOk) continue;
       UserTonescalePreset p{};
       p.id = id; p.name = name; p.createdAtUtc = created.empty() ? nowUtcIso8601() : created; p.updatedAtUtc = updated.empty() ? p.createdAtUtc : updated; p.values = parsed;
       s.tonescalePresets.push_back(p);
@@ -957,6 +1410,7 @@ bool tonescaleNameExistsLocked(const std::string& name, const std::string* ignor
   return false;
 }
 
+// Force a full in-memory reload from disk. Used by explicit Refresh and menu resync paths.
 void reloadUserPresetStoreFromDiskLocked() {
   UserPresetStore& s = userPresetStore();
   s = UserPresetStore{};
@@ -1009,6 +1463,7 @@ bool isUserTonescalePresetIndex(int idx) {
   return userTonescaleIndexFromPresetIndex(idx, &i);
 }
 
+// ===== Preset <-> Menu Index Mapping and visible user-name lists =====
 std::vector<std::string> visibleUserLookNames() {
   std::vector<std::string> out;
   std::lock_guard<std::mutex> lock(userPresetMutex());
@@ -1025,6 +1480,7 @@ std::vector<std::string> visibleUserTonescaleNames() {
   return out;
 }
 
+// ===== Preset Application Helpers: resolved params and live OFX param writes =====
 void applyLookValuesToResolved(OpenDRTParams& p, const LookPresetValues& s) {
   p.tn_con = s.tn_con; p.tn_sh = s.tn_sh; p.tn_toe = s.tn_toe; p.tn_off = s.tn_off;
   p.tn_hcon_enable = s.tn_hcon_enable; p.tn_hcon = s.tn_hcon; p.tn_hcon_pv = s.tn_hcon_pv; p.tn_hcon_st = s.tn_hcon_st;
@@ -1130,32 +1586,33 @@ void writeTonescaleValuesToParams(const TonescalePresetValues& t, OFX::ImageEffe
   setDoubleIfPresent(fx, "tn_lcon_w", t.tn_lcon_w);
 }
 
+// ===== UI Text: Parameter tooltip lookup table =====
 const char* tooltipForParam(const std::string& name) {
   static const std::unordered_map<std::string, const char*> kTooltips = {
-    {"tn_Lp", "Peak display luminance in nits."},
+    {"tn_Lp", "Peak display luminance target in nits."},
     {"tn_gb", "Amount of stops to boost grey luminance per stop of peak luminance increase."},
     {"pt_hdr", "How much purity compression and hue shift behavior changes as peak luminance increases."},
     {"tn_Lg", "Display luminance target for middle grey (0.18) in nits."},
-    {"lookPreset", "Choose a preset look."},
-    {"tonescalePreset", "Choose a tonescale preset or keep the look preset tonescale."},
-    {"creativeWhitePreset", "Set the creative whitepoint of display peak luminance."},
+    {"lookPreset", "Select a look preset. This applies look controls, while independent tonescale and creative-white selections are preserved."},
+    {"tonescalePreset", "Select a tonescale preset, or use the current look preset tonescale with 'USE LOOK PRESET'."},
+    {"creativeWhitePreset", "Select creative whitepoint behavior. 'USE LOOK PRESET' follows the selected look baseline."},
     {"cwp_lm", "Limit the intensity range affected by Creative Whitepoint."},
-    {"displayEncodingPreset", "Choose the target viewing environment."},
-    {"tn_con", "Adjust contrast/slope in display linear."},
-    {"tn_sh", "Controls where tonescale crosses display peak and clips."},
-    {"tn_toe", "Quadratic toe compression for deep shadows."},
-    {"tn_off", "Pre-tonescale scene-linear offset."},
-    {"tn_hcon_enable", "Enable upper-tonescale contrast adjustment."},
+    {"displayEncodingPreset", "Choose a target viewing environment preset (EOTF, gamut, surround, and clamp defaults)."},
+    {"tn_con", "Tonescale contrast (display-linear slope control)."},
+    {"tn_sh", "Tonescale shoulder control; affects where highlights approach peak and clip."},
+    {"tn_toe", "Shadow toe compression amount."},
+    {"tn_off", "Scene-linear offset applied before tonescale."},
+    {"tn_hcon_enable", "Enable highlight contrast shaping."},
     {"tn_hcon", "Highlight contrast amount."},
     {"tn_hcon_pv", "Stops above middle grey where highlight adjustment starts."},
-    {"tn_hcon_st", "How quickly highlight adjustment ramps in."},
-    {"tn_lcon_enable", "Enable low/mid contrast adjustment."},
-    {"tn_lcon", "Low-contrast amount."},
-    {"tn_lcon_w", "Low-contrast width."},
-    {"rs_sa", "Render-space desaturation strength."},
-    {"rs_rw", "Red weight for render-space scaling."},
-    {"rs_bw", "Blue weight for render-space scaling."},
-    {"pt_enable", "Compresses purity as intensity increases."},
+    {"tn_hcon_st", "Highlight contrast transition strength/ramp-in speed."},
+    {"tn_lcon_enable", "Enable low/mid contrast shaping."},
+    {"tn_lcon", "Low-contrast module amount."},
+    {"tn_lcon_w", "Low-contrast width (how broad the affected range is)."},
+    {"rs_sa", "Render-space color-contrast amount (desaturates toward weighted luminance axis)."},
+    {"rs_rw", "Render-space red weight."},
+    {"rs_bw", "Render-space blue weight."},
+    {"pt_enable", "Enable purity compression at higher intensities."},
     {"pt_lml", "Purity compression limit as intensity decreases (all hues)."},
     {"pt_lml_r", "Purity compression limit as intensity decreases (reds)."},
     {"pt_lml_g", "Purity compression limit as intensity decreases (greens)."},
@@ -1163,51 +1620,51 @@ const char* tooltipForParam(const std::string& name) {
     {"pt_lmh", "Purity compression limit as intensity increases (all hues)."},
     {"pt_lmh_r", "Purity compression limit as intensity increases (reds)."},
     {"pt_lmh_b", "Purity compression limit as intensity increases (blues)."},
-    {"ptl_enable", "Enable purity softclip."},
+    {"ptl_enable", "Enable purity softclip to reduce hard clipping near gamut boundaries."},
     {"ptl_c", "Purity softclip strength for cyan."},
     {"ptl_m", "Purity softclip strength for magenta."},
     {"ptl_y", "Purity softclip strength for yellow."},
-    {"ptm_enable", "Enable mid-range purity adjustments."},
-    {"ptm_low", "Increase mid-range purity in low/mid intensities."},
-    {"ptm_low_rng", "Range for mid-purity low adjustment."},
-    {"ptm_low_st", "Strength curve for mid-purity low adjustment."},
-    {"ptm_high", "Decrease mid-range purity in upper-mid/high intensities."},
-    {"ptm_high_rng", "Range for mid-purity high adjustment."},
-    {"ptm_high_st", "Strength curve for mid-purity high adjustment."},
-    {"brl_enable", "Enable brilliance module."},
-    {"brl", "Global brilliance amount."},
-    {"brl_r", "Brilliance adjustment for red."},
-    {"brl_g", "Brilliance adjustment for green."},
-    {"brl_b", "Brilliance adjustment for blue."},
-    {"brl_rng", "Brilliance intensity-range weighting."},
-    {"brl_st", "Brilliance purity-range weighting."},
-    {"brlp_enable", "Enable post-brilliance module."},
+    {"ptm_enable", "Enable mid-purity shaping controls."},
+    {"ptm_low", "Amount to raise mid-purity in low/mid intensity regions."},
+    {"ptm_low_rng", "Range for low/mid mid-purity shaping."},
+    {"ptm_low_st", "Strength weighting for low/mid mid-purity shaping."},
+    {"ptm_high", "Amount to reduce mid-purity in upper-mid/high intensity regions."},
+    {"ptm_high_rng", "Range for high mid-purity shaping."},
+    {"ptm_high_st", "Strength weighting for high mid-purity shaping."},
+    {"brl_enable", "Enable Brilliance (pre-compression purity-intensity shaping)."},
+    {"brl", "Global brilliance amount for high-purity stimuli."},
+    {"brl_r", "Brilliance amount for red stimuli."},
+    {"brl_g", "Brilliance amount for green stimuli."},
+    {"brl_b", "Brilliance amount for blue stimuli."},
+    {"brl_rng", "Brilliance range over intensity (higher values affect lower intensities more)."},
+    {"brl_st", "Brilliance strength over purity (higher values affect lower purity more)."},
+    {"brlp_enable", "Enable Post Brilliance (after purity compression/hue shifts)."},
     {"brlp", "Global post-brilliance amount."},
-    {"brlp_r", "Post-brilliance adjustment for red."},
-    {"brlp_g", "Post-brilliance adjustment for green."},
-    {"brlp_b", "Post-brilliance adjustment for blue."},
-    {"hc_enable", "Enable hue contrast module."},
+    {"brlp_r", "Post-brilliance amount for red; useful to reduce high-purity ringing/halos."},
+    {"brlp_g", "Post-brilliance amount for green; useful to reduce high-purity ringing/halos."},
+    {"brlp_b", "Post-brilliance amount for blue; useful to reduce high-purity ringing/halos."},
+    {"hc_enable", "Enable Hue Contrast shaping."},
     {"hc_r", "Hue contrast amount at red hue angle."},
-    {"hc_r_rng", "Hue contrast range over intensity."},
-    {"hs_rgb_enable", "Enable RGB hue-shift module."},
-    {"hs_r", "Red hue-shift amount."},
-    {"hs_r_rng", "Red hue-shift range."},
-    {"hs_g", "Green hue-shift amount."},
-    {"hs_g_rng", "Green hue-shift range."},
-    {"hs_b", "Blue hue-shift amount."},
-    {"hs_b_rng", "Blue hue-shift range."},
-    {"hs_cmy_enable", "Enable CMY hue-shift module."},
-    {"hs_c", "Cyan hue-shift amount."},
-    {"hs_c_rng", "Cyan hue-shift range."},
-    {"hs_m", "Magenta hue-shift amount."},
-    {"hs_m_rng", "Magenta hue-shift range."},
-    {"hs_y", "Yellow hue-shift amount."},
-    {"hs_y_rng", "Yellow hue-shift range."},
+    {"hc_r_rng", "Hue contrast range control over intensity."},
+    {"hs_rgb_enable", "Enable RGB hue-shift module (primary hue-angle distortion as intensity increases)."},
+    {"hs_r", "Red hue-shift amount (toward yellow)."},
+    {"hs_r_rng", "Range of red hue-shift."},
+    {"hs_g", "Green hue-shift amount (toward yellow)."},
+    {"hs_g_rng", "Range of green hue-shift."},
+    {"hs_b", "Blue hue-shift amount (toward cyan)."},
+    {"hs_b_rng", "Range of blue hue-shift."},
+    {"hs_cmy_enable", "Enable CMY hue-shift module (secondary hue-angle distortion as intensity decreases)."},
+    {"hs_c", "Cyan hue-shift amount (toward blue)."},
+    {"hs_c_rng", "Range of cyan hue-shift."},
+    {"hs_m", "Magenta hue-shift amount (toward blue)."},
+    {"hs_m_rng", "Range of magenta hue-shift."},
+    {"hs_y", "Yellow hue-shift amount (toward red)."},
+    {"hs_y_rng", "Range of yellow hue-shift."},
     {"clamp", "Clamp final image to display-supported range."},
-    {"tn_su", "Surround compensation mode."},
+    {"tn_su", "Surround compensation mode (dark, dim, bright)."},
     {"display_gamut", "Target display gamut."},
     {"eotf", "Target display transfer function."},
-    {"crv_enable", "Draw tonescale overlay."}
+    {"crv_enable", "Draw tonescale overlay for curve debugging/inspection."}
   };
   auto it = kTooltips.find(name);
   return it == kTooltips.end() ? nullptr : it->second;
@@ -1215,6 +1672,7 @@ const char* tooltipForParam(const std::string& name) {
 
 class OpenDRTEffect : public OFX::ImageEffect {
  public:
+  // ===== Effect Lifecycle: construct + initial menu/state sync =====
   explicit OpenDRTEffect(OfxImageEffectHandle handle)
       : ImageEffect(handle) {
     dstClip_ = fetchClip(kOfxImageEffectOutputClipName);
@@ -1241,6 +1699,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
 #endif
   }
 
+  // ===== Render Path Entry =====
   // Main render callback.
   // Rule: keep preset/file management out of this path for predictable playback.
   void render(const OFX::RenderArguments& args) override {
@@ -1441,6 +1900,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     perfLog("Render total", tRenderStart);
   }
 
+  // ===== UI Event Entry =====
   // UI/param callback entry point.
   // Keep this deterministic: mutate params/state, then refresh dependent UI labels/states.
   void changedParam(const OFX::InstanceChangedArgs& args, const std::string& paramName) override {
@@ -1459,14 +1919,33 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
-      // Look preset selection is authoritative: it resets linked preset selectors and applies full look values.
+      // ----- Preset Routing: Look selector -----
+      // Look preset selection updates look-driven controls.
+      // Tonescale/CWP selectors explicitly chosen by the user are preserved.
       if (paramName == "lookPreset") {
+        // Intent:
+        // - preserve user overrides when they explicitly selected non-zero preset choices
+        // - still apply new look defaults for all other look-driven controls
+        // Why:
+        // Previous behavior always forced tonescale/CWP back to "USE LOOK PRESET", which
+        // unexpectedly discarded user choices while browsing looks.
         int look = getChoice("lookPreset", args.time, 0);
+        const int tsPreset = getChoice("tonescalePreset", args.time, 0);
+        const int cwpPreset = getChoice("creativeWhitePreset", args.time, 0);
+        const bool preserveTonescale = (tsPreset != 0);
+        const bool preserveCwp = (cwpPreset > 0);
+        const TonescalePresetValues preservedTs = preserveTonescale ? captureCurrentTonescaleValues(args.time) : TonescalePresetValues{};
+        const int preservedCwp = preserveCwp ? getInt("cwp", args.time, 2) : 2;
+        int activeToneUser = -1;
+        if (isUserTonescalePresetIndex(tsPreset)) {
+          int userToneIdx = -1;
+          if (userTonescaleIndexFromPresetIndex(tsPreset, &userToneIdx)) activeToneUser = userToneIdx;
+        }
         FlagScope scope(suppressParamChanged_);
-        setChoice("tonescalePreset", 0);
-        setChoice("creativeWhitePreset", 0);
+        // active user slots track menu identity; this keeps update/delete/rename actions aimed
+        // at the correct user preset after a look change.
         setInt("activeUserLookSlot", -1);
-        setInt("activeUserToneSlot", -1);
+        setInt("activeUserToneSlot", activeToneUser);
         if (isUserLookPresetIndex(look)) {
           int userIdx = -1;
           if (!userLookIndexFromPresetIndex(look, &userIdx)) return;
@@ -1478,6 +1957,15 @@ class OpenDRTEffect : public OFX::ImageEffect {
         } else {
           writePresetToParams(look, *this);
         }
+        if (preserveTonescale) {
+          // Re-apply captured tonescale values after look write, so look switch does not stomp
+          // an explicit tonescale preset/user tweak.
+          writeTonescaleValuesToParams(preservedTs, *this);
+        }
+        if (preserveCwp) {
+          // Keep explicit creative-white override; cwp_lm intentionally remains look-driven.
+          setInt("cwp", preservedCwp);
+        }
         updateToggleVisibility(args.time);
         updatePresetManagerActionState(args.time);
         updateReadonlyDisplayLabels(args.time);
@@ -1485,6 +1973,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Routing: Tonescale selector -----
       // Tonescale preset can be independent, or inherit from currently selected look when index 0 is chosen.
       if (paramName == "tonescalePreset") {
         const int tsPreset = getChoice("tonescalePreset", args.time, 0);
@@ -1511,6 +2000,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Routing: Creative white selector -----
       if (paramName == "creativeWhitePreset") {
         const int cwpPreset = getChoice("creativeWhitePreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
@@ -1524,6 +2014,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Routing: Display encoding selector -----
       if (paramName == "displayEncodingPreset") {
         int preset = getChoice("displayEncodingPreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
@@ -1533,6 +2024,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset State: Discard all modifications to current baseline -----
       if (paramName == "discardPresetChanges") {
         OpenDRTParams expected{};
         if (!buildPresetBaseline(args.time, &expected)) return;
@@ -1556,6 +2048,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset State: Per-category reset buttons -----
       if (paramName == "reset_tonescale" ||
           paramName == "reset_render_space" ||
           paramName == "reset_mid_purity" ||
@@ -1663,6 +2156,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Manager: Import -----
+      // Import JSON presets into the local user library and apply imported values immediately.
       if (paramName == "userPresetImport") {
         const std::string path = pickOpenJsonFilePath();
         if (path.empty()) return;
@@ -1672,12 +2167,16 @@ class OpenDRTEffect : public OFX::ImageEffect {
         const std::string type = jsonField(content, "presetType");
         const std::string name = sanitizePresetName(jsonField(content, "name"), "Imported Preset");
         const std::string payload = jsonField(content, "payload");
-        if (type.empty() || payload.empty()) return;
+        const std::string namedValues = jsonObjectField(content, "namedValues");
+        if (type.empty() || (payload.empty() && namedValues.empty())) return;
 
         FlagScope scope(suppressParamChanged_);
         if (type == "look") {
           LookPresetValues values{};
-          if (!parseLookValues(payload, &values)) return;
+          bool parsedOk = false;
+          if (!payload.empty()) parsedOk = parseLookValues(payload, &values);
+          if (!parsedOk && !namedValues.empty()) parsedOk = parseLookValuesFromNamedJson(namedValues, &values);
+          if (!parsedOk) return;
           int index = -1;
           {
             std::lock_guard<std::mutex> lock(userPresetMutex());
@@ -1699,7 +2198,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
           writeLookValuesToParams(values, *this);
         } else if (type == "tonescale") {
           TonescalePresetValues values{};
-          if (!parseTonescaleValues(payload, &values)) return;
+          bool parsedOk = false;
+          if (!payload.empty()) parsedOk = parseTonescaleValues(payload, &values);
+          if (!parsedOk && !namedValues.empty()) parsedOk = parseTonescaleValuesFromNamedJson(namedValues, &values);
+          if (!parsedOk) return;
           int index = -1;
           {
             std::lock_guard<std::mutex> lock(userPresetMutex());
@@ -1724,6 +2226,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Manager: Update selected user preset -----
+      // Overwrite the currently selected user preset with current knob values.
       if (paramName == "userPresetUpdateCurrent") {
         const int lookIdx = getChoice("lookPreset", args.time, 0);
         const int toneIdx = getChoice("tonescalePreset", args.time, 0);
@@ -1770,6 +2274,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Manager: Delete -----
+      // Delete selected user preset(s) from disk-backed store and re-sync menu selections.
       if (paramName == "userPresetDeleteCurrent") {
         const int lookIdx = getChoice("lookPreset", args.time, 0);
         const int toneIdx = getChoice("tonescalePreset", args.time, 0);
@@ -1839,12 +2345,16 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Manager: Refresh menus from disk -----
+      // Re-scan preset file and rebuild menu options without changing non-preset controls.
       if (paramName == "userPresetRefresh") {
         FlagScope scope(suppressParamChanged_);
         syncPresetMenusFromDisk(args.time, getChoice("lookPreset", args.time, 0), getChoice("tonescalePreset", args.time, 0));
         return;
       }
 
+      // ----- Preset Manager: Rename -----
+      // Rename selected user preset, preserving its payload and identifier.
       if (paramName == "userPresetRenameCurrent") {
         const std::string newName = sanitizePresetName(getString("userPresetName", "User Preset"), "User Preset");
         const int lookIdx = getChoice("lookPreset", args.time, 0);
@@ -1912,6 +2422,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
         return;
       }
 
+      // ----- Preset Manager: Export -----
+      // Export selected user preset as a portable JSON (canonical payload + named/nuke/dctl helpers).
       if (paramName == "userPresetExportLook" || paramName == "userPresetExportTonescale") {
         const bool exportLook = (paramName == "userPresetExportLook");
         const int lookIdx = getChoice("lookPreset", args.time, 0);
@@ -1919,6 +2431,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
         std::string name;
         std::string type;
         std::string payload;
+        std::string namedValues;
+        std::string nukeCmd;
+        std::string nukeMenuEntry;
+        std::string dctlPreset;
         {
           std::lock_guard<std::mutex> lock(userPresetMutex());
           ensureUserPresetStoreLoadedLocked();
@@ -1929,6 +2445,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
             name = p.name;
             type = "look";
             serializeLookValues(p.values, payload);
+            namedValues = lookValuesAsNamedJson(p.values);
+            nukeCmd = lookValuesAsNukeCmd(name, p.values);
+            nukeMenuEntry = std::string("Look Presets/") + name;
+            dctlPreset = lookValuesAsDctl(p.values);
           } else {
             const int userIdx = toneIdx - kBuiltInTonescalePresetCount;
             if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
@@ -1936,6 +2456,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
             name = p.name;
             type = "tonescale";
             serializeTonescaleValues(p.values, payload);
+            namedValues = tonescaleValuesAsNamedJson(p.values);
+            nukeCmd = tonescaleValuesAsNukeCmd(p.values);
+            nukeMenuEntry = std::string("Tonescale Presets/") + name;
+            dctlPreset = tonescaleValuesAsDctl(p.values);
           }
         }
         const std::string file = pickSaveJsonFilePath(name + ".json");
@@ -1943,10 +2467,18 @@ class OpenDRTEffect : public OFX::ImageEffect {
         std::ofstream os(file, std::ios::binary | std::ios::trunc);
         if (!os.is_open()) return;
         os << "{\n";
-        os << "  \"schemaVersion\":2,\n";
+        os << "  \"schemaVersion\":3,\n";
         os << "  \"presetType\":\"" << jsonEscape(type) << "\",\n";
         os << "  \"name\":\"" << jsonEscape(name) << "\",\n";
-        os << "  \"payload\":\"" << jsonEscape(payload) << "\"\n";
+        os << "  \"payload\":\"" << jsonEscape(payload) << "\",\n";
+        os << "  \"namedValues\":" << prettyJsonObject(namedValues, "  ") << ",\n";
+        os << "  \"nuke\":{\n";
+        os << "    \"menuEntry\":\"" << jsonEscape(nukeMenuEntry) << "\",\n";
+        os << "    \"presetCmd\":\"" << jsonEscape(nukeCmd) << "\"\n";
+        os << "  },\n";
+        os << "  \"dctl\":{\n";
+        os << "    \"preset\":\"" << jsonEscape(dctlPreset) << "\"\n";
+        os << "  }\n";
         os << "}\n";
         return;
       }
@@ -1976,6 +2508,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     bool& flag;
   };
 
+  // ===== Staging Buffers: host memory used by non-direct render paths =====
   bool ensureStageBuffers(size_t pixelCount) {
 #if defined(OFX_SUPPORTS_CUDARENDER)
     // Prefer pinned host buffers for staged path to improve CUDA transfer throughput.
@@ -2024,6 +2557,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return dstPixels_.empty() ? nullptr : dstPixels_.data();
   }
 
+  // ===== Param Classification: route updates and state recomputation =====
   bool isAdvancedParam(const std::string& name) const {
     static const std::vector<std::string> names = {
       "tn_con","tn_sh","tn_toe","tn_off","tn_hcon_enable","tn_hcon","tn_hcon_pv","tn_hcon_st","tn_lcon_enable","tn_lcon","tn_lcon_w",
@@ -2032,7 +2566,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
       "ptm_enable","ptm_low","ptm_low_rng","ptm_low_st","ptm_high","ptm_high_rng","ptm_high_st",
       "brl_enable","brl","brl_r","brl_g","brl_b","brl_rng","brl_st","brlp_enable","brlp","brlp_r","brlp_g","brlp_b",
       "hc_enable","hc_r","hc_r_rng","hs_rgb_enable","hs_r","hs_r_rng","hs_g","hs_g_rng","hs_b","hs_b_rng","hs_cmy_enable","hs_c","hs_c_rng","hs_m","hs_m_rng","hs_y","hs_y_rng",
-      "clamp","tn_su","display_gamut","eotf"
+      "clamp","tn_su","display_gamut","eotf","cwp","cwp_lm"
     };
     for (const auto& n : names) if (n == name) return true;
     return false;
@@ -2061,6 +2595,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return std::fabs(a - b) <= eps;
   }
 
+  // ===== Label Helpers: display name composition for clean/modified states =====
   std::string lookPresetDisplayName(int lookPresetIndex) const {
     if (!isUserLookPresetIndex(lookPresetIndex)) {
       return currentPresetName(lookPresetIndex);
@@ -2082,6 +2617,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return std::string("Custom (") + lookPresetDisplayName(lookPresetIndex) + ") | " + buildLabelText();
   }
 
+  // ===== Snapshot Capture: current UI values -> preset structs =====
   TonescalePresetValues captureCurrentTonescaleValues(double time) const {
     TonescalePresetValues t{};
     t.tn_con = getDouble("tn_con", time, 1.66f);
@@ -2167,6 +2703,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return v;
   }
 
+  // ===== Preset Baseline Resolver =====
+  // Computes the expected "clean" state for current look/tonescale/display selector choices.
   bool buildPresetBaseline(double time, OpenDRTParams* expected) const {
     if (expected == nullptr) return false;
     const int look = getChoice("lookPreset", time, 0);
@@ -2174,6 +2712,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     const int displayPreset = getChoice("displayEncodingPreset", time, 0);
     const int cwpPreset = getChoice("creativeWhitePreset", time, 0);
     OpenDRTParams out{};
+    // Step 1: Start from look baseline (built-in or user look payload).
     if (isUserLookPresetIndex(look)) {
       int userIdx = -1;
       if (!userLookIndexFromPresetIndex(look, &userIdx)) return false;
@@ -2186,6 +2725,10 @@ class OpenDRTEffect : public OFX::ImageEffect {
       applyLookPresetToResolved(out, look);
     }
 
+    // Step 2: Apply tonescale policy:
+    // - user tonescale preset wins
+    // - selector==0 means "inherit tonescale from current look"
+    // - otherwise use selected built-in tonescale preset
     if (isUserTonescalePresetIndex(tsPreset)) {
       int userIdx = -1;
       if (!userTonescaleIndexFromPresetIndex(tsPreset, &userIdx)) return false;
@@ -2201,14 +2744,17 @@ class OpenDRTEffect : public OFX::ImageEffect {
       applyTonescalePresetToResolved(out, tsPreset);
     }
 
+    // Step 3: Apply display preset defaults.
     applyDisplayEncodingPreset(out, displayPreset);
     out.clamp = 1;
+    // Step 4: Creative-white selector can override look baseline cwp.
     if (cwpPreset > 0) out.cwp = cwpPreset - 1;
 
     *expected = out;
     return true;
   }
 
+  // ===== Category Reset Writers: apply selected baseline by section =====
   void applyTonescaleFromBaseline(const OpenDRTParams& p) {
     setDouble("tn_con", p.tn_con);
     setDouble("tn_sh", p.tn_sh);
@@ -2289,10 +2835,13 @@ class OpenDRTEffect : public OFX::ImageEffect {
     setDouble("hs_y_rng", p.hs_y_rng);
   }
 
+  // ===== Dirty-State Evaluation: compare live params against computed baseline =====
   bool isCurrentEqualToPresetBaseline(double time, bool* tonescaleCleanOut = nullptr) const {
     OpenDRTParams expected{};
     if (!buildPresetBaseline(time, &expected)) return false;
 
+    // tonescaleClean is split out so we can mark tonescale menu "(Modified)" independently
+    // from overall look modified state.
     const bool tonescaleClean =
       almostEqual(getDouble("tn_con", time, expected.tn_con), expected.tn_con) &&
       almostEqual(getDouble("tn_sh", time, expected.tn_sh), expected.tn_sh) &&
@@ -2308,6 +2857,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
 
     if (tonescaleCleanOut) *tonescaleCleanOut = tonescaleClean;
 
+    // Overall "clean" includes all preset-backed advanced controls + display settings + cwp/cwp_lm.
     const bool clean =
       tonescaleClean &&
       almostEqual(getDouble("rs_sa", time, expected.rs_sa), expected.rs_sa) &&
@@ -2361,6 +2911,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
       almostEqual(getDouble("hs_m_rng", time, expected.hs_m_rng), expected.hs_m_rng) &&
       almostEqual(getDouble("hs_y", time, expected.hs_y), expected.hs_y) &&
       almostEqual(getDouble("hs_y_rng", time, expected.hs_y_rng), expected.hs_y_rng) &&
+      (getInt("cwp", time, expected.cwp) == expected.cwp) &&
+      almostEqual(getDouble("cwp_lm", time, expected.cwp_lm), expected.cwp_lm) &&
       (getBool("clamp", time, expected.clamp) == expected.clamp) &&
       (getChoice("tn_su", time, expected.tn_su) == expected.tn_su) &&
       (getChoice("display_gamut", time, expected.display_gamut) == expected.display_gamut) &&
@@ -2372,11 +2924,14 @@ class OpenDRTEffect : public OFX::ImageEffect {
   void updatePresetStateFromCurrent(double time) {
     bool tonescaleClean = true;
     const bool clean = isCurrentEqualToPresetBaseline(time, &tonescaleClean);
+    // presetState drives UI readout and Discard availability.
     setInt("presetState", clean ? 0 : 1);
     if (auto* p = fetchPushButtonParam("discardPresetChanges")) p->setEnabled(!clean);
+    // Menu label mutation is separate so users can see "(Modified)" directly in look/tonescale lists.
     applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean);
   }
 
+  // ===== Typed OFX Param Accessors =====
   int getChoice(const char* name, double t, int def) const {
     if (auto* p = fetchChoiceParam(name)) {
       int v = def;
@@ -2415,6 +2970,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     if (auto* p = fetchChoiceParam(name)) p->setValue(v);
   }
 
+  // ===== Look-Derived Defaults: base whitepoint and tonescale from selected look =====
   int selectedLookBaseCwp(double t) const {
     const int lookIdx = getChoice("lookPreset", t, 0);
     if (isUserLookPresetIndex(lookIdx)) {
@@ -2468,6 +3024,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     return out;
   }
 
+  // ===== Menu Label Mutation: attach/remove "(Modified)" without rebuilding options =====
   std::string lookBaseMenuName(int idx) const {
     if (idx >= 0 && idx < kBuiltInLookPresetCount) return std::string(kLookPresetNames[static_cast<size_t>(idx)]);
     if (!isUserLookPresetIndex(idx)) return std::string();
@@ -2498,12 +3055,14 @@ class OpenDRTEffect : public OFX::ImageEffect {
         toneIdx == menuLabelToneIdx_ &&
         lookModified == menuLabelLookModified_ &&
         tonescaleModified == menuLabelToneModified_) {
+      // Fast path: avoid repeated setOption churn when nothing changed.
       return;
     }
     auto* lookParam = fetchChoiceParam("lookPreset");
     auto* toneParam = fetchChoiceParam("tonescalePreset");
 
     if (lookParam && menuLabelCacheInit_ && menuLabelLookIdx_ >= 0) {
+      // Restore previous option text before applying new modified suffix.
       const std::string basePrev = lookBaseMenuName(menuLabelLookIdx_);
       if (!basePrev.empty()) lookParam->setOption(menuLabelLookIdx_, basePrev);
     }
@@ -2528,6 +3087,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     menuLabelCacheInit_ = true;
   }
 
+  // ===== Readonly Labels: effective whitepoint/surround UI fields =====
   void updateReadonlyDisplayLabels(double t) {
     const int lookIdx = getChoice("lookPreset", t, 0);
     const int cwpPreset = getChoice("creativeWhitePreset", t, 0);
@@ -2541,6 +3101,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     setString("surroundLabel", surroundNameFromIndex(tnSu));
   }
 
+  // ===== Menu Rebuild: reconstruct look/tonescale choice options from store =====
   void rebuildLookPresetMenuOptions(int preferredIndex) {
     auto* p = fetchChoiceParam("lookPreset");
     if (!p) return;
@@ -2588,11 +3149,14 @@ class OpenDRTEffect : public OFX::ImageEffect {
 
   // Source-of-truth menu refresh:
   // reload disk store, clamp selection indices, rebuild both menus, then refresh dependent UI state.
+  // ===== Preset Menu Sync =====
+  // Reload file -> rebuild look/tonescale menus -> refresh dependent preset labels/state.
   void syncPresetMenusFromDisk(double t, int preferredLookIndex, int preferredToneIndex) {
     int lookPreferred = preferredLookIndex;
     int tonePreferred = preferredToneIndex;
     {
       std::lock_guard<std::mutex> lock(userPresetMutex());
+      // Refresh source of truth from disk first, then clamp requested selections to valid ranges.
       reloadUserPresetStoreFromDiskLocked();
       const int maxLook = kBuiltInLookPresetCount + static_cast<int>(userPresetStore().lookPresets.size()) - 1;
       const int maxTone = kBuiltInTonescalePresetCount + static_cast<int>(userPresetStore().tonescalePresets.size()) - 1;
@@ -2605,6 +3169,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
     updateReadonlyDisplayLabels(t);
   }
 
+  // ===== Preset Manager Button Enable Rules =====
   // Manager actions are enabled only when current look or tonescale points to a user preset.
   void updatePresetManagerActionState(double t) {
     const int lookIdx = getChoice("lookPreset", t, 0);
@@ -2863,6 +3428,8 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   void load() override {}
   void unload() override {}
 
+  // ===== Plugin Descriptor =====
+  // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
     static const std::string nameWithVersion = "ME_OpenDRT v1.1";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
@@ -2890,6 +3457,8 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
 #endif
   }
 
+  // ===== Parameter + UI Layout =====
+  // Defines all OFX params, groups, pages, and parent/child wiring.
   void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override {
     OFX::ClipDescriptor* src = d.defineClip(kOfxImageEffectSimpleSourceClipName);
     src->addSupportedComponent(OFX::ePixelComponentRGBA);
