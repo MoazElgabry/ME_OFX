@@ -17,9 +17,6 @@ This project is based on OpenDRT and is distributed under **GNU GPL v3**.
 - macOS (arm64 + x86_64): Metal + CPU, including host-Metal path.
 - Linux (x86_64): CUDA/OpenCL/CPU fallback chain (build depends on toolkit availability and workflow variant).
 
-Automated build available:
-- **macOS Apple Silicon (arm64)** via GitHub Actions
-- **macOS Intel (x86_64)** via GitHub Actions
 
 ## Installation
 ### Installer (recommended)
