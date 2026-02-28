@@ -2423,7 +2423,8 @@ class OpenDRTEffect : public OFX::ImageEffect {
       }
 
       // ----- Preset Manager: Export -----
-      // Export selected user preset as a portable JSON (canonical payload + named/nuke/dctl helpers).
+      // Always export current effective values for the selected scope.
+      // This intentionally avoids conditional gating logic and edge-case combinations.
       if (paramName == "userPresetExportLook" || paramName == "userPresetExportTonescale") {
         const bool exportLook = (paramName == "userPresetExportLook");
         const int lookIdx = getChoice("lookPreset", args.time, 0);
@@ -2435,32 +2436,27 @@ class OpenDRTEffect : public OFX::ImageEffect {
         std::string nukeCmd;
         std::string nukeMenuEntry;
         std::string dctlPreset;
-        {
-          std::lock_guard<std::mutex> lock(userPresetMutex());
-          ensureUserPresetStoreLoadedLocked();
-          if (exportLook) {
-            const int userIdx = lookIdx - kBuiltInLookPresetCount;
-            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().lookPresets.size())) return;
-            const auto& p = userPresetStore().lookPresets[static_cast<size_t>(userIdx)];
-            name = p.name;
-            type = "look";
-            serializeLookValues(p.values, payload);
-            namedValues = lookValuesAsNamedJson(p.values);
-            nukeCmd = lookValuesAsNukeCmd(name, p.values);
-            nukeMenuEntry = std::string("Look Presets/") + name;
-            dctlPreset = lookValuesAsDctl(p.values);
-          } else {
-            const int userIdx = toneIdx - kBuiltInTonescalePresetCount;
-            if (userIdx < 0 || userIdx >= static_cast<int>(userPresetStore().tonescalePresets.size())) return;
-            const auto& p = userPresetStore().tonescalePresets[static_cast<size_t>(userIdx)];
-            name = p.name;
-            type = "tonescale";
-            serializeTonescaleValues(p.values, payload);
-            namedValues = tonescaleValuesAsNamedJson(p.values);
-            nukeCmd = tonescaleValuesAsNukeCmd(p.values);
-            nukeMenuEntry = std::string("Tonescale Presets/") + name;
-            dctlPreset = tonescaleValuesAsDctl(p.values);
-          }
+        if (exportLook) {
+          const LookPresetValues values = captureCurrentLookValues(args.time);
+          name = sanitizePresetName(lookBaseMenuName(lookIdx), "Custom Look");
+          type = "look";
+          serializeLookValues(values, payload);
+          namedValues = lookValuesAsNamedJson(values);
+          nukeCmd = lookValuesAsNukeCmd(name, values);
+          nukeMenuEntry = std::string("Look Presets/") + name;
+          dctlPreset = lookValuesAsDctl(values);
+        } else {
+          const TonescalePresetValues values = captureCurrentTonescaleValues(args.time);
+          const std::string toneName =
+              (toneIdx == 0) ? sanitizePresetName(lookBaseMenuName(lookIdx) + " Tonescale", "Tonescale")
+                             : tonescaleBaseMenuName(toneIdx);
+          name = sanitizePresetName(toneName, "Custom Tonescale");
+          type = "tonescale";
+          serializeTonescaleValues(values, payload);
+          namedValues = tonescaleValuesAsNamedJson(values);
+          nukeCmd = tonescaleValuesAsNukeCmd(values);
+          nukeMenuEntry = std::string("Tonescale Presets/") + name;
+          dctlPreset = tonescaleValuesAsDctl(values);
         }
         const std::string file = pickSaveJsonFilePath(name + ".json");
         if (file.empty()) return;
@@ -2927,6 +2923,9 @@ class OpenDRTEffect : public OFX::ImageEffect {
     // presetState drives UI readout and Discard availability.
     setInt("presetState", clean ? 0 : 1);
     if (auto* p = fetchPushButtonParam("discardPresetChanges")) p->setEnabled(!clean);
+    // Export buttons are always available (current-state export model).
+    if (auto* p = fetchPushButtonParam("userPresetExportLook")) p->setEnabled(true);
+    if (auto* p = fetchPushButtonParam("userPresetExportTonescale")) p->setEnabled(true);
     // Menu label mutation is separate so users can see "(Modified)" directly in look/tonescale lists.
     applyPresetMenuModifiedLabels(time, !clean, !tonescaleClean);
   }
@@ -3171,13 +3170,18 @@ class OpenDRTEffect : public OFX::ImageEffect {
 
   // ===== Preset Manager Button Enable Rules =====
   // Manager actions are enabled only when current look or tonescale points to a user preset.
+  // Export buttons are always enabled; they export current effective values.
   void updatePresetManagerActionState(double t) {
     const int lookIdx = getChoice("lookPreset", t, 0);
     const int toneIdx = getChoice("tonescalePreset", t, 0);
-    const bool enable = isUserLookPresetIndex(lookIdx) || isUserTonescalePresetIndex(toneIdx);
+    const bool hasUserLook = isUserLookPresetIndex(lookIdx);
+    const bool hasUserTone = isUserTonescalePresetIndex(toneIdx);
+    const bool enable = hasUserLook || hasUserTone;
     if (auto* p = fetchPushButtonParam("userPresetUpdateCurrent")) p->setEnabled(enable);
     if (auto* p = fetchPushButtonParam("userPresetDeleteCurrent")) p->setEnabled(enable);
     if (auto* p = fetchPushButtonParam("userPresetRenameCurrent")) p->setEnabled(enable);
+    if (auto* p = fetchPushButtonParam("userPresetExportLook")) p->setEnabled(true);
+    if (auto* p = fetchPushButtonParam("userPresetExportTonescale")) p->setEnabled(true);
   }
 
   void setParamVisible(const char* name, bool visible) {
