@@ -1,4 +1,4 @@
-﻿# ME_OpenDRT OFX
+# ME_OpenDRT OFX
 
 ME_OpenDRT OFX is a DaVinci Resolve OFX port of **OpenDRT v1.1.0**.
 This OFX aims to enable the full potential of OpenDRT by giving colorists the flexibility to take control of how the DRT interacts with their look-development process
@@ -63,6 +63,8 @@ sudo chown -R root:wheel /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 sudo xattr -dr com.apple.quarantine /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 sudo codesign --force --deep --sign - /Library/OFX/Plugins/ME_OpenDRT.ofx.bundle
 ```
+*If you're prompted for tour Mac login password usually there is jo indication or cursor
+simply imput the password and hit enter.
 
 Then relaunch DaVinci Resolve.
 
