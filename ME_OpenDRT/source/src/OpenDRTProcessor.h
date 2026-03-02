@@ -370,7 +370,7 @@ class OpenDRTProcessor {
   }
 #endif
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !defined(ME_OPENDRT_VIEWER_CPU_ONLY)
   // Metal path remains unchanged and is the primary backend on macOS.
   bool renderMetal(
       const float* src,
@@ -603,11 +603,15 @@ class OpenDRTProcessor {
     const float ts_y1 = params_.tn_Lp / 100.0f;
     const float ts_x0 = 0.18f + params_.tn_off;
     const float ts_y0 = params_.tn_Lg / 100.0f * (1.0f + params_.tn_gb * std::log2(ts_y1));
-    const float ts_s0 = params_.tn_toe == 0.0f ? ts_y0 : (ts_y0 + std::sqrt(ts_y0 * (4.0f * params_.tn_toe + ts_y0))) / 2.0f;
+    const float ts_s0 = params_.tn_toe == 0.0f
+                            ? ts_y0
+                            : (ts_y0 + std::sqrt(std::fmax(0.0f, ts_y0 * (4.0f * params_.tn_toe + ts_y0)))) / 2.0f;
     const float ts_p = params_.tn_con / (1.0f + static_cast<float>(params_.tn_su) * 0.05f);
     const float ts_s10 = ts_x0 * (std::pow(ts_s0, -1.0f / params_.tn_con) - 1.0f);
     const float ts_m1 = ts_y1 / std::pow(ts_x1 / (ts_x1 + ts_s10), params_.tn_con);
-    const float ts_m2 = params_.tn_toe == 0.0f ? ts_m1 : (ts_m1 + std::sqrt(ts_m1 * (4.0f * params_.tn_toe + ts_m1))) / 2.0f;
+    const float ts_m2 = params_.tn_toe == 0.0f
+                            ? ts_m1
+                            : (ts_m1 + std::sqrt(std::fmax(0.0f, ts_m1 * (4.0f * params_.tn_toe + ts_m1)))) / 2.0f;
     const float ts_s = ts_x0 * (std::pow(ts_s0 / ts_m2, -1.0f / params_.tn_con) - 1.0f);
     const float ts_dsc = params_.eotf == 4 ? 0.01f : params_.eotf == 5 ? 0.1f : 100.0f / params_.tn_Lp;
     const float pt_cmp_Lf = params_.pt_hdr * std::fmin(1.0f, (params_.tn_Lp - 100.0f) / 900.0f);
