@@ -270,6 +270,13 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${OFX_OUTPUT_DIR}"
     OSX_ARCHITECTURES "${CMAKE_OSX_ARCHITECTURES}"
   )
+  if(APPLE)
+    # Ensure helper binary remains launchable after packaging/copy steps.
+    add_custom_command(TARGET ME_OpenDRT_CubeViewer POST_BUILD
+      COMMAND /bin/chmod +x "$<TARGET_FILE:ME_OpenDRT_CubeViewer>"
+      VERBATIM
+    )
+  endif()
 endif()
 
 
