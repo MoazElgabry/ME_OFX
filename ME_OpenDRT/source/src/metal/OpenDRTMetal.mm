@@ -38,6 +38,8 @@ struct ThreadBuffers {
   id<MTLBuffer> srcBuffer = nil;
   id<MTLBuffer> dstBuffer = nil;
   size_t bufferBytes = 0;
+  id<MTLBuffer> hostTempSrcBuffer = nil;
+  size_t hostTempSrcBytes = 0;
   id<MTLBuffer> hostTempDstBuffer = nil;
   size_t hostTempDstBytes = 0;
 };
@@ -628,8 +630,32 @@ bool renderHost(
     return false;
   }
 
+  id<MTLBuffer> kernelSrcBuffer = srcBuffer;
+  size_t kernelSrcOffset = srcOffsetBytes;
   id<MTLBuffer> kernelDstBuffer = dstBuffer;
   size_t kernelDstOffset = dstOffsetBytes;
+
+  const bool sameBuffer = (srcBuffer == dstBuffer);
+  const size_t srcBegin = srcOffsetBytes;
+  const size_t srcEnd = srcOffsetBytes + requiredSrcBytes;
+  const size_t dstBegin = dstOffsetBytes;
+  const size_t dstEnd = dstOffsetBytes + requiredDstBytes;
+  const bool overlappingRanges = sameBuffer && (srcBegin < dstEnd) && (dstBegin < srcEnd);
+  const bool needsAliasProtection = overlappingRanges && (srcOffsetBytes != dstOffsetBytes || srcRowBytes != dstRowBytes);
+  if (needsAliasProtection) {
+    auto& buffers = threadBuffers();
+    if (buffers.hostTempSrcBuffer == nil || buffers.hostTempSrcBytes < requiredSrcBytes) {
+      buffers.hostTempSrcBuffer = [ctx.device newBufferWithLength:requiredSrcBytes options:MTLResourceStorageModeShared];
+      buffers.hostTempSrcBytes = (buffers.hostTempSrcBuffer != nil) ? requiredSrcBytes : 0;
+    }
+    if (buffers.hostTempSrcBuffer == nil) {
+      debugLog("Failed to allocate host temp src buffer for alias protection.");
+      return false;
+    }
+    kernelSrcBuffer = buffers.hostTempSrcBuffer;
+    kernelSrcOffset = 0;
+    diagLog("alias-protect enabled: src/dst overlap on same host buffer.");
+  }
   if (!forceHostMetalWait() && useHostIntermediateDst()) {
     auto& buffers = threadBuffers();
     if (buffers.hostTempDstBuffer == nil || buffers.hostTempDstBytes < requiredDstBytes) {
@@ -658,8 +684,18 @@ bool renderHost(
     return false;
   }
 
+  if (needsAliasProtection) {
+    id<MTLBlitCommandEncoder> preBlit = [cmd blitCommandEncoder];
+    if (preBlit == nil) {
+      debugLog("Failed to create precompute alias-protect blit encoder.");
+      return false;
+    }
+    [preBlit copyFromBuffer:srcBuffer sourceOffset:srcOffsetBytes toBuffer:kernelSrcBuffer destinationOffset:0 size:requiredSrcBytes];
+    [preBlit endEncoding];
+  }
+
   [enc setComputePipelineState:ctx.pipeline];
-  [enc setBuffer:srcBuffer offset:srcOffsetBytes atIndex:0];
+  [enc setBuffer:kernelSrcBuffer offset:kernelSrcOffset atIndex:0];
   [enc setBuffer:kernelDstBuffer offset:kernelDstOffset atIndex:1];
   [enc setBytes:&params length:sizeof(OpenDRTParams) atIndex:2];
   [enc setBytes:&width length:sizeof(int) atIndex:3];

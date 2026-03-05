@@ -7,7 +7,7 @@ on:
       - "v*"
 
 env:
-  OPENDRT_VERSION: v1.2.4
+  OPENDRT_VERSION: v1.2.5
 
 jobs:
   build-macos:
@@ -17,12 +17,12 @@ jobs:
         include:
           - arch: arm64
             runner: macos-14
-            zip_name: ME_OpenDRT_v1.2.4_macOS_arm64_portable.zip
-            artifact_name: ME_OpenDRT-v1.2.4-macos-arm64
+            zip_name: ME_OpenDRT_v1.2.5_macOS_arm64_portable.zip
+            artifact_name: ME_OpenDRT-v1.2.5-macos-arm64
           - arch: x86_64
             runner: macos-15-intel
-            zip_name: ME_OpenDRT_v1.2.4_macOS_x86_64_portable.zip
-            artifact_name: ME_OpenDRT-v1.2.4-macos-x86_64
+            zip_name: ME_OpenDRT_v1.2.5_macOS_x86_64_portable.zip
+            artifact_name: ME_OpenDRT-v1.2.5-macos-x86_64
 
     runs-on: ${{ matrix.runner }}
 
@@ -72,12 +72,12 @@ jobs:
         variant:
           - id: opencl-cpu
             linux_cuda: "OFF"
-            artifact_name: ME_OpenDRT-v1.2.4-linux-x86_64-opencl-cpu
-            archive_name: ME_OpenDRT_v1.2.4_linux_x86_64_opencl_cpu_portable.tar.gz
+            artifact_name: ME_OpenDRT-v1.2.5-linux-x86_64-opencl-cpu
+            archive_name: ME_OpenDRT_v1.2.5_linux_x86_64_opencl_cpu_portable.tar.gz
           - id: cuda-opencl-cpu
             linux_cuda: "ON"
-            artifact_name: ME_OpenDRT-v1.2.4-linux-x86_64-cuda-opencl-cpu
-            archive_name: ME_OpenDRT_v1.2.4_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
+            artifact_name: ME_OpenDRT-v1.2.5-linux-x86_64-cuda-opencl-cpu
+            archive_name: ME_OpenDRT_v1.2.5_linux_x86_64_cuda_opencl_cpu_portable.tar.gz
 
     runs-on: ubuntu-22.04
 
@@ -208,5 +208,5 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ME_OpenDRT-v1.2.4-windows-x86_64-bundle
+          name: ME_OpenDRT-v1.2.5-windows-x86_64-bundle
           path: ME_OpenDRT/source/bundle/ME_OpenDRT.ofx.bundle
