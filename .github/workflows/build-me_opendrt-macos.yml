@@ -1,10 +1,14 @@
 name: Build ME_OpenDRT macOS (arm64 + x86_64)
+run-name: Build ME_OpenDRT macOS
 
 on:
   workflow_dispatch:
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: read
 
 jobs:
   build-macos:

@@ -1,10 +1,14 @@
 name: Build ME_OpenDRT Windows (x86_64 CUDA/OpenCL/CPU)
+run-name: Build ME_OpenDRT Windows
 
 on:
   workflow_dispatch:
   push:
     tags:
       - "v*"
+
+permissions:
+  contents: read
 
 jobs:
   build-windows:
