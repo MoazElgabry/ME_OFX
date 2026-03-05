@@ -6,7 +6,7 @@ and design the DRT aspects according to their projects and stories. I've built a
 that makes it easy to store and share configurations to give the colorist both flexibility and speed. 
 
 Current plugin in this repo:
-- **ME_OpenDRT OFX v1.2** (A direct port from OpenDRT v1.1.0)
+- **ME_OpenDRT OFX v1.2.2** (A direct port from OpenDRT v1.1.0)
 
 ## Upstream Project and License
 This project is based on OpenDRT and is distributed under **GNU GPL v3**.
