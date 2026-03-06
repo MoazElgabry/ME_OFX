@@ -2451,14 +2451,24 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerIdentity") {
-        setChoice("cubeViewerSource", getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1);
+        const bool identityMode = getBool("cubeViewerIdentity", args.time, 1) != 0;
+        setChoice("cubeViewerSource", identityMode ? 0 : 1);
+        cubeViewerInputCloudRefreshPending_ = !identityMode;
+        if (!identityMode) {
+          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+        }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
         return;
       }
       if (paramName == "cubeViewerSource") {
-        setBool("cubeViewerIdentity", getChoice("cubeViewerSource", args.time, 0) == 0 ? 1 : 0);
+        const bool identityMode = getChoice("cubeViewerSource", args.time, 0) == 0;
+        setBool("cubeViewerIdentity", identityMode ? 1 : 0);
+        cubeViewerInputCloudRefreshPending_ = !identityMode;
+        if (!identityMode) {
+          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+        }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
@@ -4172,9 +4182,12 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
   // Input-cloud gate: only emit when viewer is live/visible and source mode is input-image.
 bool shouldEmitCubeViewerInputCloud(double time) {
     if (!cubeViewerRequested_ || !cubeViewerLive_) return false;
-    if (!cubeViewerConnected_) return false;
-    if (!cubeViewerWindowUsable_) return false;
     if (getBool("cubeViewerIdentity", time, 1) != 0) return false;
+    const bool forceFirstCloud = cubeViewerInputCloudRefreshPending_;
+    if (!forceFirstCloud) {
+      if (!cubeViewerConnected_) return false;
+      if (!cubeViewerWindowUsable_) return false;
+    }
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ != std::chrono::steady_clock::time_point::min()) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
@@ -4295,10 +4308,20 @@ bool shouldEmitCubeViewerInputCloud(double time) {
 
     if (sendCubeViewerMessage(os.str())) {
       cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
+      cubeViewerInputCloudRefreshPending_ = false;
+      setCubeViewerStatusLabel("Updating");
+      return true;
+    }
+    if (cubeViewerInputCloudRefreshPending_ && connectCubeViewerWithRetry(1, 20) && sendCubeViewerMessage(os.str())) {
+      cubeViewerConnected_ = true;
+      cubeViewerWindowUsable_ = true;
+      cubeViewerInputCloudRefreshPending_ = false;
       setCubeViewerStatusLabel("Updating");
       return true;
     }
     cubeViewerConnected_ = false;
+    cubeViewerWindowUsable_ = false;
     setCubeViewerStatusLabel("Disconnected");
     return false;
   }
@@ -4560,6 +4583,7 @@ void closeCubeViewerSession() {
   uint32_t cubeViewerProcessId_ = 0;
   bool cubeViewerLive_ = true;
   bool cubeViewerWindowUsable_ = false;
+  bool cubeViewerInputCloudRefreshPending_ = false;
   bool cubeViewerLastStateVisible_ = true;
   bool cubeViewerLastStateMinimized_ = false;
   bool cubeViewerLastStateFocused_ = true;
