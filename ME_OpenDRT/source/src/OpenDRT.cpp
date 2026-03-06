@@ -2209,6 +2209,10 @@ void render(const OFX::RenderArguments& args) override {
     const bool needFirstCloudHandoff = shouldEmitCubeViewerInputCloudFirstHandoff(args.time);
     const bool needSteadyStateCloud = canUpdateInputCloudCache && shouldEmitCubeViewerInputCloudSteadyState(args.time);
     const bool needHostReadableInputCloud = needFirstCloudHandoff || needSteadyStateCloud;
+    // Cloud extraction relies on host-readable image memory. Avoid rendering once via host Metal and then
+    // falling through into a second render on the same frame. For cloud-needed frames, bypass host Metal
+    // up front and let the existing host-readable path handle render + cloud extraction in one pass.
+    const bool bypassHostMetalForCubeViewerCloud = needHostReadableInputCloud;
 
     if (!processor_) {
       processor_ = std::make_unique<OpenDRTProcessor>(params);
@@ -2311,7 +2315,8 @@ void render(const OFX::RenderArguments& args) override {
     // - Uses host-provided command queue + MTLBuffer image handles.
     // - Avoids plugin-owned CPU staging copies.
     const bool preferHostMetal = (selectedMetalRenderMode() == MetalRenderMode::HostPreferred);
-    const bool tryHostMetal = preferHostMetal && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
+    const bool tryHostMetal =
+        preferHostMetal && !bypassHostMetalForCubeViewerCloud && args.isEnabledMetalRender && (args.pMetalCmdQ != nullptr);
     if (tryHostMetal) {
       const auto tHostMetal = std::chrono::steady_clock::now();
       const void* srcMetalBuffer = src->getPixelData();
@@ -2335,22 +2340,20 @@ void render(const OFX::RenderArguments& args) override {
         hostMetalRendered = true;
         OpenDRTMetal::resetHostMetalFailureState();
         perfLog("Backend render host Metal", tHostMetal);
-        if (!needHostReadableInputCloud) {
-          perfLog("Render total", tRenderStart);
-          return;
-        }
-        if (debugLogEnabled()) {
-          std::fprintf(
-              stderr,
-              "[ME_OpenDRT] Host Metal rendered; routing frame through host-readable path for cube viewer (%s).\n",
-              needFirstCloudHandoff ? "first handoff" : "steady-state");
-        }
+        perfLog("Render total", tRenderStart);
+        return;
       }
       if (!hostMetalRendered && debugLogEnabled()) {
         std::fprintf(stderr, "[ME_OpenDRT] Host Metal render failed.\n");
       }
       // Safe fallback: continue into existing internal render path.
       // This preserves stability if host-Metal submission fails transiently.
+    }
+    if (bypassHostMetalForCubeViewerCloud && debugLogEnabled()) {
+      std::fprintf(
+          stderr,
+          "[ME_OpenDRT] Bypassing host Metal for cube viewer cloud frame (%s).\n",
+          needFirstCloudHandoff ? "first handoff" : "steady-state");
     }
 #endif
 
@@ -4439,7 +4442,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     os << "\"quality\":\"" << payload.quality << "\",";
     os << "\"resolution\":" << payload.resolution << ",";
     os << "\"sourceMode\":\"input\",";
-    os << "\"paramHash\":\"" << payload.pointsHash << "\",";
+    os << "\"paramHash\":\"" << payload.paramsHash << "\",";
     os << "\"points\":\"" << jsonEscape(payload.points) << "\"";
     os << "}";
     return os.str();
@@ -4452,7 +4455,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
 
   bool sendCubeViewerInputCloudPayload(
       const CachedCubeViewerInputCloud& payload,
-      bool allowReconnect,
+      bool /*allowReconnect*/,
       const char* reason) {
     if (!payload.valid || payload.points.empty()) return false;
     noteCubeViewerInputCloudAttempt();
@@ -4473,17 +4476,6 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
       cubeViewerWindowUsable_ = true;
       cubeViewerInputCloudRefreshPending_ = false;
       setCubeViewerStatusLabel("Updating");
-      return true;
-    }
-
-    if (allowReconnect && connectCubeViewerWithRetry(1, 20) && sendCubeViewerMessage(json)) {
-      cubeViewerConnected_ = true;
-      cubeViewerWindowUsable_ = true;
-      cubeViewerInputCloudRefreshPending_ = false;
-      setCubeViewerStatusLabel("Updating");
-      if (debugLogEnabled()) {
-        std::fprintf(stderr, "[ME_OpenDRT] Cube input cloud reconnect retry succeeded (%s).\n", reason ? reason : "unspecified");
-      }
       return true;
     }
 
