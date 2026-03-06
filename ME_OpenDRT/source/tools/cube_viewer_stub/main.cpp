@@ -82,7 +82,7 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
-const char* kViewerVersionString = "v1.2.7";
+const char* kViewerVersionString = "v1.2.8";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {

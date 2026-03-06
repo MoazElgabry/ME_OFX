@@ -9,9 +9,9 @@ on:
 jobs:
   build-windows:
     env:
-      OPENDRT_VERSION: v1.2.7
-      ZIP_NAME: ME_OpenDRT_v1.2.7_windows_x86_64_portable.zip
-      ARTIFACT_NAME: ME_OpenDRT-v1.2.7-windows-x86_64
+      OPENDRT_VERSION: v1.2.8
+      ZIP_NAME: ME_OpenDRT_v1.2.8_windows_x86_64_portable.zip
+      ARTIFACT_NAME: ME_OpenDRT-v1.2.8-windows-x86_64
 
     runs-on: windows-2022
 

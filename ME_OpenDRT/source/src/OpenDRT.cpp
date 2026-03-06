@@ -187,7 +187,7 @@ void cubeViewerDebugLog(const std::string& line) {
   appendMacDebugLogLine(std::string("[ME_OpenDRT][CubeViewer] ") + line);
 }
 
-const char* kOfxVersionString = "v1.2.7";
+const char* kOfxVersionString = "v1.2.8";
 
 void cubeViewerDebugLogGate(const std::string& line) {
   static std::atomic<unsigned long long> counter{0};
@@ -4709,7 +4709,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-      static const std::string nameWithVersion = "ME_OpenDRT v1.2.7";
+      static const std::string nameWithVersion = "ME_OpenDRT v1.2.8";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5098,7 +5098,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.7");
+    supportOfxVersion->setDefault("v1.2.8");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);
