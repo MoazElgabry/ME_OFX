@@ -8,6 +8,12 @@ using namespace metal;
 constant float SQRT3 = 1.7320508075688772f;
 constant float PI = 3.1415926535897932f;
 
+#ifndef ME_OPENDRT_METAL_STAGE_DEBUG
+#define ME_OPENDRT_METAL_STAGE_DEBUG 0
+#endif
+
+#define ME_STAGE_RETURN(stage_id, value) do { if (ME_OPENDRT_METAL_STAGE_DEBUG == (stage_id)) return (value); } while (0)
+
 typedef struct {
   float3 x, y, z;
 } drt_float3x3;
@@ -70,21 +76,55 @@ inline float sdivf(float a, float b) { return (b == 0.0f) ? 0.0f : a / b; }
 inline float3 sdivf3f(float3 a, float b) { return make_float3(sdivf(a.x, b), sdivf(a.y, b), sdivf(a.z, b)); }
 inline float spowf(float a, float b) { return (a <= 0.0f) ? a : pow(a, b); }
 inline float3 spowf3(float3 a, float b) { return make_float3(spowf(a.x, b), spowf(a.y, b), spowf(a.z, b)); }
-inline float hypotf2(float2 v) { return sqrt(fmax(0.0f, v.x * v.x + v.y * v.y)); }
-inline float hypotf3(float3 v) { return sqrt(fmax(0.0f, v.x * v.x + v.y * v.y + v.z * v.z)); }
+// Keep optimization-sensitive nonlinear math in explicit helpers. When Metal
+// output drifts from CPU/OpenCL/CUDA, audit these helpers first before assuming
+// the issue is row layout, transport, or viewer code.
+inline float safe_div(float num, float den, float fallback, float eps) {
+  if (fabs(den) < eps) return fallback;
+  return num / den;
+}
+inline float safe_div(float num, float den) { return safe_div(num, den, 0.0f, 1e-6f); }
+inline float safe_recip(float x, float eps) { return safe_div(1.0f, x, 0.0f, eps); }
+inline float safe_recip(float x) { return safe_recip(x, 1e-6f); }
+inline float safe_sqrt(float x) { return sqrt(fmax(0.0f, x)); }
+inline float safe_pow_pos(float base, float expv, float fallback) { return base <= 0.0f ? fallback : pow(base, expv); }
+inline float safe_pow_pos(float base, float expv) { return safe_pow_pos(base, expv, 0.0f); }
+inline float safe_log_pos(float x, float eps) { return log(fmax(x, eps)); }
+inline float safe_log_pos(float x) { return safe_log_pos(x, 1e-6f); }
+inline float safe_log2_pos(float x, float eps) { return log2(fmax(x, eps)); }
+inline float safe_log2_pos(float x) { return safe_log2_pos(x, 1e-6f); }
+inline float safe_exp_clamped(float x) { return exp(clampf3(make_float3(x, x, x), -80.0f, 80.0f).x); }
+inline float safe_exp2_clamped(float x) { return exp2(clampf3(make_float3(x, x, x), -126.0f, 126.0f).x); }
+inline float safe_hypot2(float2 v) { return safe_sqrt(v.x * v.x + v.y * v.y); }
+inline float safe_hypot3(float3 v) { return safe_sqrt(v.x * v.x + v.y * v.y + v.z * v.z); }
+// atan/atan2 have been a backend-specific trouble spot before, especially near
+// neutral pixels where opponent values approach zero. Guard them here so future
+// hue work has one obvious place to tighten behavior.
+inline float safe_atan2(float y, float x, float fallback) { return (fabs(x) < 1e-8f && fabs(y) < 1e-8f) ? fallback : atan2(y, x); }
+inline float safe_atan2(float y, float x) { return safe_atan2(y, x, 0.0f); }
+// Wrap hue in one helper instead of repeating raw fmod chains. That makes it
+// easier to compare Metal behavior against CPU/OpenCL/CUDA when the hue math is
+// touched later.
+inline float safe_hue_wrap(float h) {
+  float wrapped = fmod(h, 2.0f * PI);
+  if (wrapped < 0.0f) wrapped += 2.0f * PI;
+  return wrapped;
+}
+inline float hypotf2(float2 v) { return safe_hypot2(v); }
+inline float hypotf3(float3 v) { return safe_hypot3(v); }
 inline float3 clampf3(float3 a, float mn, float mx) { return make_float3(fmin(fmax(a.x, mn), mx), fmin(fmax(a.y, mn), mx), fmin(fmax(a.z, mn), mx)); }
 inline float3 clampminf3(float3 a, float mn) { return make_float3(fmax(a.x, mn), fmax(a.y, mn), fmax(a.z, mn)); }
 
 inline float oetf_davinci_intermediate(float x) { return x <= 0.02740668f ? x / 10.44426855f : exp2(x / 0.07329248f - 7.0f) - 0.0075f; }
-inline float oetf_filmlight_tlog(float x) { return x < 0.075f ? (x - 0.075f) / 16.184376489665897f : exp((x - 0.5520126568606655f) / 0.09232902596577353f) - 0.0057048244042473785f; }
+inline float oetf_filmlight_tlog(float x) { return x < 0.075f ? (x - 0.075f) / 16.184376489665897f : safe_exp_clamped((x - 0.5520126568606655f) / 0.09232902596577353f) - 0.0057048244042473785f; }
 inline float oetf_acescct(float x) { return x <= 0.155251141552511f ? (x - 0.0729055341958355f) / 10.5402377416545f : exp2(x * 17.52f - 9.72f); }
-inline float exp10_compat(float x) { return exp2(x * 3.3219280948873626f); }
-inline float oetf_arri_logc3(float x) { return x < 5.367655f * 0.010591f + 0.092809f ? (x - 0.092809f) / 5.367655f : (exp10_compat((x - 0.385537f) / 0.247190f) - 0.052272f) / 5.555556f; }
-inline float oetf_arri_logc4(float x) { return x < -0.7774983977293537f ? x * 0.3033266726886969f - 0.7774983977293537f : (exp2(14.0f * (x - 0.09286412512218964f) / 0.9071358748778103f + 6.0f) - 64.0f) / 2231.8263090676883f; }
-inline float oetf_red_log3g10(float x) { return x < 0.0f ? (x / 15.1927f) - 0.01f : (exp10_compat(x / 0.224282f) - 1.0f) / 155.975327f - 0.01f; }
+inline float exp10_compat(float x) { return safe_exp2_clamped(x * 3.3219280948873626f); }
+inline float oetf_arri_logc3(float x) { return x < 5.367655f * 0.010591f + 0.092809f ? (x - 0.092809f) / 5.367655f : safe_div(exp10_compat((x - 0.385537f) / 0.247190f) - 0.052272f, 5.555556f); }
+inline float oetf_arri_logc4(float x) { return x < -0.7774983977293537f ? x * 0.3033266726886969f - 0.7774983977293537f : safe_div(safe_exp2_clamped(14.0f * (x - 0.09286412512218964f) / 0.9071358748778103f + 6.0f) - 64.0f, 2231.8263090676883f); }
+inline float oetf_red_log3g10(float x) { return x < 0.0f ? (x / 15.1927f) - 0.01f : safe_div(exp10_compat(x / 0.224282f) - 1.0f, 155.975327f) - 0.01f; }
 inline float oetf_panasonic_vlog(float x) { return x < 0.181f ? (x - 0.125f) / 5.6f : exp10_compat((x - 0.598206f) / 0.241514f) - 0.00873f; }
 inline float oetf_sony_slog3(float x) { return x < 171.2102946929f / 1023.0f ? (x * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f) : (exp10_compat(((x * 1023.0f - 420.0f) / 261.5f)) * (0.18f + 0.01f) - 0.01f); }
-inline float oetf_fujifilm_flog2(float x) { return x < 0.100686685370811f ? (x - 0.092864f) / 8.799461f : (exp10_compat(((x - 0.384316f) / 0.245281f)) / 5.555556f - 0.064829f / 5.555556f); }
+inline float oetf_fujifilm_flog2(float x) { return x < 0.100686685370811f ? (x - 0.092864f) / 8.799461f : safe_div(exp10_compat(((x - 0.384316f) / 0.245281f)), 5.555556f) - 0.064829f / 5.555556f; }
 
 inline float3 linearize(float3 rgb, int tf) {
   if (tf == 0) return rgb;
@@ -104,17 +144,30 @@ inline float3 eotf_hlg(float3 rgb, int inverse) {
   if (inverse == 1) {
     float Yd = 0.2627f * rgb.x + 0.6780f * rgb.y + 0.0593f * rgb.z;
     rgb = rgb * spowf(Yd, (1.0f - 1.2f) / 1.2f);
-    rgb.x = rgb.x <= 1.0f / 12.0f ? sqrt(fmax(0.0f, 3.0f * rgb.x)) : 0.17883277f * log(12.0f * rgb.x - 0.28466892f) + 0.55991073f;
-    rgb.y = rgb.y <= 1.0f / 12.0f ? sqrt(fmax(0.0f, 3.0f * rgb.y)) : 0.17883277f * log(12.0f * rgb.y - 0.28466892f) + 0.55991073f;
-    rgb.z = rgb.z <= 1.0f / 12.0f ? sqrt(fmax(0.0f, 3.0f * rgb.z)) : 0.17883277f * log(12.0f * rgb.z - 0.28466892f) + 0.55991073f;
+    rgb.x = rgb.x <= 1.0f / 12.0f ? safe_sqrt(3.0f * rgb.x) : 0.17883277f * safe_log_pos(12.0f * rgb.x - 0.28466892f) + 0.55991073f;
+    rgb.y = rgb.y <= 1.0f / 12.0f ? safe_sqrt(3.0f * rgb.y) : 0.17883277f * safe_log_pos(12.0f * rgb.y - 0.28466892f) + 0.55991073f;
+    rgb.z = rgb.z <= 1.0f / 12.0f ? safe_sqrt(3.0f * rgb.z) : 0.17883277f * safe_log_pos(12.0f * rgb.z - 0.28466892f) + 0.55991073f;
   } else {
-    rgb.x = rgb.x <= 0.5f ? rgb.x * rgb.x / 3.0f : (exp((rgb.x - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f;
-    rgb.y = rgb.y <= 0.5f ? rgb.y * rgb.y / 3.0f : (exp((rgb.y - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f;
-    rgb.z = rgb.z <= 0.5f ? rgb.z * rgb.z / 3.0f : (exp((rgb.z - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.0f;
+    rgb.x = rgb.x <= 0.5f ? rgb.x * rgb.x / 3.0f : safe_div(safe_exp_clamped((rgb.x - 0.55991073f) / 0.17883277f) + 0.28466892f, 12.0f);
+    rgb.y = rgb.y <= 0.5f ? rgb.y * rgb.y / 3.0f : safe_div(safe_exp_clamped((rgb.y - 0.55991073f) / 0.17883277f) + 0.28466892f, 12.0f);
+    rgb.z = rgb.z <= 0.5f ? rgb.z * rgb.z / 3.0f : safe_div(safe_exp_clamped((rgb.z - 0.55991073f) / 0.17883277f) + 0.28466892f, 12.0f);
     float Ys = 0.2627f * rgb.x + 0.6780f * rgb.y + 0.0593f * rgb.z;
     rgb = rgb * spowf(Ys, 0.2f);
   }
   return rgb;
+}
+
+inline float eotf_pq_encode_channel(float x, float c1, float c2, float c3, float m2) {
+  const float num = c1 + c2 * x;
+  const float den = 1.0f + c3 * x;
+  const float ratio = safe_div(num, den, 0.0f, 1e-6f);
+  return spowf(ratio, m2);
+}
+
+inline float eotf_pq_decode_channel(float x, float c1, float c2, float c3, float invM1) {
+  const float den = c2 - c3 * x;
+  const float ratio = safe_div(x - c1, den, 0.0f, 1e-6f);
+  return spowf(ratio, invM1);
 }
 
 inline float3 eotf_pq(float3 rgb, int inverse) {
@@ -125,67 +178,76 @@ inline float3 eotf_pq(float3 rgb, int inverse) {
   const float c3 = 2392.0f / 128.0f;
   if (inverse == 1) {
     rgb = spowf3(rgb, m1);
-    float num = c1 + c2 * rgb.x;
-    float den = 1.0f + c3 * rgb.x;
-    if (fabs(den) < 1e-6f) den = den < 0.0f ? -1e-6f : 1e-6f;
-    rgb.x = spowf(num / den, m2);
-    num = c1 + c2 * rgb.y;
-    den = 1.0f + c3 * rgb.y;
-    if (fabs(den) < 1e-6f) den = den < 0.0f ? -1e-6f : 1e-6f;
-    rgb.y = spowf(num / den, m2);
-    num = c1 + c2 * rgb.z;
-    den = 1.0f + c3 * rgb.z;
-    if (fabs(den) < 1e-6f) den = den < 0.0f ? -1e-6f : 1e-6f;
-    rgb.z = spowf(num / den, m2);
+    rgb = make_float3(
+        eotf_pq_encode_channel(rgb.x, c1, c2, c3, m2),
+        eotf_pq_encode_channel(rgb.y, c1, c2, c3, m2),
+        eotf_pq_encode_channel(rgb.z, c1, c2, c3, m2));
   } else {
-    rgb = spowf3(rgb, 1.0f / m2);
-    rgb = spowf3((rgb - c1) / (c2 - c3 * rgb), 1.0f / m1);
+    const float invM2 = 1.0f / m2;
+    const float invM1 = 1.0f / m1;
+    rgb = spowf3(rgb, invM2);
+    rgb = make_float3(
+        eotf_pq_decode_channel(rgb.x, c1, c2, c3, invM1),
+        eotf_pq_decode_channel(rgb.y, c1, c2, c3, invM1),
+        eotf_pq_decode_channel(rgb.z, c1, c2, c3, invM1));
   }
   return rgb;
 }
 
-inline float compress_hyperbolic_power(float x, float s, float p) { return spowf(x / (x + s), p); }
+inline float compress_hyperbolic_power(float x, float s, float p) {
+  const float ratio = safe_div(x, x + s, 0.0f, 1e-6f);
+  return spowf(ratio, p);
+}
 inline float compress_toe_quadratic(float x, float toe, int inv) {
   if (toe == 0.0f) return x;
-  if (inv == 0) return spowf(x, 2.0f) / (x + toe);
-  return (x + sqrt(fmax(0.0f, x * (4.0f * toe + x)))) / 2.0f;
+  if (inv == 0) return safe_div(spowf(x, 2.0f), x + toe, 0.0f, 1e-6f);
+  const float radicand = x * (4.0f * toe + x);
+  return (x + safe_sqrt(radicand)) / 2.0f;
 }
 inline float compress_toe_cubic(float x, float m, float w, int inv) {
   if (m == 1.0f) return x;
-  float x2 = x * x;
-  if (inv == 0) return x * (x2 + m * w) / (x2 + w);
-  float p0 = x2 - 3.0f * m * w;
-  float p1 = 2.0f * x2 + 27.0f * w - 9.0f * m * w;
-  float radicand = fmax(0.0f, x2 * p1 * p1 - 4.0f * p0 * p0 * p0);
-  float base = sqrt(radicand) / 2.0f + x * p1 / 2.0f;
-  float p2 = base <= 0.0f ? 0.0f : pow(base, 1.0f / 3.0f);
+  const float x2 = x * x;
+  if (inv == 0) return x * safe_div(x2 + m * w, x2 + w, 0.0f, 1e-6f);
+  const float p0 = x2 - 3.0f * m * w;
+  const float p1 = 2.0f * x2 + 27.0f * w - 9.0f * m * w;
+  const float radicand = fmax(0.0f, x2 * p1 * p1 - 4.0f * p0 * p0 * p0);
+  const float base = safe_sqrt(radicand) / 2.0f + x * p1 / 2.0f;
+  const float p2 = safe_pow_pos(base, 1.0f / 3.0f, 0.0f);
   if (p2 == 0.0f) return x;
-  return p0 / (3.0f * p2) + p2 / 3.0f + x / 3.0f;
+  return safe_div(p0, 3.0f * p2, 0.0f, 1e-6f) + p2 / 3.0f + x / 3.0f;
 }
-inline float softplus(float x, float s) { if (x > 10.0f * s || s < 1e-4f) return x; return s * log(fmax(0.0f, 1.0f + exp(x / s))); }
-inline float gauss_window(float x, float w) { return exp(-x * x / w); }
+inline float softplus(float x, float s) {
+  if (x > 10.0f * s || s < 1e-4f) return x;
+  const float scaled = safe_div(x, s, 0.0f, 1e-6f);
+  return s * safe_log_pos(1.0f + safe_exp_clamped(scaled));
+}
+inline float gauss_window(float x, float w) {
+  const float expo = -safe_div(x * x, w, 0.0f, 1e-6f);
+  return safe_exp_clamped(expo);
+}
 inline float2 opponent(float3 rgb) { return make_float2(rgb.x - rgb.z, rgb.y - (rgb.x + rgb.z) / 2.0f); }
-inline float hue_offset(float h, float o) { return fmod(h - o + PI, 2.0f * PI) - PI; }
+inline float hue_offset(float h, float o) { return safe_hue_wrap(h - o + PI) - PI; }
 inline float contrast_high(float x, float p, float pv, float pv_lx, int inv) {
-  const float x0 = 0.18f * pow(2.0f, pv);
+  const float x0 = 0.18f * safe_exp2_clamped(pv);
   if (x < x0 || p == 1.0f) return x;
-  const float o = x0 - x0 / p;
-  const float s0 = pow(x0, 1.0f - p) / p;
-  const float x1 = x0 * pow(2.0f, pv_lx);
-  const float k1 = p * s0 * pow(x1, p) / x1;
-  const float y1 = s0 * pow(x1, p) + o;
+  const float o = x0 - safe_div(x0, p, 0.0f, 1e-6f);
+  const float s0 = safe_div(safe_pow_pos(x0, 1.0f - p), p, 0.0f, 1e-6f);
+  const float x1 = x0 * safe_exp2_clamped(pv_lx);
+  const float x1Pow = safe_pow_pos(x1, p);
+  const float k1 = p * s0 * safe_div(x1Pow, x1, 0.0f, 1e-6f);
+  const float y1 = s0 * x1Pow + o;
   if (inv == 1) {
-    if (x > y1) return (x - y1) / k1 + x1;
-    float base = (x - o) / s0;
-    return base <= 0.0f ? 0.0f : pow(base, 1.0f / p);
+    if (x > y1) return safe_div(x - y1, k1, 0.0f, 1e-6f) + x1;
+    const float base = safe_div(x - o, s0, 0.0f, 1e-6f);
+    return safe_pow_pos(base, 1.0f / p, 0.0f);
   }
-  return x > x1 ? k1 * (x - x1) + y1 : s0 * pow(x, p) + o;
+  return x > x1 ? k1 * (x - x1) + y1 : s0 * safe_pow_pos(x, p, 0.0f) + o;
 }
 
 inline float3 display_gamut_whitepoint(float3 rgb, float tsn, float cwp_lm, int display_gamut, int cwp) {
   rgb = vdot(matrix_p3d65_to_xyz, rgb);
   float3 cwp_neutral = rgb;
-  float cwp_f = pow(fmax(0.0f, tsn), 2.0f * cwp_lm);
+  float cwp_f = safe_pow_pos(fmax(0.0f, tsn), 2.0f * cwp_lm, 0.0f);
   if (display_gamut < 3) {
     if (cwp == 0) rgb = vdot(matrix_cat_d65_to_d93, rgb);
     else if (cwp == 1) rgb = vdot(matrix_cat_d65_to_d75, rgb);
@@ -264,8 +326,12 @@ inline float3 openDRTTransform(
   float crv_tsn = 0.0f;
   float2 pos = make_float2((float)x, (float)y), res = make_float2((float)width, (float)height);
   if (crv_enable == 1) crv_tsn = oetf_filmlight_tlog(pos.x / res.x);
-  rgb = linearize(rgb, in_oetf);
 
+  // Stage 3: input linearization.
+  rgb = linearize(rgb, in_oetf);
+  ME_STAGE_RETURN(3, rgb);
+
+  // Stage 4: tonescale parameter derivation.
   float ts_x1, ts_y1, ts_x0, ts_y0, ts_s0, ts_p, ts_s10, ts_m1, ts_m2, ts_s, ts_dsc, pt_cmp_Lf, s_Lp100, ts_s1;
   if (d.enabled != 0) {
     ts_x1 = d.ts_x1;
@@ -283,67 +349,79 @@ inline float3 openDRTTransform(
     s_Lp100 = d.s_Lp100;
     ts_s1 = d.ts_s1;
   } else {
-    ts_x1 = pow(2.0f, 6.0f * tn_sh + 4.0f);
+    ts_x1 = safe_exp2_clamped(6.0f * tn_sh + 4.0f);
     ts_y1 = tn_Lp / 100.0f;
     ts_x0 = 0.18f + tn_off;
-    ts_y0 = tn_Lg / 100.0f * (1.0f + tn_gb * log2(ts_y1));
+    ts_y0 = tn_Lg / 100.0f * (1.0f + tn_gb * safe_log2_pos(ts_y1));
     ts_s0 = compress_toe_quadratic(ts_y0, tn_toe, 1);
     ts_p = tn_con / (1.0f + (float)tn_su * 0.05f);
-    ts_s10 = ts_x0 * (pow(ts_s0, -1.0f / tn_con) - 1.0f);
-    ts_m1 = ts_y1 / pow(ts_x1 / (ts_x1 + ts_s10), tn_con);
+    ts_s10 = ts_x0 * (safe_pow_pos(ts_s0, -1.0f / tn_con, 0.0f) - 1.0f);
+    ts_m1 = safe_div(ts_y1, safe_pow_pos(safe_div(ts_x1, ts_x1 + ts_s10, 0.0f, 1e-6f), tn_con, 0.0f), 0.0f, 1e-6f);
     ts_m2 = compress_toe_quadratic(ts_m1, tn_toe, 1);
-    ts_s = ts_x0 * (pow(ts_s0 / ts_m2, -1.0f / tn_con) - 1.0f);
+    ts_s = ts_x0 * (safe_pow_pos(safe_div(ts_s0, ts_m2, 0.0f, 1e-6f), -1.0f / tn_con, 0.0f) - 1.0f);
     ts_dsc = eotf == 4 ? 0.01f : eotf == 5 ? 0.1f : 100.0f / tn_Lp;
     pt_cmp_Lf = pt_hdr * fmin(1.0f, (tn_Lp - 100.0f) / 900.0f);
-    s_Lp100 = ts_x0 * (pow((tn_Lg / 100.0f), -1.0f / tn_con) - 1.0f);
+    s_Lp100 = ts_x0 * (safe_pow_pos((tn_Lg / 100.0f), -1.0f / tn_con, 0.0f) - 1.0f);
     ts_s1 = ts_s * pt_cmp_Lf + s_Lp100 * (1.0f - pt_cmp_Lf);
   }
 
+  // Stage 5: input-to-P3 conversion.
   rgb = vdot(matrix_xyz_to_p3d65, vdot(in_to_xyz, rgb));
+  ME_STAGE_RETURN(5, rgb);
   float3 rs_w = make_float3(rs_rw, 1.0f - rs_rw - rs_bw, rs_bw);
   float sat_L = rgb.x * rs_w.x + rgb.y * rs_w.y + rgb.z * rs_w.z;
   rgb = sat_L * rs_sa + rgb * (1.0f - rs_sa);
   rgb += tn_off;
   if (crv_enable == 1) crv_tsn += tn_off;
 
+  // Stage 6: opponent/hue/achromatic analysis.
   float tsn = hypotf3(rgb) / SQRT3;
   rgb = sdivf3f(rgb, tsn);
   float2 opp = opponent(rgb);
   float ach_d = 1.25f * compress_toe_quadratic(hypotf2(opp) / 2.0f, 0.25f, 0);
-  float hue = fmod(atan2(opp.x, opp.y) + PI + 1.10714931f, 2.0f * PI);
+  // Keep the opponent->hue path explicit and guarded. If future math edits
+  // reintroduce architecture-specific artifacts, this is one of the first
+  // places to compare against CPU/OpenCL/CUDA and to test with compiler
+  // safe-math flags enabled where the toolchain supports them.
+  float hue = safe_hue_wrap(safe_atan2(opp.x, opp.y) + PI + 1.10714931f);
 
   float3 ha_rgb = make_float3(gauss_window(hue_offset(hue, 0.1f), 0.66f), gauss_window(hue_offset(hue, 4.3f), 0.66f), gauss_window(hue_offset(hue, 2.3f), 0.66f));
   float3 ha_rgb_hs = make_float3(gauss_window(hue_offset(hue, -0.4f), 0.66f), ha_rgb.y, gauss_window(hue_offset(hue, 2.5f), 0.66f));
   float3 ha_cmy = make_float3(gauss_window(hue_offset(hue, 3.3f), 0.5f), gauss_window(hue_offset(hue, 1.3f), 0.5f), gauss_window(hue_offset(hue, -1.15f), 0.5f));
+  ME_STAGE_RETURN(6, rgb);
 
+  // Stage 7: brilliance.
   if (brl_enable) {
-    float brl_tsf = pow(tsn / (tsn + 1.0f), 1.0f - brl_rng);
-    float brl_exf = (brl + brl_r * ha_rgb.x + brl_g * ha_rgb.y + brl_b * ha_rgb.z) * pow(ach_d, 1.0f / brl_st);
-    float brl_ex = pow(2.0f, brl_exf * (brl_exf < 0.0f ? brl_tsf : 1.0f - brl_tsf));
+    float brl_tsf = safe_pow_pos(safe_div(tsn, tsn + 1.0f, 0.0f, 1e-6f), 1.0f - brl_rng, 0.0f);
+    float brl_exf = (brl + brl_r * ha_rgb.x + brl_g * ha_rgb.y + brl_b * ha_rgb.z) * safe_pow_pos(ach_d, 1.0f / brl_st, 0.0f);
+    float brl_ex = safe_exp2_clamped(brl_exf * (brl_exf < 0.0f ? brl_tsf : 1.0f - brl_tsf));
     tsn *= brl_ex;
   }
 
+  // Stage 8: local contrast / highlight contrast.
   if (tn_lcon_enable) {
-    float lcon_m = pow(2.0f, -tn_lcon), lcon_w = (tn_lcon_w / 4.0f); lcon_w *= lcon_w;
-    const float lcon_cnst_sc = compress_toe_cubic(ts_x0, lcon_m, lcon_w, 1) / ts_x0;
+    float lcon_m = safe_exp2_clamped(-tn_lcon), lcon_w = (tn_lcon_w / 4.0f); lcon_w *= lcon_w;
+    const float lcon_cnst_sc = safe_div(compress_toe_cubic(ts_x0, lcon_m, lcon_w, 1), ts_x0, 0.0f, 1e-6f);
     tsn = compress_toe_cubic(tsn * lcon_cnst_sc, lcon_m, lcon_w, 0);
     if (crv_enable == 1) crv_tsn = compress_toe_cubic(crv_tsn * lcon_cnst_sc, lcon_m, lcon_w, 0);
   }
 
   if (tn_hcon_enable) {
-    float hcon_p = pow(2.0f, tn_hcon);
+    float hcon_p = safe_exp2_clamped(tn_hcon);
     tsn = contrast_high(tsn, hcon_p, tn_hcon_pv, tn_hcon_st, 0);
     if (crv_enable == 1) crv_tsn = contrast_high(crv_tsn, hcon_p, tn_hcon_pv, tn_hcon_st, 0);
   }
 
+  // Stage 9: tone shaping / tonescale application.
   float tsn_pt = compress_hyperbolic_power(tsn, ts_s1, ts_p);
   float tsn_const = compress_hyperbolic_power(tsn, s_Lp100, ts_p);
   tsn = compress_hyperbolic_power(tsn, ts_s, ts_p);
   float crv_tsn_const = 0.0f;
   if (crv_enable == 1) { crv_tsn_const = compress_hyperbolic_power(crv_tsn, s_Lp100, ts_p); crv_tsn = compress_hyperbolic_power(crv_tsn, ts_s, ts_p); }
 
+  // Stage 10: hue contrast / hue shifts.
   if (hc_enable) {
-    float hc_ts = pow(1.0f - tsn_const, 1.0f / hc_r_rng);
+    float hc_ts = safe_pow_pos(1.0f - tsn_const, 1.0f / hc_r_rng, 0.0f);
     float hc_c = (1.0f - tsn_const) * (1.0f - ach_d) + ach_d * tsn_const;
     hc_c *= ach_d * ha_rgb.x;
     float hc_f = hc_r * (hc_c - 2.0f * hc_c * hc_ts) + 1.0f;
@@ -351,30 +429,31 @@ inline float3 openDRTTransform(
   }
 
   if (hs_rgb_enable) {
-    float3 hs_rgb = make_float3(ha_rgb_hs.x * ach_d * pow(tsn_pt, 1.0f / hs_r_rng), ha_rgb_hs.y * ach_d * pow(tsn_pt, 1.0f / hs_g_rng), ha_rgb_hs.z * ach_d * pow(tsn_pt, 1.0f / hs_b_rng));
+    float3 hs_rgb = make_float3(ha_rgb_hs.x * ach_d * safe_pow_pos(tsn_pt, 1.0f / hs_r_rng, 0.0f), ha_rgb_hs.y * ach_d * safe_pow_pos(tsn_pt, 1.0f / hs_g_rng, 0.0f), ha_rgb_hs.z * ach_d * safe_pow_pos(tsn_pt, 1.0f / hs_b_rng, 0.0f));
     float3 hsf = make_float3(hs_rgb.x * hs_r, hs_rgb.y * -hs_g, hs_rgb.z * -hs_b);
     hsf = make_float3(hsf.z - hsf.y, hsf.x - hsf.z, hsf.y - hsf.x);
     rgb += hsf;
   }
   if (hs_cmy_enable) {
     float tsn_pt_compl = 1.0f - tsn_pt;
-    float3 hs_cmy = make_float3(ha_cmy.x * ach_d * pow(tsn_pt_compl, 1.0f / hs_c_rng), ha_cmy.y * ach_d * pow(tsn_pt_compl, 1.0f / hs_m_rng), ha_cmy.z * ach_d * pow(tsn_pt_compl, 1.0f / hs_y_rng));
+    float3 hs_cmy = make_float3(ha_cmy.x * ach_d * safe_pow_pos(tsn_pt_compl, 1.0f / hs_c_rng, 0.0f), ha_cmy.y * ach_d * safe_pow_pos(tsn_pt_compl, 1.0f / hs_m_rng, 0.0f), ha_cmy.z * ach_d * safe_pow_pos(tsn_pt_compl, 1.0f / hs_y_rng, 0.0f));
     float3 hsf = make_float3(hs_cmy.x * -hs_c, hs_cmy.y * hs_m, hs_cmy.z * hs_y);
     hsf = make_float3(hsf.z - hsf.y, hsf.x - hsf.z, hsf.y - hsf.x);
     rgb += hsf;
   }
 
+  // Stage 11: purity / purity luma / purity mid controls.
   float pt_lml_p = 1.0f + 4.0f * (1.0f - tsn_pt) * (pt_lml + pt_lml_r * ha_rgb_hs.x + pt_lml_g * ha_rgb_hs.y + pt_lml_b * ha_rgb_hs.z);
   float ptf = 1.0f;
   if (pt_enable) {
-    ptf = 1.0f - pow(tsn_pt, pt_lml_p);
+    ptf = 1.0f - safe_pow_pos(tsn_pt, pt_lml_p, 0.0f);
     float pt_lmh_p = (1.0f - ach_d * (pt_lmh_r * ha_rgb_hs.x + pt_lmh_b * ha_rgb_hs.z)) * (1.0f - pt_lmh * ach_d);
-    ptf = pow(fmax(1e-6f, ptf), pt_lmh_p);
+    ptf = safe_pow_pos(fmax(1e-6f, ptf), pt_lmh_p, 0.0f);
   }
 
   if (ptm_enable) {
-    float ptm_low_f = (ptm_low_st == 0.0f || ptm_low_rng == 0.0f) ? 1.0f : 1.0f + ptm_low * exp(-2.0f * ach_d * ach_d / ptm_low_st) * pow(1.0f - tsn_const, 1.0f / ptm_low_rng);
-    float ptm_high_f = (ptm_high_st == 0.0f || ptm_high_rng == 0.0f) ? 1.0f : 1.0f + ptm_high * exp(-2.0f * ach_d * ach_d / ptm_high_st) * pow(tsn_pt, 1.0f / (4.0f * ptm_high_rng));
+    float ptm_low_f = (ptm_low_st == 0.0f || ptm_low_rng == 0.0f) ? 1.0f : 1.0f + ptm_low * safe_exp_clamped(-safe_div(2.0f * ach_d * ach_d, ptm_low_st, 0.0f, 1e-6f)) * safe_pow_pos(1.0f - tsn_const, 1.0f / ptm_low_rng, 0.0f);
+    float ptm_high_f = (ptm_high_st == 0.0f || ptm_high_rng == 0.0f) ? 1.0f : 1.0f + ptm_high * safe_exp_clamped(-safe_div(2.0f * ach_d * ach_d, ptm_high_st, 0.0f, 1e-6f)) * safe_pow_pos(tsn_pt, 1.0f / (4.0f * ptm_high_rng), 0.0f);
     ptf *= ptm_low_f * ptm_high_f;
   }
 
@@ -383,19 +462,24 @@ inline float3 openDRTTransform(
   float inv_rs_denom = rs_sa - 1.0f;
   if (fabs(inv_rs_denom) < 1e-6f) inv_rs_denom = inv_rs_denom < 0.0f ? -1e-6f : 1e-6f;
   rgb = (sat_L * rs_sa - rgb) / inv_rs_denom;
-  rgb = display_gamut_whitepoint(rgb, tsn_const, cwp_lm, display_gamut, cwp);
 
+  // Stage 12: display gamut whitepoint adaptation.
+  rgb = display_gamut_whitepoint(rgb, tsn_const, cwp_lm, display_gamut, cwp);
+  ME_STAGE_RETURN(12, rgb);
+
+  // Stage 13: brilliance-plus.
   if (brlp_enable) {
     float2 brlp_opp = opponent(rgb);
     float brlp_ach_d = hypotf2(brlp_opp) / 4.0f;
-    brlp_ach_d = 1.1f * (brlp_ach_d * brlp_ach_d / (brlp_ach_d + 0.1f));
+    brlp_ach_d = 1.1f * safe_div(brlp_ach_d * brlp_ach_d, brlp_ach_d + 0.1f, 0.0f, 1e-6f);
     float3 brlp_ha_rgb = ach_d * ha_rgb;
     float brlp_m = brlp + brlp_r * brlp_ha_rgb.x + brlp_g * brlp_ha_rgb.y + brlp_b * brlp_ha_rgb.z;
-    rgb *= pow(2.0f, brlp_m * brlp_ach_d * tsn);
+    rgb *= safe_exp2_clamped(brlp_m * brlp_ach_d * tsn);
   }
 
   if (ptl_enable) rgb = make_float3(softplus(rgb.x, ptl_c), softplus(rgb.y, ptl_m), softplus(rgb.z, ptl_y));
 
+  // Stage 14: display gamut conversion.
   tsn = compress_toe_quadratic(tsn * ts_m2, tn_toe, 0) * ts_dsc;
   if (crv_enable == 1) {
     crv_tsn = compress_toe_quadratic(crv_tsn * ts_m2, tn_toe, 0) * ts_dsc;
@@ -407,21 +491,25 @@ inline float3 openDRTTransform(
 
   if (display_gamut == 2) { rgb = vdot(matrix_p3_to_rec2020, clampminf3(rgb, 0.0f)); }
   if (clamp) rgb = clampf3(rgb, 0.0f, 1.0f);
+  ME_STAGE_RETURN(14, rgb);
 
+  // Stage 15: final EOTF / clamp.
   float eotf_p = 2.0f + eotf * 0.2f;
   if ((eotf > 0) && (eotf < 4)) rgb = spowf3(rgb, 1.0f / eotf_p);
   else if (eotf == 4) rgb = eotf_pq(rgb, 1);
   else if (eotf == 5) rgb = eotf_hlg(rgb, 1);
+  ME_STAGE_RETURN(15, rgb);
 
+  // Stage 16: optional curve overlay branch.
   if (crv_enable == 1) {
     if ((eotf > 0) && (eotf < 4)) crv_rgb = spowf3(crv_rgb, 1.0f / eotf_p);
     else if (eotf == 4) crv_rgb = eotf_pq(crv_rgb, 1);
     else if (eotf == 5) crv_rgb = eotf_hlg(crv_rgb, 1);
     float3 crv_rgb_dst = make_float3(pos.y - crv_rgb.x * res.y, pos.y - crv_rgb.y * res.y, pos.y - crv_rgb.z * res.y);
     float crv_w0 = 0.35f;
-    crv_rgb_dst.x = exp(-crv_rgb_dst.x * crv_rgb_dst.x * crv_w0);
-    crv_rgb_dst.y = exp(-crv_rgb_dst.y * crv_rgb_dst.y * crv_w0);
-    crv_rgb_dst.z = exp(-crv_rgb_dst.z * crv_rgb_dst.z * crv_w0);
+    crv_rgb_dst.x = safe_exp_clamped(-crv_rgb_dst.x * crv_rgb_dst.x * crv_w0);
+    crv_rgb_dst.y = safe_exp_clamped(-crv_rgb_dst.y * crv_rgb_dst.y * crv_w0);
+    crv_rgb_dst.z = safe_exp_clamped(-crv_rgb_dst.z * crv_rgb_dst.z * crv_w0);
     crv_rgb_dst = clampf3(crv_rgb_dst, 0.0f, 1.0f);
     rgb = rgb * (1.0f - crv_rgb_dst) + make_float3(1.0f, 1.0f, 1.0f) * crv_rgb_dst;
   }
