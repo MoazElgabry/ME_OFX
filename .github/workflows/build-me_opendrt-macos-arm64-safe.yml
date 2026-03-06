@@ -1,0 +1,80 @@
+name: Build ME_OpenDRT macOS arm64 (safe Metal math required)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+env:
+  OPENDRT_VERSION: v1.2.8
+
+jobs:
+  build-macos-arm64-safe:
+    runs-on: macos-14
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: ME_OpenDRT/source
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Report macOS toolchain
+        run: |
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          xcrun metal -v || true
+
+      - name: Ensure build tools are available
+        run: |
+          if command -v ninja >/dev/null 2>&1; then
+            echo "ninja already available: $(command -v ninja)"
+            ninja --version
+          else
+            brew install ninja
+          fi
+
+      - name: Require Metal safe/precise math flags
+        run: |
+          cat > /tmp/me_opendrt_flag_probe.metal <<'EOF'
+          kernel void flag_probe(device float* dst [[buffer(0)]], uint tid [[thread_position_in_grid]]) { dst[tid] = 0.0; }
+          EOF
+          xcrun -sdk macosx metal \
+            -std=macos-metal2.4 \
+            -fmetal-math-mode=safe \
+            -fmetal-math-fp32-functions=precise \
+            -mmacosx-version-min=13.0 \
+            -c /tmp/me_opendrt_flag_probe.metal \
+            -o /tmp/me_opendrt_flag_probe.air
+          echo "Confirmed Metal safe/precise math flags are supported on this runner."
+
+      - name: Configure
+        run: cmake -S . -B build-mac -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 -DME_OPENDRT_BUILD_CUBE_VIEWER_STUB=ON -DME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW=ON
+
+      - name: Build
+        run: cmake --build build-mac --config Release
+
+      - name: Verify bundle outputs
+        run: |
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT_CubeViewer
+          test -f bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib
+          otool -l bundle/ME_OpenDRT.ofx.bundle/Contents/MacOS/ME_OpenDRT.ofx | grep -A3 LC_BUILD_VERSION | grep -q "minos 13.0"
+          strings bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -E -q "air64-apple-macosx13(\\.|$)"
+          xcrun metal-objdump -t bundle/ME_OpenDRT.ofx.bundle/Contents/Resources/OpenDRT.metallib | grep -q "OpenDRTKernel"
+
+      - name: Package macOS portable bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            bundle/ME_OpenDRT.ofx.bundle \
+            ../../ME_OpenDRT_v1.2.8_macOS_arm64_safe_math_portable.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ME_OpenDRT-v1.2.8-macos-arm64-safe-math
+          path: ME_OpenDRT_v1.2.8_macOS_arm64_safe_math_portable.zip
