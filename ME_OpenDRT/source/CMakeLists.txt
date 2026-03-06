@@ -143,7 +143,7 @@ if(APPLE)
   add_custom_command(
     OUTPUT "${METAL_AIR}"
     # Use a broadly compatible Metal language version for Intel + Apple Silicon hosts.
-    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
+    COMMAND "${XCRUN_EXECUTABLE}" -sdk macosx metal -std=macos-metal2.4 -fmetal-math-mode=safe -fmetal-math-fp32-functions=precise -mmacosx-version-min=${METAL_MIN_OS} -c "${METAL_SRC}" -o "${METAL_AIR}"
     DEPENDS "${METAL_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}/src/OpenDRTParams.h"
     VERBATIM
   )

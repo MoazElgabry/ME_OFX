@@ -2525,14 +2525,22 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerIdentity") {
-        setChoice("cubeViewerSource", getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1);
+        const int desiredSource = getBool("cubeViewerIdentity", args.time, 1) ? 0 : 1;
+        if (getChoice("cubeViewerSource", args.time, 0) != desiredSource) {
+          FlagScope scope(suppressParamChanged_);
+          setChoice("cubeViewerSource", desiredSource);
+        }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
         return;
       }
       if (paramName == "cubeViewerSource") {
-        setBool("cubeViewerIdentity", getChoice("cubeViewerSource", args.time, 0) == 0 ? 1 : 0);
+        const bool desiredIdentity = (getChoice("cubeViewerSource", args.time, 0) == 0);
+        if (getBool("cubeViewerIdentity", args.time, 1) != (desiredIdentity ? 1 : 0)) {
+          FlagScope scope(suppressParamChanged_);
+          setBool("cubeViewerIdentity", desiredIdentity);
+        }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
