@@ -68,7 +68,8 @@ jobs:
       - name: Install deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libglfw3-dev libx11-dev libxcursor-dev libxinerama-dev libxi-dev libxrandr-dev libxxf86vm-dev libgl1-mesa-dev
+          sudo apt-get install -y cmake ninja-build g++ ocl-icd-opencl-dev libglfw3-dev libgl1-mesa-dev xvfb
+          sudo apt-get install -y nvidia-cuda-toolkit
       - name: Configure
         run: |
           cmake -S . -B build-linux -G Ninja \
