@@ -4411,10 +4411,33 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   }
 
   // Render-thread viewer liveness probe: keeps streaming gate/state up to date during playback.
- void refreshCubeViewerRuntimeStateRenderSafe() {
+  void refreshCubeViewerRuntimeStateRenderSafe() {
     // Stability-first: never perform viewer socket heartbeat probes on the render thread.
     // UI/status monitoring keeps connection state fresh on its own thread.
     return;
+  }
+
+  void disconnectCubeViewerSessionLocal(const std::string& status) {
+    cubeViewerRequested_ = false;
+    cubeViewerConnected_ = false;
+    cubeViewerProcessId_ = 0;
+    cubeViewerWindowUsable_ = false;
+    cubeViewerLastStateVisible_ = false;
+    cubeViewerLastStateMinimized_ = false;
+    cubeViewerLastStateFocused_ = false;
+    cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
+    cubeViewerHeartbeatFailCount_ = 0;
+    cubeViewerRenderProbeFailCount_ = 0;
+    cubeViewerInputCloudRefreshPending_ = false;
+    cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+    {
+      std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
+      cubeViewerPendingCloud_ = false;
+      cubeViewerPendingParams_ = false;
+    }
+    setCubeViewerStatusLabel(status);
   }
 
   // UI-thread heartbeat: keeps status label truthful and detects stale/disconnected viewer sessions.
@@ -4449,6 +4472,16 @@ void refreshCubeViewerConnectionHealth() {
     int minimized = 0;
     int focused = 1;
     if (sendCubeViewerHeartbeatProbe(&active, &visible, &minimized, &focused)) {
+      if (visible == 0) {
+        cubeViewerDebugLog("Cube viewer heartbeat reports hidden window; auto-disconnecting local session.");
+        disconnectCubeViewerSessionLocal("Disconnected (window hidden)");
+        return;
+      }
+      if (minimized != 0) {
+        cubeViewerDebugLog("Cube viewer heartbeat reports minimized window; auto-disconnecting local session.");
+        disconnectCubeViewerSessionLocal("Disconnected (minimized)");
+        return;
+      }
       cubeViewerHeartbeatFailCount_ = 0;
       cubeViewerConnected_ = true;
       cubeViewerWindowUsable_ = (active != 0 && visible != 0 && minimized == 0);
@@ -4466,12 +4499,8 @@ void refreshCubeViewerConnectionHealth() {
     } else {
       ++cubeViewerHeartbeatFailCount_;
       if (cubeViewerHeartbeatFailCount_ >= 3) {
-        cubeViewerConnected_ = false;
-        cubeViewerWindowUsable_ = false;
-        cubeViewerLastStateVisible_ = false;
-        cubeViewerLastStateMinimized_ = false;
-        cubeViewerLastStateFocused_ = false;
-        setCubeViewerStatusLabel("Disconnected");
+        cubeViewerDebugLog("Cube viewer heartbeat failed repeatedly; auto-disconnecting local session.");
+        disconnectCubeViewerSessionLocal("Disconnected");
       }
     }
   }
@@ -4865,19 +4894,7 @@ void closeCubeViewerSession() {
     }
     // Local disconnect only: keep external viewer process alive.
     // Open action can re-attach to an existing viewer instance.
-    cubeViewerRequested_ = false;
-    cubeViewerConnected_ = false;
-    cubeViewerProcessId_ = 0;
-    cubeViewerWindowUsable_ = false;
-    cubeViewerLastStateVisible_ = false;
-    cubeViewerLastStateMinimized_ = false;
-    cubeViewerLastStateFocused_ = false;
-    cubeViewerLastHeartbeatAt_ = std::chrono::steady_clock::time_point::min();
-    cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
-    cubeViewerLastRenderProbeAt_ = std::chrono::steady_clock::time_point::min();
-    cubeViewerHeartbeatFailCount_ = 0;
-    cubeViewerRenderProbeFailCount_ = 0;
-    setCubeViewerStatusLabel("Disconnected");
+    disconnectCubeViewerSessionLocal("Disconnected");
   }
 
   OpenDRTRawValues readRawValues(double time) const {
