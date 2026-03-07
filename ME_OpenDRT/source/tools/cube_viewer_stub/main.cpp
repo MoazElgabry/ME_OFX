@@ -82,7 +82,7 @@ void logViewerEvent(const std::string& msg) {
 #endif
 }
 
-const char* kViewerVersionString = "v1.2.9";
+const char* kViewerVersionString = "v1.2.9b";
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -489,19 +489,23 @@ std::string handleIncomingLine(const std::string& line) {
   if (line.empty()) return std::string();
   if (line.find("\"type\":\"hello\"") != std::string::npos || line.find("\"type\":\"open_session\"") != std::string::npos) {
     gConnected.store(true);
+    logViewerEvent("Received session hello/open_session.");
     return std::string();
   }
   if (line.find("\"type\":\"close_session\"") != std::string::npos) {
+    logViewerEvent("Received close_session.");
     gRun.store(false);
     return std::string();
   }
   if (line.find("\"type\":\"heartbeat\"") != std::string::npos) {
     gConnected.store(true);
+    logViewerEvent("Received heartbeat.");
     return heartbeatAckJson();
   }
   if (line.find("\"type\":\"bring_to_front\"") != std::string::npos) {
     gBringToFront.store(true);
     gConnected.store(true);
+    logViewerEvent("Received bring_to_front.");
     return std::string();
   }
   ResolvedPayload payload{};
@@ -511,10 +515,24 @@ std::string handleIncomingLine(const std::string& line) {
   if (!isParams && !isCloud) return std::string();
   std::lock_guard<std::mutex> lock(gMsgMutex);
   if (isParams) {
+    std::ostringstream os;
+    os << "Queued params message: sender=" << payload.senderId
+       << " seq=" << payload.seq
+       << " sourceMode=" << payload.sourceMode
+       << " quality=" << payload.quality
+       << " res=" << payload.resolution;
+    logViewerEvent(os.str());
     gPendingParamsMsg.seq = payload.seq;
     gPendingParamsMsg.line = line;
     gHasPendingParamsMsg = true;
   } else {
+    std::ostringstream os;
+    os << "Queued input cloud message: sender=" << cloud.senderId
+       << " seq=" << cloud.seq
+       << " quality=" << cloud.quality
+       << " res=" << cloud.resolution
+       << " pointBytes=" << cloud.points.size();
+    logViewerEvent(os.str());
     gPendingCloudMsg.seq = cloud.seq;
     gPendingCloudMsg.line = line;
     gHasPendingCloudMsg = true;
@@ -872,6 +890,7 @@ struct AppState {
   CameraState cam;
   bool leftDown = false;
   bool panMode = false;
+  bool zoomMode = false;
   bool keepOnTop = false;
   bool appliedTopmost = false;
   std::string currentSourceMode = "identity";
@@ -893,7 +912,12 @@ void onWindowClose(GLFWwindow*) {
 void onScroll(GLFWwindow* window, double, double yoff) {
   auto* app = reinterpret_cast<AppState*>(glfwGetWindowUserPointer(window));
   if (!app) return;
-  app->scrollAccum += static_cast<float>(yoff);
+  const bool shift =
+      (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+  const bool ctrl =
+      (glfwGetKey(window, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS || glfwGetKey(window, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+  const float scale = (shift || ctrl) ? 0.35f : 1.0f;
+  app->scrollAccum += static_cast<float>(yoff) * scale;
 }
 
 void processMouseAndKeys(GLFWwindow* window, AppState* app) {
@@ -909,7 +933,8 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
 
   if (anyDown && !app->leftDown) {
     app->leftDown = true;
-    app->panMode = (m == GLFW_PRESS) || (r == GLFW_PRESS) || shift;
+    app->zoomMode = (r == GLFW_PRESS);
+    app->panMode = !app->zoomMode && ((m == GLFW_PRESS) || shift);
     app->lastX = cx;
     app->lastY = cy;
     const double now = glfwGetTime();
@@ -920,6 +945,7 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
   } else if (!anyDown && app->leftDown) {
     app->leftDown = false;
     app->panMode = false;
+    app->zoomMode = false;
   }
 
   if (app->leftDown) {
@@ -927,7 +953,12 @@ void processMouseAndKeys(GLFWwindow* window, AppState* app) {
     const float dy = static_cast<float>(cy - app->lastY);
     app->lastX = cx;
     app->lastY = cy;
-    if (app->panMode) {
+    if (app->zoomMode) {
+      const float zoomFactor = std::exp(dy * 0.0105f);
+      app->cam.distance *= zoomFactor;
+      if (app->cam.distance < 0.6f) app->cam.distance = 0.6f;
+      if (app->cam.distance > 30.0f) app->cam.distance = 30.0f;
+    } else if (app->panMode) {
       const float panScale = 0.0022f * app->cam.distance;
       app->cam.panX += dx * panScale;
       app->cam.panY -= dy * panScale;
@@ -1077,14 +1108,25 @@ int runApp() {
       ResolvedPayload rp{};
       try {
         if (parseParamsMessage(pendingParams.line, &rp)) {
+          {
+            std::ostringstream os;
+            os << "Params received: sender=" << rp.senderId
+               << " seq=" << rp.seq
+               << " sourceMode=" << rp.sourceMode
+               << " quality=" << rp.quality
+               << " res=" << rp.resolution
+               << " hash=" << rp.paramHash;
+            logViewerEvent(os.str());
+          }
           if (!rp.senderId.empty() && rp.senderId != app.currentSenderId) {
             app.currentSenderId = rp.senderId;
             lastParamsSeq = 0;
             lastCloudSeq = 0;
             hasDeferredCloud = false;
+            logViewerEvent("Active sender changed; reset params/cloud sequence tracking.");
           }
           if (rp.seq < lastParamsSeq) {
-            // Ignore stale param snapshots/deltas within the params stream.
+            logViewerEvent("Ignored stale params sequence.");
           } else {
             lastParamsSeq = rp.seq;
             const std::string prevSourceMode = app.currentSourceMode;
@@ -1106,6 +1148,7 @@ int runApp() {
                 // Reset pan only when switching modes so stale framing does not hide the cloud.
                 app.cam.panX = 0.0f;
                 app.cam.panY = 0.0f;
+                logViewerEvent("Params switched source mode to input.");
               }
               if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
                   senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
@@ -1130,6 +1173,16 @@ int runApp() {
       InputCloudPayload cp{};
       try {
         if (parseInputCloudMessage(pendingCloud.line, &cp)) {
+          {
+            std::ostringstream os;
+            os << "Input cloud received: sender=" << cp.senderId
+               << " seq=" << cp.seq
+               << " quality=" << cp.quality
+               << " res=" << cp.resolution
+               << " pointBytes=" << cp.points.size()
+               << " sourceMode=" << app.currentSourceMode;
+            logViewerEvent(os.str());
+          }
           if (!senderMatchesCurrent(app.currentSenderId, cp.senderId)) {
             // Ignore clouds from a different OFX instance than the active sender.
             logViewerEvent("Ignored input cloud from non-active sender.");
@@ -1145,6 +1198,16 @@ int runApp() {
               mesh = std::move(nextMesh);
               lastCloudSeq = cp.seq;
               hasDeferredCloud = false;
+              {
+                std::ostringstream os;
+                os << "Applied input cloud: seq=" << cp.seq
+                   << " points=" << (mesh.pointVerts.size() / 3u)
+                   << " quality=" << mesh.quality
+                   << " hash=" << mesh.paramHash;
+                logViewerEvent(os.str());
+              }
+            } else {
+              logViewerEvent("Input cloud payload parsed but mesh build failed.");
             }
           }
         }
