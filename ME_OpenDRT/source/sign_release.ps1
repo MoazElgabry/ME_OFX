@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 
 $signtool = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe"
 $plugin   = "C:\Users\mizo_\OneDrive\Documents\GitHub\OpenDRT-OFX\bundle\ME_OpenDRT.ofx.bundle\Contents\Win64\ME_OpenDRT.ofx"
-$installer= "C:\Users\mizo_\OneDrive\Documents\GitHub\OpenDRT-OFX\installer\ME_OpenDRT_v1.2.8b_Windows_cuda_opencl_Installer.exe"
+$installer= "C:\Users\mizo_\OneDrive\Documents\GitHub\OpenDRT-OFX\installer\ME_OpenDRT_v1.2.9_Windows_cuda_opencl_Installer.exe"
 $pfx      = "$env:USERPROFILE\Desktop\ME_OpenDRT_SelfSign.pfx"
 
 if (!(Test-Path $signtool)) { throw "signtool not found: $signtool" }

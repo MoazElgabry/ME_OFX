@@ -42,6 +42,7 @@ struct ThreadBuffers {
   size_t hostTempSrcBytes = 0;
   id<MTLBuffer> hostTempDstBuffer = nil;
   size_t hostTempDstBytes = 0;
+  id<MTLCommandBuffer> hostInFlightCmd = nil;
   id<MTLBuffer> hostReadbackSrcBuffer = nil;
   size_t hostReadbackSrcBytes = 0;
   id<MTLBuffer> hostReadbackDstBuffer = nil;
@@ -233,6 +234,60 @@ void perfLogStage(const char* stage, const std::chrono::steady_clock::time_point
       std::fclose(f);
     }
   }
+}
+
+void clearInFlightHostCommand(ThreadBuffers& buffers) {
+#if __has_feature(objc_arc)
+  buffers.hostInFlightCmd = nil;
+#else
+  if (buffers.hostInFlightCmd != nil) {
+    [buffers.hostInFlightCmd release];
+    buffers.hostInFlightCmd = nil;
+  }
+#endif
+}
+
+void storeInFlightHostCommand(ThreadBuffers& buffers, id<MTLCommandBuffer> cmd) {
+#if __has_feature(objc_arc)
+  buffers.hostInFlightCmd = cmd;
+#else
+  if (buffers.hostInFlightCmd == cmd) return;
+  if (buffers.hostInFlightCmd != nil) [buffers.hostInFlightCmd release];
+  buffers.hostInFlightCmd = (cmd != nil) ? [cmd retain] : nil;
+#endif
+}
+
+bool finishInFlightHostCommandIfNeeded(MetalContext& ctx, ThreadBuffers& buffers, const char* reason) {
+  id<MTLCommandBuffer> inFlight = buffers.hostInFlightCmd;
+  if (inFlight == nil) return true;
+  [inFlight waitUntilCompleted];
+  const bool ok = (inFlight.status == MTLCommandBufferStatusCompleted);
+  if (!ok) {
+    ctx.hostAsyncErrorCount.fetch_add(1, std::memory_order_relaxed);
+    ctx.hostTemporarilyDisabled.store(true, std::memory_order_relaxed);
+    if (inFlight.error != nil) {
+      NSLog(@"ME_OpenDRT Metal host in-flight failure (%s): %@", reason, inFlight.error.localizedDescription);
+    } else {
+      NSLog(@"ME_OpenDRT Metal host in-flight failure (%s): unknown error", reason);
+    }
+    if (metalDiagEnabled()) {
+      std::ostringstream oss;
+      oss << "sync-reuse-complete status=" << static_cast<int>(inFlight.status)
+          << " reason=" << reason
+          << " errors=" << ctx.hostAsyncErrorCount.load(std::memory_order_relaxed);
+      diagLog(oss.str());
+    }
+    clearInFlightHostCommand(buffers);
+    return false;
+  }
+  ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+  if (metalDiagEnabled()) {
+    std::ostringstream oss;
+    oss << "sync-reuse-complete status=COMPLETED reason=" << reason << " errors=0";
+    diagLog(oss.str());
+  }
+  clearInFlightHostCommand(buffers);
+  return true;
 }
 
 void copyBufferToHostRows(
@@ -682,8 +737,12 @@ bool renderHost(
     kernelSrcOffset = 0;
     diagLog("alias-protect enabled: src/dst overlap on same host buffer.");
   }
+  auto& buffers = threadBuffers();
   if (!forceHostMetalWait() && useHostIntermediateDst()) {
-    auto& buffers = threadBuffers();
+    if (!finishInFlightHostCommandIfNeeded(ctx, buffers, "renderHost reuse")) {
+      debugLog("Previous host Metal command failed before temp dst reuse.");
+      return false;
+    }
     if (buffers.hostTempDstBuffer == nil || buffers.hostTempDstBytes < requiredDstBytes) {
       buffers.hostTempDstBuffer = [ctx.device newBufferWithLength:requiredDstBytes options:MTLResourceStorageModeShared];
       buffers.hostTempDstBytes = (buffers.hostTempDstBuffer != nil) ? requiredDstBytes : 0;
@@ -754,31 +813,6 @@ bool renderHost(
                     size:requiredDstBytes];
     [blit endEncoding];
   }
-  if (!forceHostMetalWait()) {
-    [cmd addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-      if (cb.status != MTLCommandBufferStatusCompleted) {
-        context().hostAsyncErrorCount.fetch_add(1, std::memory_order_relaxed);
-        if (debugLogEnabled()) {
-          if (cb.error != nil) {
-            NSLog(@"ME_OpenDRT Metal host async failure: %@", cb.error.localizedDescription);
-          } else {
-            NSLog(@"ME_OpenDRT Metal host async failure with unknown error");
-          }
-        }
-        if (metalDiagEnabled()) {
-          std::ostringstream oss;
-          oss << "async-complete status=" << static_cast<int>(cb.status)
-              << " errors=" << context().hostAsyncErrorCount.load(std::memory_order_relaxed);
-          diagLog(oss.str());
-        }
-      } else {
-        context().hostAsyncErrorCount.store(0, std::memory_order_relaxed);
-        if (metalDiagEnabled()) {
-          diagLog("async-complete status=COMPLETED errors=0");
-        }
-      }
-    }];
-  }
   [cmd commit];
 
   if (forceHostMetalWait()) {
@@ -791,18 +825,24 @@ bool renderHost(
       return false;
     }
     ctx.hostAsyncErrorCount.store(0, std::memory_order_relaxed);
+    clearInFlightHostCommand(buffers);
     if (metalDiagEnabled()) {
       diagLog("sync-complete status=COMPLETED errors=0");
+    }
+  } else if (kernelDstBuffer != dstBuffer) {
+    storeInFlightHostCommand(buffers, cmd);
+    if (metalDiagEnabled()) {
+      diagLog("async-queued status=PENDING reuse=TEMP_DST");
+    }
+  } else {
+    clearInFlightHostCommand(buffers);
+    if (metalDiagEnabled()) {
+      diagLog("async-queued status=PENDING reuse=DST_DIRECT");
     }
   }
 
   if (!forceHostMetalWait()) {
-    const int errors = ctx.hostAsyncErrorCount.load(std::memory_order_relaxed);
-    if (errors >= 3) {
-      ctx.hostTemporarilyDisabled.store(true, std::memory_order_relaxed);
-      debugLog("Host Metal path auto-disabled after repeated async errors.");
-      return false;
-    }
+    ctx.hostTemporarilyDisabled.store(false, std::memory_order_relaxed);
   }
 
   perfLogStage("Metal host total", tStart);
@@ -902,6 +942,10 @@ bool renderHostReadback(
   }
 
   auto& buffers = threadBuffers();
+  if (!finishInFlightHostCommandIfNeeded(ctx, buffers, "renderHostReadback")) {
+    debugLog("Previous host Metal command failed before readback.");
+    return false;
+  }
   id<MTLBuffer> kernelSrcBuffer = srcBuffer;
   size_t kernelSrcOffset = srcOffsetBytes;
   id<MTLBuffer> kernelDstBuffer = dstBuffer;

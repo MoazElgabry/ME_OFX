@@ -200,8 +200,11 @@ inline float compress_hyperbolic_power(float x, float s, float p) {
 }
 inline float compress_toe_quadratic(float x, float toe, int inv) {
   if (toe == 0.0f) return x;
-  if (inv == 0) return safe_div(spowf(x, 2.0f), x + toe, 0.0f, 1e-6f);
-  const float radicand = x * (4.0f * toe + x);
+  if (inv == 0) {
+    const float xPos = fmax(0.0f, x);
+    return safe_div(xPos * xPos, xPos + toe, 0.0f, 1e-6f);
+  }
+  const float radicand = fmax(0.0f, x * (4.0f * toe + x));
   return (x + safe_sqrt(radicand)) / 2.0f;
 }
 inline float compress_toe_cubic(float x, float m, float w, int inv) {

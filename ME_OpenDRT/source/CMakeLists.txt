@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.8 LANGUAGES CXX)
-set(OPENDRT_DISPLAY_VERSION "1.2.8b")
+project(ME_OpenDRT VERSION 1.2.9 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.9")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)

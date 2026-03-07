@@ -2722,10 +2722,22 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         int preset = getChoice("displayEncodingPreset", args.time, 0);
         FlagScope scope(suppressParamChanged_);
         writeDisplayPresetToParams(preset, *this);
+        const int eotf = getChoice("eotf", args.time, 2);
+        if (eotf == 4 || eotf == 5) {
+          setDouble("tn_Lp", 1000.0);
+        }
         updatePresetStateFromCurrent(args.time);
         updateReadonlyDisplayLabels(args.time);
         pushCubeViewerUpdate(args.time, paramName, true);
         return;
+      }
+
+      if (paramName == "eotf") {
+        const int eotf = getChoice("eotf", args.time, 2);
+        if (eotf == 4 || eotf == 5) {
+          FlagScope scope(suppressParamChanged_);
+          setDouble("tn_Lp", 1000.0);
+        }
       }
 
       // ----- Preset State: Discard all modifications to current baseline -----
@@ -3309,7 +3321,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   bool isVisibilityToggleParam(const std::string& name) const {
     static const std::vector<std::string> names = {
       "tn_hcon_enable","tn_lcon_enable",
-      "ptl_enable","ptm_enable",
+      "pt_enable","ptl_enable","ptm_enable",
       "brl_enable","brlp_enable",
       "hc_enable","hs_rgb_enable","hs_cmy_enable"
     };
@@ -3976,6 +3988,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
   void updateToggleVisibility(double t) {
     const bool hcon = getBool("tn_hcon_enable", t, 0) != 0;
     const bool lcon = getBool("tn_lcon_enable", t, 0) != 0;
+    const bool pt = getBool("pt_enable", t, 1) != 0;
     const bool ptl = getBool("ptl_enable", t, 1) != 0;
     const bool ptm = getBool("ptm_enable", t, 1) != 0;
     const bool brl = getBool("brl_enable", t, 1) != 0;
@@ -3987,6 +4000,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     if (visibilityCacheInit_ &&
         hcon == vis_hcon_ &&
         lcon == vis_lcon_ &&
+        pt == vis_pt_ &&
         ptl == vis_ptl_ &&
         ptm == vis_ptm_ &&
         brl == vis_brl_ &&
@@ -3999,6 +4013,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
 
     const bool applyHcon = !visibilityCacheInit_ || hcon != vis_hcon_;
     const bool applyLcon = !visibilityCacheInit_ || lcon != vis_lcon_;
+    const bool applyPt = !visibilityCacheInit_ || pt != vis_pt_;
     const bool applyPtl = !visibilityCacheInit_ || ptl != vis_ptl_;
     const bool applyPtm = !visibilityCacheInit_ || ptm != vis_ptm_;
     const bool applyBrl = !visibilityCacheInit_ || brl != vis_brl_;
@@ -4015,6 +4030,15 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     if (applyLcon) {
       setParamVisible("tn_lcon", lcon);
       setParamVisible("tn_lcon_w", lcon);
+    }
+    if (applyPt) {
+      setParamVisible("pt_lml", pt);
+      setParamVisible("pt_lml_r", pt);
+      setParamVisible("pt_lml_g", pt);
+      setParamVisible("pt_lml_b", pt);
+      setParamVisible("pt_lmh", pt);
+      setParamVisible("pt_lmh_r", pt);
+      setParamVisible("pt_lmh_b", pt);
     }
     if (applyPtl) {
       setParamVisible("ptl_c", ptl);
@@ -4066,6 +4090,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
 
     vis_hcon_ = hcon;
     vis_lcon_ = lcon;
+    vis_pt_ = pt;
     vis_ptl_ = ptl;
     vis_ptm_ = ptm;
     vis_brl_ = brl;
@@ -4863,6 +4888,7 @@ void closeCubeViewerSession() {
   bool visibilityCacheInit_ = false;
   bool vis_hcon_ = false;
   bool vis_lcon_ = false;
+  bool vis_pt_ = false;
   bool vis_ptl_ = false;
   bool vis_ptm_ = false;
   bool vis_brl_ = false;
@@ -4930,7 +4956,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.2.8b";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.9";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -4971,6 +4997,8 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* pUserPresets = d.definePageParam("User Preset Manager");
     auto* pBasic = d.definePageParam("Basic");
+    auto* pDisplayEncoding = d.definePageParam("Display Encoding");
+    auto* pDrtLook = d.definePageParam("DRT Look");
     auto* pAdvanced = d.definePageParam("Advanced Look Control");
     auto* pCubeViewer = d.definePageParam("Cube Viewer");
     auto* pSupport = d.definePageParam("Support");
@@ -5019,68 +5047,67 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     surroundLabel->setLabel("Effective Surround");
     surroundLabel->setDefault("Dim");
     surroundLabel->setEnabled(false);
-    auto* grpLookBasic = d.defineGroupParam("grp_look_basic");
-    grpLookBasic->setLabel("Basic");
-    grpLookBasic->setOpen(true);
-    inGamut->setParent(*grpLookBasic);
-    inOetf->setParent(*grpLookBasic);
-    dep->setParent(*grpLookBasic);
-    lookPreset->setParent(*grpLookBasic);
-    presetState->setParent(*grpLookBasic);
-    cwpHidden->setParent(*grpLookBasic);
-    activeUserLookSlot->setParent(*grpLookBasic);
-    activeUserToneSlot->setParent(*grpLookBasic);
-    tonescalePreset->setParent(*grpLookBasic);
-    cwpPreset->setParent(*grpLookBasic);
-    cwpLm->setParent(*grpLookBasic);
-    baseWpLabel->setParent(*grpLookBasic);
-    surroundLabel->setParent(*grpLookBasic);
+    auto* grpBasicRoot = d.defineGroupParam("grp_basic_root");
+    grpBasicRoot->setLabel("Basic");
+    grpBasicRoot->setOpen(true);
+    inGamut->setParent(*grpBasicRoot);
+    inOetf->setParent(*grpBasicRoot);
+    dep->setParent(*grpBasicRoot);
+    presetState->setParent(*grpBasicRoot);
+    cwpHidden->setParent(*grpBasicRoot);
+    activeUserLookSlot->setParent(*grpBasicRoot);
+    activeUserToneSlot->setParent(*grpBasicRoot);
+    auto* grpDrtLook = d.defineGroupParam("grp_drt_look");
+    grpDrtLook->setLabel("DRT Look");
+    grpDrtLook->setOpen(true);
+    lookPreset->setParent(*grpDrtLook);
+    tonescalePreset->setParent(*grpDrtLook);
+    cwpPreset->setParent(*grpDrtLook);
+    cwpLm->setParent(*grpDrtLook);
+    baseWpLabel->setParent(*grpDrtLook);
+    surroundLabel->setParent(*grpDrtLook);
     auto* discardPresetChanges = d.definePushButtonParam("discardPresetChanges");
     discardPresetChanges->setLabel("Discard Changes");
     discardPresetChanges->setEnabled(false);
-    discardPresetChanges->setParent(*grpLookBasic);
-    pBasic->addChild(*grpLookBasic);
+    discardPresetChanges->setParent(*grpDrtLook);
+    pBasic->addChild(*grpBasicRoot);
     pBasic->addChild(*inGamut);
     pBasic->addChild(*inOetf);
     pBasic->addChild(*dep);
-    pBasic->addChild(*lookPreset);
     pBasic->addChild(*presetState);
     pBasic->addChild(*cwpHidden);
     pBasic->addChild(*activeUserLookSlot);
     pBasic->addChild(*activeUserToneSlot);
-    pBasic->addChild(*tonescalePreset);
-    pBasic->addChild(*cwpPreset);
-    pBasic->addChild(*cwpLm);
-    pBasic->addChild(*baseWpLabel);
-    pBasic->addChild(*surroundLabel);
-    pBasic->addChild(*discardPresetChanges);
 
     auto* overlay = d.defineBooleanParam("crv_enable");
     overlay->setLabel("Tonescale Overlay");
     overlay->setDefault(false);
     if (const char* hint = tooltipForParam("crv_enable")) overlay->setHint(hint);
-    overlay->setParent(*grpLookBasic);
-    pBasic->addChild(*overlay);
-
+    overlay->setParent(*grpDrtLook);
     auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
-    auto* grpDisplayMapping = d.defineGroupParam("grp_display_mapping"); grpDisplayMapping->setLabel("Display Mapping"); grpDisplayMapping->setOpen(false); grpDisplayMapping->setParent(*grpAdvancedRoot);
     auto* grpTone = d.defineGroupParam("grp_tonescale"); grpTone->setLabel("Tonescale"); grpTone->setOpen(false); grpTone->setParent(*grpAdvancedRoot);
     auto* grpRender = d.defineGroupParam("grp_render"); grpRender->setLabel("Render Space"); grpRender->setOpen(false); grpRender->setParent(*grpAdvancedRoot);
     auto* grpMidPurity = d.defineGroupParam("grp_mid_purity"); grpMidPurity->setLabel("Mid Purity"); grpMidPurity->setOpen(false); grpMidPurity->setParent(*grpAdvancedRoot);
     auto* grpPurityCompression = d.defineGroupParam("grp_purity_compression"); grpPurityCompression->setLabel("Purity Compression"); grpPurityCompression->setOpen(false); grpPurityCompression->setParent(*grpAdvancedRoot);
     auto* grpBrl = d.defineGroupParam("grp_brl"); grpBrl->setLabel("Brilliance"); grpBrl->setOpen(false); grpBrl->setParent(*grpAdvancedRoot);
     auto* grpHue = d.defineGroupParam("grp_hue"); grpHue->setLabel("Hue"); grpHue->setOpen(false); grpHue->setParent(*grpAdvancedRoot);
-    auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Overrides"); grpDisplay->setOpen(false); grpDisplay->setParent(*grpAdvancedRoot);
+    auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Encoding"); grpDisplay->setOpen(false);
 
     auto addAdvBool = [&d](const char* n, const char* l, bool def, OFX::GroupParamDescriptor* g){ auto* p=d.defineBooleanParam(n); p->setLabel(l); p->setDefault(def); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
     auto addAdvD = [&d](const char* n, const char* l, double df, double mn, double mx, OFX::GroupParamDescriptor* g){ auto* p=d.defineDoubleParam(n); p->setLabel(l); p->setDefault(df); p->setRange(mn,mx); p->setDisplayRange(mn,mx); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
     auto addAdvC = [&d](const char* n, const char* l, int df, const std::vector<const char*>& o, OFX::GroupParamDescriptor* g){ auto* p=d.defineChoiceParam(n); p->setLabel(l); for(auto* s:o)p->appendOption(s); p->setDefault(df); p->setParent(*g); if (const char* hint = tooltipForParam(n)) p->setHint(hint); return p; };
 
+    pDisplayEncoding->addChild(*grpDisplay);
+    pDrtLook->addChild(*grpDrtLook);
+    pDrtLook->addChild(*lookPreset);
+    pDrtLook->addChild(*tonescalePreset);
+    pDrtLook->addChild(*cwpPreset);
+    pDrtLook->addChild(*cwpLm);
+    pDrtLook->addChild(*baseWpLabel);
+    pDrtLook->addChild(*surroundLabel);
+    pDrtLook->addChild(*discardPresetChanges);
+    pDrtLook->addChild(*overlay);
     pAdvanced->addChild(*grpAdvancedRoot);
-    addAdvD("tn_Lp", "Peak Luminance", 100.0, 100.0, 1000.0, grpDisplayMapping);
-    addAdvD("tn_Lg", "Grey Luminance", 10.0, 3.0, 25.0, grpDisplayMapping);
-    addAdvD("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0, grpDisplayMapping);
-    addAdvD("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0, grpDisplayMapping);
 
     auto* resetTonescale = d.definePushButtonParam("reset_tonescale");
     resetTonescale->setLabel("Reset Tonescale");
@@ -5118,8 +5145,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     auto* resetPurityCompression = d.definePushButtonParam("reset_purity_compression");
     resetPurityCompression->setLabel("Reset Purity Compression");
     resetPurityCompression->setParent(*grpPurityCompression);
-    auto* ptEnable = addAdvBool("pt_enable","Purity Compress High (Always On)",true,grpPurityCompression);
-    ptEnable->setEnabled(false);
+    addAdvBool("pt_enable","Enable Purity Compress High",true,grpPurityCompression);
     addAdvD("pt_lml","Purity Limit Low",0.25,0.0,1.0,grpPurityCompression);
     addAdvD("pt_lml_r","Purity Limit Low R",0.5,0.0,1.0,grpPurityCompression);
     addAdvD("pt_lml_g","Purity Limit Low G",0.0,0.0,1.0,grpPurityCompression);
@@ -5169,10 +5195,14 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     addAdvD("hs_m_rng","Hueshift M Range",1.0,0.0,1.0,grpHue);
     addAdvD("hs_y_rng","Hueshift Y Range",1.0,0.0,1.0,grpHue);
 
-    addAdvBool("clamp","Clamp",true,grpDisplay);
-    addAdvC("tn_su","Surround",1,{"Dark","Dim","Bright"},grpDisplay);
     addAdvC("display_gamut","Display Gamut",0,{"Rec.709","P3-D65","Rec.2020","P3-D60","P3-DCI","XYZ"},grpDisplay);
     addAdvC("eotf","Display EOTF",2,{"Linear","2.2 Power sRGB","2.4 Power Rec.1886","2.6 Power DCI","ST 2084 PQ","HLG"},grpDisplay);
+    addAdvD("tn_Lp", "Peak Luminance", 100.0, 100.0, 1000.0, grpDisplay);
+    addAdvD("tn_Lg", "Grey Luminance", 10.0, 3.0, 25.0, grpDisplay);
+    addAdvD("tn_gb", "HDR Grey Boost", 0.13, 0.0, 1.0, grpDisplay);
+    addAdvD("pt_hdr", "HDR Purity", 0.5, 0.0, 1.0, grpDisplay);
+    addAdvC("tn_su","Surround",1,{"Dark","Dim","Bright"},grpDisplay);
+    addAdvBool("clamp","Clamp",true,grpDisplay);
 
     auto* userPresetName = d.defineStringParam("userPresetName");
     userPresetName->setLabel("User Preset Name");
@@ -5319,7 +5349,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.8b");
+    supportOfxVersion->setDefault("v1.2.9");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
     pSupport->addChild(*supportOfxVersion);

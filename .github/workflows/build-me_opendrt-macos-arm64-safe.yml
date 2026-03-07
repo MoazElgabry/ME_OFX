@@ -7,7 +7,7 @@ on:
       - "v*"
 
 env:
-  OPENDRT_VERSION: v1.2.8b
+  OPENDRT_VERSION: v1.2.9
 
 jobs:
   build-macos-arm64-safe:
@@ -71,10 +71,10 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent \
             bundle/ME_OpenDRT.ofx.bundle \
-            ../../ME_OpenDRT_v1.2.8b_macOS_arm64_safe_math_portable.zip
+            ../../ME_OpenDRT_v1.2.9_macOS_arm64_safe_math_portable.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ME_OpenDRT-v1.2.8b-macos-arm64-safe-math
-          path: ME_OpenDRT_v1.2.8b_macOS_arm64_safe_math_portable.zip
+          name: ME_OpenDRT-v1.2.9-macos-arm64-safe-math
+          path: ME_OpenDRT_v1.2.9_macOS_arm64_safe_math_portable.zip
