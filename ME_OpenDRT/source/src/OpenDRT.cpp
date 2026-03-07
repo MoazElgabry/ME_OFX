@@ -4310,6 +4310,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         }
 
         if (haveCloud) {
+          cubeViewerCloudSendActive_.store(true, std::memory_order_relaxed);
           const std::string json = buildCubeViewerInputCloudJson(cloudPayload);
           std::ostringstream os;
           os << "Cube input cloud send (" << (cloudReason.empty() ? "unspecified" : cloudReason)
@@ -4339,6 +4340,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
             cubeViewerWindowUsable_ = false;
             setCubeViewerStatusLabel("Disconnected");
           }
+          cubeViewerCloudSendActive_.store(false, std::memory_order_relaxed);
         }
       }
       cubeViewerIoRunning_.store(false, std::memory_order_relaxed);
@@ -4549,11 +4551,21 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     const auto now = std::chrono::steady_clock::now();
     if (cubeViewerLastCloudSendAt_ == std::chrono::steady_clock::time_point::min()) return true;
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - cubeViewerLastCloudSendAt_).count();
-    return ms >= 8;
+    int minIntervalMs = 100;
+    if (cubeViewerQuality_ <= 0) minIntervalMs = 40;
+    else if (cubeViewerQuality_ == 1) minIntervalMs = 85;
+    else minIntervalMs = 220;
+    return ms >= minIntervalMs;
   }
 
   void noteCubeViewerInputCloudAttempt() {
     cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::now();
+  }
+
+  bool cubeViewerSteadyStateCloudPipelineAvailable() {
+    if (cubeViewerCloudSendActive_.load(std::memory_order_relaxed)) return false;
+    std::lock_guard<std::mutex> lock(cubeViewerIoMutex_);
+    return !cubeViewerPendingCloud_;
   }
 
   // First handoff policy: get the viewer off the stale identity mesh as soon as a valid cloud can be built.
@@ -4574,6 +4586,7 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     if (cubeViewerInputCloudRefreshPending_) return false;
     if (!cubeViewerConnected_) return false;
     if (!cubeViewerWindowUsable_) return false;
+    if (!cubeViewerSteadyStateCloudPipelineAvailable()) return false;
     return cubeViewerInputCloudThrottleOpen();
   }
 
@@ -5011,6 +5024,7 @@ void closeCubeViewerSession() {
   std::thread cubeViewerIoThread_;
   std::atomic<bool> cubeViewerIoStop_{false};
   std::atomic<bool> cubeViewerIoRunning_{false};
+  std::atomic<bool> cubeViewerCloudSendActive_{false};
   std::mutex cubeViewerIoMutex_;
   std::condition_variable cubeViewerIoCv_;
   bool cubeViewerPendingParams_ = false;
@@ -5042,7 +5056,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-    static const std::string nameWithVersion = "ME_OpenDRT v1.2.9b";
+static const std::string nameWithVersion = "ME_OpenDRT v1.2.9c";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5378,7 +5392,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.9b");
+    supportOfxVersion->setDefault("v1.2.9c");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }
