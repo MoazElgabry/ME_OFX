@@ -5042,7 +5042,7 @@ class OpenDRTFactory : public OFX::PluginFactoryHelper<OpenDRTFactory> {
   // ===== Plugin Descriptor =====
   // Host capability advertisement and static metadata.
   void describe(OFX::ImageEffectDescriptor& d) override {
-static const std::string nameWithVersion = "ME_OpenDRT v1.2.9c";
+    static const std::string nameWithVersion = "ME_OpenDRT v1.2.9b";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
@@ -5378,7 +5378,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* supportOfxVersion = d.defineStringParam("supportOfxVersion");
     supportOfxVersion->setLabel("OFX version");
-    supportOfxVersion->setDefault("v1.2.9c");
+    supportOfxVersion->setDefault("v1.2.9b");
     supportOfxVersion->setEnabled(false);
     supportOfxVersion->setParent(*grpSupportRoot);
   }
