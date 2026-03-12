@@ -2170,6 +2170,7 @@ class OpenDRTEffect : public OFX::ImageEffect {
   // Render stage map: (1) validate clips/layout, (2) resolve params, (3) pick backend, (4) optional viewer cloud publish.
 void render(const OFX::RenderArguments& args) override {
     const auto tRenderStart = std::chrono::steady_clock::now();
+    updateToggleVisibility(args.time);
     refreshCubeViewerRuntimeStateRenderSafe();
     std::unique_ptr<OFX::Image> src(srcClip_->fetchImage(args.time));
     std::unique_ptr<OFX::Image> dst(dstClip_->fetchImage(args.time));
@@ -2602,19 +2603,38 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerShowOverflow") {
+        const bool showOverflow = getBool("cubeViewerShowOverflow", args.time, 1) != 0;
+        if (showOverflow && getBool("cubeViewerHighlightOverflow", args.time, 1) == 0) {
+          FlagScope scope(suppressParamChanged_);
+          setBool("cubeViewerHighlightOverflow", 1);
+        }
+        setParamVisible("cubeViewerHighlightOverflow", showOverflow);
         updateToggleVisibility(args.time);
         if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
           cubeViewerInputCloudRefreshPending_ = true;
+          cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
         }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
+          if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
+            (void)trySendCachedCubeViewerInputCloud(args.time, "cubeViewerShowOverflow");
+          }
         }
         return;
       }
       if (paramName == "cubeViewerHighlightOverflow") {
         updateToggleVisibility(args.time);
+        if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
+          cubeViewerInputCloudRefreshPending_ = true;
+          cubeViewerInputCloudHandoffQueued_.store(false, std::memory_order_relaxed);
+          cubeViewerLastCloudSendAt_ = std::chrono::steady_clock::time_point::min();
+        }
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
+          if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
+            (void)trySendCachedCubeViewerInputCloud(args.time, "cubeViewerHighlightOverflow");
+          }
         }
         return;
       }
@@ -3303,6 +3323,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     bool valid = false;
     std::string points;
     std::string paramsHash;
+    std::string contentHash;
     std::string pointsHash;
     std::string senderId;
     std::string quality;
@@ -3311,6 +3332,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     bool highlightOverflow = true;
     int width = 0;
     int height = 0;
+    std::vector<float> rawSamples;
   };
 
   // ===== Staging Buffers: host memory used by non-direct render paths =====
@@ -4114,7 +4136,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const bool hc = getBool("hc_enable", t, 1) != 0;
     const bool hsRgb = getBool("hs_rgb_enable", t, 1) != 0;
     const bool hsCmy = getBool("hs_cmy_enable", t, 1) != 0;
-    const bool cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", t, 0) != 0;
+    const bool cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", t, 1) != 0;
 
     if (visibilityCacheInit_ &&
         hcon == vis_hcon_ &&
@@ -4141,7 +4163,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const bool applyHc = !visibilityCacheInit_ || hc != vis_hc_;
     const bool applyHsRgb = !visibilityCacheInit_ || hsRgb != vis_hsRgb_;
     const bool applyHsCmy = !visibilityCacheInit_ || hsCmy != vis_hsCmy_;
-    const bool applyCubeViewerOverflow = !visibilityCacheInit_ || cubeViewerShowOverflow != vis_cubeViewerShowOverflow_;
+    const bool applyCubeViewerOverflow = true;
 
     if (applyHcon) {
       setParamVisible("tn_hcon", hcon);
@@ -4589,6 +4611,30 @@ void refreshCubeViewerConnectionHealth() {
     return std::to_string(std::hash<std::string>{}(hashInput.str()));
   }
 
+  std::string currentCubeViewerInputCloudContentHash(double time) {
+    const OpenDRTRawValues raw = readRawValues(time);
+    std::string lookPayload;
+    std::string tonePayload;
+    serializeLookValues(captureCurrentLookValues(time), lookPayload);
+    serializeTonescaleValues(captureCurrentTonescaleValues(time), tonePayload);
+    std::ostringstream hashInput;
+    hashInput << lookPayload << "|" << tonePayload
+              << "|" << raw.lookPreset
+              << "|" << raw.tonescalePreset
+              << "|" << raw.creativeWhitePreset
+              << "|" << raw.displayEncodingPreset
+              << "|" << raw.display_gamut
+              << "|" << raw.eotf
+              << "|" << raw.tn_su
+              << "|" << raw.tn_Lp
+              << "|" << raw.tn_Lg
+              << "|" << raw.tn_gb
+              << "|" << raw.pt_hdr
+              << "|" << raw.clamp
+              << "|" << raw.cubeViewerPlotInLinear;
+    return std::to_string(std::hash<std::string>{}(hashInput.str()));
+  }
+
   // Snapshot/delta payload builder: canonical params + compact payloads for external cube visualization.
 std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::string& changedParam) {
     const OpenDRTRawValues raw = readRawValues(time);
@@ -4607,7 +4653,7 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
     os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
     os << "\"sourceMode\":\"" << cubeViewerSourceModeName(getBool("cubeViewerIdentity", time, 1) ? 0 : 1) << "\",";
     os << "\"plotInLinear\":" << (getBool("cubeViewerPlotInLinear", time, 0) ? 1 : 0) << ",";
-    os << "\"showOverflow\":" << (getBool("cubeViewerShowOverflow", time, 0) ? 1 : 0) << ",";
+    os << "\"showOverflow\":" << (getBool("cubeViewerShowOverflow", time, 1) ? 1 : 0) << ",";
     os << "\"highlightOverflow\":" << (getBool("cubeViewerHighlightOverflow", time, 1) ? 1 : 0) << ",";
     os << "\"alwaysOnTop\":" << (getBool("cubeViewerOnTop", time, 0) ? 1 : 0) << ",";
     os << "\"paramHash\":\"" << currentCubeViewerParamsHash(time) << "\",";
@@ -4672,6 +4718,64 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     return !cubeViewerPendingCloud_;
   }
 
+  bool rebuildCubeViewerInputCloudPayloadFromRawSamples(
+      double time,
+      const std::vector<float>& rawSamples,
+      int width,
+      int height,
+      CachedCubeViewerInputCloud* out) {
+    if (!out) return false;
+    if (rawSamples.empty() || (rawSamples.size() % 6u) != 0u) return false;
+
+    const bool showOverflow = getBool("cubeViewerShowOverflow", time, 1) != 0;
+    const bool highlightOverflow = getBool("cubeViewerHighlightOverflow", time, 1) != 0;
+    auto clamp01 = [](float v) -> float {
+      return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    };
+
+    std::ostringstream pts;
+    pts.setf(std::ios::fixed);
+    pts.precision(4);
+    bool first = true;
+    for (size_t i = 0; i + 5u < rawSamples.size(); i += 6u) {
+      const float sr = rawSamples[i + 0u];
+      const float sg = rawSamples[i + 1u];
+      const float sb = rawSamples[i + 2u];
+      const float dr = rawSamples[i + 3u];
+      const float dg = rawSamples[i + 4u];
+      const float db = rawSamples[i + 5u];
+      if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb) ||
+          !std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
+        continue;
+      }
+      if (!first) pts << ' ';
+      first = false;
+      pts << (showOverflow ? sr : clamp01(sr)) << ' '
+          << (showOverflow ? sg : clamp01(sg)) << ' '
+          << (showOverflow ? sb : clamp01(sb)) << ' '
+          << (showOverflow ? dr : clamp01(dr)) << ' '
+          << (showOverflow ? dg : clamp01(dg)) << ' '
+          << (showOverflow ? db : clamp01(db));
+    }
+
+    if (first) return false;
+
+    out->valid = true;
+    out->points = pts.str();
+    out->paramsHash = currentCubeViewerParamsHash(time);
+    out->contentHash = currentCubeViewerInputCloudContentHash(time);
+    out->pointsHash = std::to_string(std::hash<std::string>{}(out->points));
+    out->senderId = cubeViewerSenderId();
+    out->quality = cubeViewerQualityName(cubeViewerQuality_);
+    out->resolution = cubeViewerQualityToResolution(cubeViewerQuality_);
+    out->showOverflow = showOverflow;
+    out->highlightOverflow = highlightOverflow;
+    out->width = width;
+    out->height = height;
+    out->rawSamples = rawSamples;
+    return true;
+  }
+
   // First handoff policy: get the viewer off the stale identity mesh as soon as a valid cloud can be built.
   // This intentionally bypasses stale connection/window flags and HQ/full-frame checks, but only while the
   // one-shot refresh-pending flag is armed.
@@ -4715,21 +4819,26 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     // Keep a stable point budget per quality tier so drag/release does not appear to "switch quality"
     // when host preview resolution changes during interactive edits.
     const size_t targetPts = maxPts;
+    struct OccupancyCandidate {
+      float sr = 0.0f;
+      float sg = 0.0f;
+      float sb = 0.0f;
+      float dr = 0.0f;
+      float dg = 0.0f;
+      float db = 0.0f;
+      int bin = 0;
+      int binRank = 0;
+      uint32_t tie = 0;
+    };
     const size_t srcStrideFloats = srcRowBytes / sizeof(float);
     const size_t dstStrideFloats = dstRowBytes / sizeof(float);
     const size_t minStrideFloats = static_cast<size_t>(width) * 4u;
     if (srcStrideFloats < minStrideFloats || dstStrideFloats < minStrideFloats) return false;
     const bool plotInLinear = getBool("cubeViewerPlotInLinear", time, 0) != 0;
-    const bool showOverflow = getBool("cubeViewerShowOverflow", time, 0) != 0;
-    const bool highlightOverflow = getBool("cubeViewerHighlightOverflow", time, 1) != 0;
 
-    std::ostringstream pts;
-    pts.setf(std::ios::fixed);
-    pts.precision(4);
-    bool first = true;
-    auto clamp01 = [](float v) -> float {
-      return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
-    };
+    std::vector<float> rawSamples;
+    rawSamples.reserve(targetPts * 6u);
+    std::vector<int> occupancy(16 * 16 * 16, 0);
     auto halton = [](size_t index, int base) -> float {
       float f = 1.0f;
       float r = 0.0f;
@@ -4740,6 +4849,20 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
         i /= static_cast<size_t>(base);
       }
       return r;
+    };
+    auto clamp01 = [](float v) -> float {
+      return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    };
+    auto occupancyBinIndex = [&](float r, float g, float b) -> int {
+      constexpr int kBins = 16;
+      const auto toBin = [kBins, &clamp01](float v) {
+        const float clamped = clamp01(v);
+        return std::clamp(static_cast<int>(std::floor(clamped * static_cast<float>(kBins))), 0, kBins - 1);
+      };
+      const int ri = toBin(r);
+      const int gi = toBin(g);
+      const int bi = toBin(b);
+      return (ri * kBins + gi) * kBins + bi;
     };
 
     auto sampleRGBBilinear = [](const float* base, size_t strideFloats, int w, int h, float u, float v, float* r, float* g, float* b) {
@@ -4801,16 +4924,13 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
         sampledSrc.push_back(1.0f);
         continue;
       }
-      if (!first) pts << ' ';
-      first = false;
-      const float outSr = showOverflow ? sr : clamp01(sr);
-      const float outSg = showOverflow ? sg : clamp01(sg);
-      const float outSb = showOverflow ? sb : clamp01(sb);
-      const float outDr = showOverflow ? dr : clamp01(dr);
-      const float outDg = showOverflow ? dg : clamp01(dg);
-      const float outDb = showOverflow ? db : clamp01(db);
-      pts << outSr << ' ' << outSg << ' ' << outSb << ' '
-          << outDr << ' ' << outDg << ' ' << outDb;
+      rawSamples.push_back(sr);
+      rawSamples.push_back(sg);
+      rawSamples.push_back(sb);
+      rawSamples.push_back(dr);
+      rawSamples.push_back(dg);
+      rawSamples.push_back(db);
+      ++occupancy[occupancyBinIndex(dr, dg, db)];
     }
 
     if (plotInLinear) {
@@ -4829,33 +4949,103 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
         const float dr = sampledDst[i + 0];
         const float dg = sampledDst[i + 1];
         const float db = sampledDst[i + 2];
-        if (!first) pts << ' ';
-        first = false;
-        const float outSr = showOverflow ? sr : clamp01(sr);
-        const float outSg = showOverflow ? sg : clamp01(sg);
-        const float outSb = showOverflow ? sb : clamp01(sb);
-        const float outDr = showOverflow ? dr : clamp01(dr);
-        const float outDg = showOverflow ? dg : clamp01(dg);
-        const float outDb = showOverflow ? db : clamp01(db);
-        pts << outSr << ' ' << outSg << ' ' << outSb << ' '
-            << outDr << ' ' << outDg << ' ' << outDb;
+        rawSamples.push_back(sr);
+        rawSamples.push_back(sg);
+        rawSamples.push_back(sb);
+        rawSamples.push_back(dr);
+        rawSamples.push_back(dg);
+        rawSamples.push_back(db);
+        ++occupancy[occupancyBinIndex(dr, dg, db)];
       }
     }
 
-    if (first) return false;
+    const int extraPointCount = std::max(2048, static_cast<int>(targetPts / 2u));
+    const int candidateCount = std::min(std::max(extraPointCount * 3, 8192), 131072);
+    if (candidateCount > 0) {
+      std::vector<int> binCandidateRank(occupancy.size(), 0);
+      std::vector<OccupancyCandidate> candidates;
+      candidates.reserve(static_cast<size_t>(candidateCount));
+      std::vector<float> candidateSrc;
+      if (plotInLinear) candidateSrc.reserve(static_cast<size_t>(candidateCount) * 4u);
 
-    out->valid = true;
-    out->points = pts.str();
-    out->paramsHash = currentCubeViewerParamsHash(time);
-    out->pointsHash = std::to_string(std::hash<std::string>{}(out->points));
-    out->senderId = cubeViewerSenderId();
-    out->quality = cubeViewerQualityName(cubeViewerQuality_);
-    out->resolution = cubeViewerQualityToResolution(cubeViewerQuality_);
-    out->showOverflow = showOverflow;
-    out->highlightOverflow = highlightOverflow;
-    out->width = width;
-    out->height = height;
-    return true;
+      for (int i = 0; i < candidateCount; ++i) {
+        const float u = halton(static_cast<size_t>(i + 1), 2);
+        const float v = halton(static_cast<size_t>(i + 1), 3);
+        float sr = 0.0f, sg = 0.0f, sb = 0.0f;
+        float dr = 0.0f, dg = 0.0f, db = 0.0f;
+        if (!sampleRGBBilinear(srcBase, srcStrideFloats, width, height, u, v, &sr, &sg, &sb)) {
+          continue;
+        }
+        if (!std::isfinite(sr) || !std::isfinite(sg) || !std::isfinite(sb)) {
+          continue;
+        }
+        OccupancyCandidate candidate{};
+        candidate.sr = sr;
+        candidate.sg = sg;
+        candidate.sb = sb;
+        if (plotInLinear) {
+          candidateSrc.push_back(sr);
+          candidateSrc.push_back(sg);
+          candidateSrc.push_back(sb);
+          candidateSrc.push_back(1.0f);
+        } else {
+          if (!sampleRGBBilinear(dstBase, dstStrideFloats, width, height, u, v, &dr, &dg, &db)) {
+            continue;
+          }
+          if (!std::isfinite(dr) || !std::isfinite(dg) || !std::isfinite(db)) {
+            continue;
+          }
+          candidate.dr = dr;
+          candidate.dg = dg;
+          candidate.db = db;
+          candidate.bin = occupancyBinIndex(dr, dg, db);
+          candidate.binRank = binCandidateRank[candidate.bin]++;
+          candidate.tie = static_cast<uint32_t>(i);
+        }
+        candidates.push_back(candidate);
+      }
+
+      if (plotInLinear && !candidates.empty() && !candidateSrc.empty()) {
+        std::vector<float> candidateDst(candidateSrc.size(), 1.0f);
+        OpenDRTParams viewerParams = resolveParams(readRawValues(time));
+        viewerParams.eotf = 0;
+        OpenDRTProcessor viewerProcessor(viewerParams);
+        if (viewerProcessor.render(candidateSrc.data(), candidateDst.data(), static_cast<int>(candidateSrc.size() / 4u), 1, true, false)) {
+          for (size_t i = 0; i < candidates.size(); ++i) {
+            const size_t base = i * 4u;
+            candidates[i].dr = candidateDst[base + 0u];
+            candidates[i].dg = candidateDst[base + 1u];
+            candidates[i].db = candidateDst[base + 2u];
+            candidates[i].bin = occupancyBinIndex(candidates[i].dr, candidates[i].dg, candidates[i].db);
+            candidates[i].binRank = binCandidateRank[candidates[i].bin]++;
+            candidates[i].tie = static_cast<uint32_t>(i);
+          }
+        } else {
+          candidates.clear();
+        }
+      }
+
+      std::sort(candidates.begin(), candidates.end(), [&](const OccupancyCandidate& a, const OccupancyCandidate& b) {
+        if (occupancy[a.bin] != occupancy[b.bin]) return occupancy[a.bin] < occupancy[b.bin];
+        if (a.binRank != b.binRank) return a.binRank < b.binRank;
+        return a.tie < b.tie;
+      });
+
+      const int appendCount = std::min<int>(extraPointCount, static_cast<int>(candidates.size()));
+      rawSamples.reserve(rawSamples.size() + static_cast<size_t>(appendCount) * 6u);
+      for (int i = 0; i < appendCount; ++i) {
+        const auto& candidate = candidates[static_cast<size_t>(i)];
+        rawSamples.push_back(candidate.sr);
+        rawSamples.push_back(candidate.sg);
+        rawSamples.push_back(candidate.sb);
+        rawSamples.push_back(candidate.dr);
+        rawSamples.push_back(candidate.dg);
+        rawSamples.push_back(candidate.db);
+      }
+    }
+
+    if (rawSamples.empty()) return false;
+    return rebuildCubeViewerInputCloudPayloadFromRawSamples(time, rawSamples, width, height, out);
   }
 
   std::string buildCubeViewerInputCloudJson(const CachedCubeViewerInputCloud& payload) {
@@ -4902,6 +5092,23 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     }
 
     const std::string currentHash = currentCubeViewerParamsHash(time);
+    const std::string currentContentHash = currentCubeViewerInputCloudContentHash(time);
+    if (cubeViewerCachedInputCloud_.contentHash == currentContentHash &&
+        cubeViewerCachedInputCloud_.senderId == cubeViewerSenderId() &&
+        cubeViewerCachedInputCloud_.quality == cubeViewerQualityName(cubeViewerQuality_) &&
+        cubeViewerCachedInputCloud_.resolution == cubeViewerQualityToResolution(cubeViewerQuality_)) {
+      CachedCubeViewerInputCloud rebuilt = cubeViewerCachedInputCloud_;
+      if (rebuildCubeViewerInputCloudPayloadFromRawSamples(
+              time, cubeViewerCachedInputCloud_.rawSamples, cubeViewerCachedInputCloud_.width, cubeViewerCachedInputCloud_.height, &rebuilt)) {
+        std::ostringstream os;
+        os << "Cube input cloud cache rebuilt (" << (reason ? reason : "unspecified") << ") quality="
+           << rebuilt.quality << " res=" << rebuilt.resolution;
+        cubeViewerDebugLog(os.str());
+        maybeCaptureCubeViewerInputCloudCache(rebuilt);
+        return sendCubeViewerInputCloudPayload(rebuilt, true, reason);
+      }
+    }
+
     if (cubeViewerCachedInputCloud_.paramsHash != currentHash ||
         cubeViewerCachedInputCloud_.senderId != cubeViewerSenderId() ||
         cubeViewerCachedInputCloud_.quality != cubeViewerQualityName(cubeViewerQuality_) ||
@@ -5114,7 +5321,7 @@ void closeCubeViewerSession() {
     r.display_gamut = getChoice("display_gamut", time, 0);
     r.eotf = getChoice("eotf", time, 2);
     r.cubeViewerPlotInLinear = getBool("cubeViewerPlotInLinear", time, 0);
-    r.cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", time, 0);
+    r.cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", time, 1);
     r.cubeViewerHighlightOverflow = getBool("cubeViewerHighlightOverflow", time, 1);
 
     return r;
@@ -5501,7 +5708,7 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
 
     auto* cubeViewerShowOverflow = d.defineBooleanParam("cubeViewerShowOverflow");
     cubeViewerShowOverflow->setLabel("Show Overflow");
-    cubeViewerShowOverflow->setDefault(false);
+    cubeViewerShowOverflow->setDefault(true);
     cubeViewerShowOverflow->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerShowOverflow")) cubeViewerShowOverflow->setHint(hint);
 

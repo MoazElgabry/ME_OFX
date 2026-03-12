@@ -13,8 +13,16 @@ Thumbs.db
 **/build/
 **/build-*/
 **/build-ninja/
+**/bundle/
 **/out/
 **/cmake-build-*/
+
+# Local mirror docs we do not publish from this repo
+ME_OpenDRT/source/docs/*
+!ME_OpenDRT/source/docs/ARCHITECTURE.md
+
+# Local mirror installer artifacts we do not publish from this repo
+ME_OpenDRT/source/installer/*.exe
 
 # macOS metadata
 **/.AppleDouble
