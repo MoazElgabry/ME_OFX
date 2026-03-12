@@ -4,6 +4,14 @@ project(ME_OpenDRT VERSION 1.2.10 LANGUAGES CXX)
 set(OPENDRT_DISPLAY_VERSION "1.2.10")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
+set(PLUGIN_IDENTIFIER "com.moazelgabry.me_opendrt")
+set(SHARED_ICON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../OFX-Workshop/icons")
+set(PLUGIN_ICON_SVG "${SHARED_ICON_DIR}/opendrt_icon_v6.svg")
+set(PLUGIN_ICON_PNG "${SHARED_ICON_DIR}/opendrt_icon_v6.png")
+set(VIEWER_ICON_SVG "${SHARED_ICON_DIR}/OpenDRT_Cube.svg")
+# OpenDRT_Cube.svg matches the existing shared raster used for the LUT viewer icon.
+set(VIEWER_ICON_PNG "${SHARED_ICON_DIR}/Cube 2.png")
+set(GENERATED_ASSET_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
 option(ME_OPENDRT_LINUX_CUDA "Enable CUDA backend on Linux builds" ON)
 option(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB "Build cube-viewer transport stub (research)" ON)
 
@@ -73,11 +81,15 @@ if(WIN32 OR (UNIX AND NOT APPLE))
 endif()
 
 if(APPLE)
+  find_program(SIPS_EXECUTABLE sips REQUIRED)
+  find_program(ICONUTIL_EXECUTABLE iconutil REQUIRED)
   enable_language(OBJCXX)
   set(CMAKE_OBJCXX_STANDARD 17)
   set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
   list(APPEND PLUGIN_SOURCES src/metal/OpenDRTMetal.mm)
 endif()
+
+file(MAKE_DIRECTORY "${GENERATED_ASSET_DIR}")
 
 add_library(${PLUGIN_BASENAME} SHARED ${PLUGIN_SOURCES})
 if(WIN32 OR (UNIX AND NOT APPLE))
@@ -180,7 +192,9 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
 )
 
 if(WIN32)
-  set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/Win64")
+  set(OFX_STAGE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle")
+  set(OFX_RESOURCES_DIR "${OFX_STAGE_ROOT}/Contents/Resources")
+  set(OFX_OUTPUT_DIR "${OFX_STAGE_ROOT}/Contents/Win64")
 elseif(APPLE)
   set(OFX_BUNDLE_CONTENTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents")
   set(OFX_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bundle/${PLUGIN_BASENAME}.ofx.bundle/Contents/MacOS")
@@ -197,10 +211,20 @@ if(APPLE)
     "${CMAKE_CURRENT_BINARY_DIR}/Info.plist"
     @ONLY
   )
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CubeViewerInfo.plist.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/CubeViewerInfo.plist"
+    @ONLY
+  )
   add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${METAL_LIB}" "${OFX_RESOURCES_DIR}/OpenDRT.metallib"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/Info.plist" "${OFX_BUNDLE_CONTENTS_DIR}/Info.plist")
 endif()
+
+add_custom_command(TARGET ${PLUGIN_BASENAME} POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "${OFX_RESOURCES_DIR}"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PLUGIN_ICON_PNG}" "${OFX_RESOURCES_DIR}/${PLUGIN_IDENTIFIER}.png"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PLUGIN_ICON_PNG}" "${OFX_RESOURCES_DIR}/${PLUGIN_BASENAME}.png")
 
 set_target_properties(${PLUGIN_BASENAME} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY "${OFX_OUTPUT_DIR}"
@@ -275,6 +299,36 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     message(FATAL_ERROR "No compatible OpenGL CMake target found for ME_OpenDRT_CubeViewer")
   endif()
   if(WIN32)
+    if(NOT EXISTS "${PLUGIN_ICON_PNG}")
+      message(FATAL_ERROR "Missing plugin icon PNG at ${PLUGIN_ICON_PNG} (source SVG: ${PLUGIN_ICON_SVG})")
+    endif()
+    if(NOT EXISTS "${VIEWER_ICON_PNG}")
+      message(FATAL_ERROR "Missing viewer icon PNG at ${VIEWER_ICON_PNG} (source SVG: ${VIEWER_ICON_SVG})")
+    endif()
+
+    set(PLUGIN_ICON_ICO "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}.ico")
+    set(PLUGIN_ICON_RC "${GENERATED_ASSET_DIR}/${PLUGIN_BASENAME}.rc")
+    set(VIEWER_ICON_ICO "${GENERATED_ASSET_DIR}/ME_OpenDRT_CubeViewer.ico")
+    set(VIEWER_ICON_RC "${GENERATED_ASSET_DIR}/ME_OpenDRT_CubeViewer.rc")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/plugin_icon.rc.in" "${PLUGIN_ICON_RC}" @ONLY)
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/viewer_icon.rc.in" "${VIEWER_ICON_RC}" @ONLY)
+
+    add_custom_command(
+      OUTPUT "${PLUGIN_ICON_ICO}"
+      COMMAND powershell -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/cmake/png_to_ico.ps1" -InputPng "${PLUGIN_ICON_PNG}" -OutputIco "${PLUGIN_ICON_ICO}"
+      DEPENDS "${PLUGIN_ICON_PNG}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/png_to_ico.ps1"
+      COMMENT "Generating Windows ICO from ${PLUGIN_ICON_PNG}"
+      VERBATIM)
+
+    add_custom_command(
+      OUTPUT "${VIEWER_ICON_ICO}"
+      COMMAND powershell -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_SOURCE_DIR}/cmake/png_to_ico.ps1" -InputPng "${VIEWER_ICON_PNG}" -OutputIco "${VIEWER_ICON_ICO}"
+      DEPENDS "${VIEWER_ICON_PNG}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/png_to_ico.ps1"
+      COMMENT "Generating Windows ICO from ${VIEWER_ICON_PNG}"
+      VERBATIM)
+
+    target_sources(${PLUGIN_BASENAME} PRIVATE "${PLUGIN_ICON_RC}" "${PLUGIN_ICON_ICO}")
+    target_sources(ME_OpenDRT_CubeViewer PRIVATE "${VIEWER_ICON_RC}" "${VIEWER_ICON_ICO}")
     target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE ws2_32 user32 gdi32)
   endif()
   set_target_properties(ME_OpenDRT_CubeViewer PROPERTIES
@@ -287,8 +341,37 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     OSX_ARCHITECTURES "${CMAKE_OSX_ARCHITECTURES}"
   )
   if(APPLE)
+    set(VIEWER_ICONSET_DIR "${GENERATED_ASSET_DIR}/ME_OpenDRT_CubeViewer.iconset")
+    set(VIEWER_ICON_ICNS "${GENERATED_ASSET_DIR}/OpenDRT_CubeViewer.icns")
+    set(VIEWER_APP_BUNDLE_DIR "${OFX_RESOURCES_DIR}/ME_OpenDRT_CubeViewer.app")
+    add_custom_command(
+      OUTPUT "${VIEWER_ICON_ICNS}"
+      COMMAND ${CMAKE_COMMAND} -E rm -rf "${VIEWER_ICONSET_DIR}"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${VIEWER_ICONSET_DIR}"
+      COMMAND "${SIPS_EXECUTABLE}" -z 16 16 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_16x16.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 32 32 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_16x16@2x.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 32 32 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_32x32.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 64 64 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_32x32@2x.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 128 128 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_128x128.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 256 256 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_128x128@2x.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 256 256 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_256x256.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 512 512 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_256x256@2x.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 512 512 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_512x512.png"
+      COMMAND "${SIPS_EXECUTABLE}" -z 1024 1024 "${VIEWER_ICON_PNG}" --out "${VIEWER_ICONSET_DIR}/icon_512x512@2x.png"
+      COMMAND "${ICONUTIL_EXECUTABLE}" -c icns "${VIEWER_ICONSET_DIR}" -o "${VIEWER_ICON_ICNS}"
+      DEPENDS "${VIEWER_ICON_PNG}"
+      COMMENT "Generating macOS ICNS from ${VIEWER_ICON_PNG}"
+      VERBATIM)
+    add_custom_target(OpenDRTViewerIcns ALL DEPENDS "${VIEWER_ICON_ICNS}")
+    add_dependencies(ME_OpenDRT_CubeViewer OpenDRTViewerIcns)
     # Ensure helper binary remains launchable after packaging/copy steps.
     add_custom_command(TARGET ME_OpenDRT_CubeViewer POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${VIEWER_APP_BUNDLE_DIR}/Contents/MacOS"
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${VIEWER_APP_BUNDLE_DIR}/Contents/Resources"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:ME_OpenDRT_CubeViewer>" "${VIEWER_APP_BUNDLE_DIR}/Contents/MacOS/ME_OpenDRT_CubeViewer"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/CubeViewerInfo.plist" "${VIEWER_APP_BUNDLE_DIR}/Contents/Info.plist"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VIEWER_ICON_ICNS}" "${VIEWER_APP_BUNDLE_DIR}/Contents/Resources/OpenDRT_CubeViewer.icns"
+      COMMAND /bin/chmod +x "${VIEWER_APP_BUNDLE_DIR}/Contents/MacOS/ME_OpenDRT_CubeViewer"
       COMMAND /bin/chmod +x "$<TARGET_FILE:ME_OpenDRT_CubeViewer>"
       VERBATIM
     )

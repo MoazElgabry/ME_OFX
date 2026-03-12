@@ -20,7 +20,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Report macOS toolchain
         run: |
@@ -74,7 +74,7 @@ jobs:
             ../../ME_OpenDRT_v1.2.10_macOS_arm64_safe_math_portable.zip
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ME_OpenDRT-v1.2.10-macos-arm64-safe-math
           path: ME_OpenDRT_v1.2.10_macOS_arm64_safe_math_portable.zip

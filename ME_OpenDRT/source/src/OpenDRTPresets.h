@@ -95,6 +95,8 @@ struct OpenDRTRawValues {
   int display_gamut;
   int eotf;
   int cubeViewerPlotInLinear;
+  int cubeViewerShowOverflow;
+  int cubeViewerHighlightOverflow;
 };
 
 struct LookPresetValues {

@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#0f1822"/>
+      <stop offset="100%" stop-color="#060c12"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="88" ry="88" fill="url(#bg)"/>
+
+  <!-- TOP FACE — lightest -->
+  <polygon points="256,68 420,162 256,256 92,162" fill="#3a5570"/>
+  <!-- LEFT FACE — mid -->
+  <polygon points="92,162 256,256 256,444 92,350" fill="#1e3248"/>
+  <!-- RIGHT FACE — darkest -->
+  <polygon points="420,162 420,350 256,444 256,256" fill="#142536"/>
+
+  <!-- EDGE GLOW LAYER (blurred duplicate underneath) -->
+  <g opacity="0.6">
+    <line x1="256" y1="68"  x2="92"  y2="162" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+    <line x1="256" y1="68"  x2="420" y2="162" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+    <line x1="420" y1="162" x2="420" y2="350" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+    <line x1="92"  y1="162" x2="92"  y2="350" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+    <line x1="420" y1="350" x2="256" y2="444" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+    <line x1="92"  y1="350" x2="256" y2="444" stroke="white" stroke-width="8" stroke-linecap="round" style="filter:blur(4px)"/>
+  </g>
+
+  <!-- OUTER EDGES — crisp on top -->
+  <line x1="256" y1="68"  x2="92"  y2="162" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="256" y1="68"  x2="420" y2="162" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="420" y1="162" x2="420" y2="350" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="92"  y1="162" x2="92"  y2="350" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="420" y1="350" x2="256" y2="444" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+  <line x1="92"  y1="350" x2="256" y2="444" stroke="white" stroke-width="3.5" stroke-linecap="round"/>
+
+  <!-- INNER EDGES -->
+  <line x1="256" y1="256" x2="420" y2="162" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <line x1="256" y1="256" x2="92"  y2="162" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <line x1="256" y1="256" x2="256" y2="444" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- DOT GLOW LAYER -->
+  <g opacity="0.5" style="filter:blur(6px)">
+    <circle cx="256" cy="68"  r="12" fill="white"/>
+    <circle cx="420" cy="162" r="12" fill="white"/>
+    <circle cx="420" cy="350" r="12" fill="white"/>
+    <circle cx="256" cy="444" r="12" fill="white"/>
+    <circle cx="92"  cy="350" r="12" fill="white"/>
+    <circle cx="92"  cy="162" r="12" fill="white"/>
+    <circle cx="256" cy="256" r="9"  fill="white"/>
+  </g>
+
+  <!-- CORNER DOTS — crisp -->
+  <circle cx="256" cy="68"  r="8" fill="white"/>
+  <circle cx="420" cy="162" r="8" fill="white"/>
+  <circle cx="420" cy="350" r="8" fill="white"/>
+  <circle cx="256" cy="444" r="8" fill="white"/>
+  <circle cx="92"  cy="350" r="8" fill="white"/>
+  <circle cx="92"  cy="162" r="8" fill="white"/>
+  <circle cx="256" cy="256" r="5" fill="white" opacity="0.55"/>
+</svg>

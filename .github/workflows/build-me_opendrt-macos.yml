@@ -32,7 +32,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Ensure build tools are available
         run: |
@@ -65,7 +65,7 @@ jobs:
             ../../${{ matrix.zip_name }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.zip_name }}

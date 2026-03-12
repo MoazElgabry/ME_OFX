@@ -276,6 +276,18 @@ std::string joinPath(const std::string& a, const std::string& b) {
 #endif
 }
 
+#if defined(__APPLE__)
+std::string macAppExecutablePath(const std::string& appPath, const std::string& exeName) {
+  if (appPath.empty()) return std::string();
+  return joinPath(joinPath(joinPath(appPath, "Contents"), "MacOS"), exeName);
+}
+
+bool endsWithAppBundle(const std::string& path) {
+  if (path.size() < 4) return false;
+  return path.compare(path.size() - 4, 4, ".app") == 0;
+}
+#endif
+
 bool isAbsolutePath(const std::string& p) {
   if (p.empty()) return false;
 #if defined(_WIN32)
@@ -329,7 +341,15 @@ std::vector<std::string> cubeViewerExeCandidates() {
   if (env && env[0] != '\0') {
     const std::string envPath(env);
     out.push_back(envPath);
+#if defined(__APPLE__)
+    if (endsWithAppBundle(envPath)) out.push_back(macAppExecutablePath(envPath, exeName));
+#endif
     if (!isAbsolutePath(envPath) && !moduleDir.empty()) out.push_back(joinPath(moduleDir, envPath));
+#if defined(__APPLE__)
+    if (!isAbsolutePath(envPath) && !moduleDir.empty() && endsWithAppBundle(envPath)) {
+      out.push_back(macAppExecutablePath(joinPath(moduleDir, envPath), exeName));
+    }
+#endif
   }
   if (!moduleDir.empty()) {
     out.push_back(joinPath(moduleDir, exeName));
@@ -338,6 +358,9 @@ std::vector<std::string> cubeViewerExeCandidates() {
     if (!contentsDir.empty()) {
       out.push_back(joinPath(contentsDir, exeName));
       out.push_back(joinPath(joinPath(contentsDir, "Resources"), exeName));
+#if defined(__APPLE__)
+      out.push_back(macAppExecutablePath(joinPath(joinPath(contentsDir, "Resources"), "ME_OpenDRT_CubeViewer.app"), exeName));
+#endif
     }
   }
   out.push_back(exeName); // final PATH fallback
@@ -2094,6 +2117,8 @@ const char* tooltipForParam(const std::string& name) {
     {"cubeViewerPlotInLinear", "Plot the cube and image cloud in display-linear space by stopping before the final display encoding step."},
     {"cubeViewerOnTop", "Keep the external viewer window above the host while tweaking controls."},
     {"cubeViewerQuality", "Viewer sampling density for the 3D cube (Low=25^3, about 45k points; Medium=41^3, about 90k points; High=57^3, about 180k points)."},
+    {"cubeViewerShowOverflow", "Allow the viewer plot to extend outside the nominal cube bounds instead of clamping transformed values back into range."},
+    {"cubeViewerHighlightOverflow", "Highlight out-of-bound plotted points in pure red while overflow display is enabled."},
     {"cubeViewerStatus", "Connection state for external 3D identity-cube viewer."}
   };
   auto it = kTooltips.find(name);
@@ -2571,6 +2596,23 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         return;
       }
       if (paramName == "cubeViewerPlotInLinear") {
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerShowOverflow") {
+        updateToggleVisibility(args.time);
+        if (getBool("cubeViewerIdentity", args.time, 1) == 0) {
+          cubeViewerInputCloudRefreshPending_ = true;
+        }
+        if (cubeViewerRequested_ && cubeViewerLive_) {
+          pushCubeViewerUpdate(args.time, paramName, true);
+        }
+        return;
+      }
+      if (paramName == "cubeViewerHighlightOverflow") {
+        updateToggleVisibility(args.time);
         if (cubeViewerRequested_ && cubeViewerLive_) {
           pushCubeViewerUpdate(args.time, paramName, true);
         }
@@ -3265,6 +3307,8 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     std::string senderId;
     std::string quality;
     int resolution = 33;
+    bool showOverflow = false;
+    bool highlightOverflow = true;
     int width = 0;
     int height = 0;
   };
@@ -4070,6 +4114,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const bool hc = getBool("hc_enable", t, 1) != 0;
     const bool hsRgb = getBool("hs_rgb_enable", t, 1) != 0;
     const bool hsCmy = getBool("hs_cmy_enable", t, 1) != 0;
+    const bool cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", t, 0) != 0;
 
     if (visibilityCacheInit_ &&
         hcon == vis_hcon_ &&
@@ -4081,7 +4126,8 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
         brlp == vis_brlp_ &&
         hc == vis_hc_ &&
         hsRgb == vis_hsRgb_ &&
-        hsCmy == vis_hsCmy_) {
+        hsCmy == vis_hsCmy_ &&
+        cubeViewerShowOverflow == vis_cubeViewerShowOverflow_) {
       return;
     }
 
@@ -4095,6 +4141,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     const bool applyHc = !visibilityCacheInit_ || hc != vis_hc_;
     const bool applyHsRgb = !visibilityCacheInit_ || hsRgb != vis_hsRgb_;
     const bool applyHsCmy = !visibilityCacheInit_ || hsCmy != vis_hsCmy_;
+    const bool applyCubeViewerOverflow = !visibilityCacheInit_ || cubeViewerShowOverflow != vis_cubeViewerShowOverflow_;
 
     if (applyHcon) {
       setParamVisible("tn_hcon", hcon);
@@ -4161,6 +4208,9 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
       setParamVisible("hs_y", hsCmy);
       setParamVisible("hs_y_rng", hsCmy);
     }
+    if (applyCubeViewerOverflow) {
+      setParamVisible("cubeViewerHighlightOverflow", cubeViewerShowOverflow);
+    }
 
     vis_hcon_ = hcon;
     vis_lcon_ = lcon;
@@ -4172,6 +4222,7 @@ void changedParam(const OFX::InstanceChangedArgs& args, const std::string& param
     vis_hc_ = hc;
     vis_hsRgb_ = hsRgb;
     vis_hsCmy_ = hsCmy;
+    vis_cubeViewerShowOverflow_ = cubeViewerShowOverflow;
     visibilityCacheInit_ = true;
   }
   void setInt(const char* name, int v) {
@@ -4532,7 +4583,9 @@ void refreshCubeViewerConnectionHealth() {
               << "|" << raw.tn_gb
               << "|" << raw.pt_hdr
               << "|" << raw.clamp
-              << "|" << raw.cubeViewerPlotInLinear;
+              << "|" << raw.cubeViewerPlotInLinear
+              << "|" << raw.cubeViewerShowOverflow
+              << "|" << raw.cubeViewerHighlightOverflow;
     return std::to_string(std::hash<std::string>{}(hashInput.str()));
   }
 
@@ -4554,6 +4607,8 @@ std::string buildCubeViewerParamsJson(double time, bool deltaOnly, const std::st
     os << "\"resolution\":" << cubeViewerQualityToResolution(cubeViewerQuality_) << ",";
     os << "\"sourceMode\":\"" << cubeViewerSourceModeName(getBool("cubeViewerIdentity", time, 1) ? 0 : 1) << "\",";
     os << "\"plotInLinear\":" << (getBool("cubeViewerPlotInLinear", time, 0) ? 1 : 0) << ",";
+    os << "\"showOverflow\":" << (getBool("cubeViewerShowOverflow", time, 0) ? 1 : 0) << ",";
+    os << "\"highlightOverflow\":" << (getBool("cubeViewerHighlightOverflow", time, 1) ? 1 : 0) << ",";
     os << "\"alwaysOnTop\":" << (getBool("cubeViewerOnTop", time, 0) ? 1 : 0) << ",";
     os << "\"paramHash\":\"" << currentCubeViewerParamsHash(time) << "\",";
     if (deltaOnly) {
@@ -4665,6 +4720,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     const size_t minStrideFloats = static_cast<size_t>(width) * 4u;
     if (srcStrideFloats < minStrideFloats || dstStrideFloats < minStrideFloats) return false;
     const bool plotInLinear = getBool("cubeViewerPlotInLinear", time, 0) != 0;
+    const bool showOverflow = getBool("cubeViewerShowOverflow", time, 0) != 0;
+    const bool highlightOverflow = getBool("cubeViewerHighlightOverflow", time, 1) != 0;
 
     std::ostringstream pts;
     pts.setf(std::ios::fixed);
@@ -4746,9 +4803,14 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
       }
       if (!first) pts << ' ';
       first = false;
-      // Plot coordinates are clamped to cube bounds to avoid out-of-range spikes.
-      pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
-          << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+      const float outSr = showOverflow ? sr : clamp01(sr);
+      const float outSg = showOverflow ? sg : clamp01(sg);
+      const float outSb = showOverflow ? sb : clamp01(sb);
+      const float outDr = showOverflow ? dr : clamp01(dr);
+      const float outDg = showOverflow ? dg : clamp01(dg);
+      const float outDb = showOverflow ? db : clamp01(db);
+      pts << outSr << ' ' << outSg << ' ' << outSb << ' '
+          << outDr << ' ' << outDg << ' ' << outDb;
     }
 
     if (plotInLinear) {
@@ -4769,8 +4831,14 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
         const float db = sampledDst[i + 2];
         if (!first) pts << ' ';
         first = false;
-        pts << clamp01(sr) << ' ' << clamp01(sg) << ' ' << clamp01(sb) << ' '
-            << clamp01(dr) << ' ' << clamp01(dg) << ' ' << clamp01(db);
+        const float outSr = showOverflow ? sr : clamp01(sr);
+        const float outSg = showOverflow ? sg : clamp01(sg);
+        const float outSb = showOverflow ? sb : clamp01(sb);
+        const float outDr = showOverflow ? dr : clamp01(dr);
+        const float outDg = showOverflow ? dg : clamp01(dg);
+        const float outDb = showOverflow ? db : clamp01(db);
+        pts << outSr << ' ' << outSg << ' ' << outSb << ' '
+            << outDr << ' ' << outDg << ' ' << outDb;
       }
     }
 
@@ -4783,6 +4851,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     out->senderId = cubeViewerSenderId();
     out->quality = cubeViewerQualityName(cubeViewerQuality_);
     out->resolution = cubeViewerQualityToResolution(cubeViewerQuality_);
+    out->showOverflow = showOverflow;
+    out->highlightOverflow = highlightOverflow;
     out->width = width;
     out->height = height;
     return true;
@@ -4798,6 +4868,8 @@ bool shouldEmitCubeViewerUpdate(bool forceSnapshot, const std::string& changedPa
     os << "\"quality\":\"" << payload.quality << "\",";
     os << "\"resolution\":" << payload.resolution << ",";
     os << "\"sourceMode\":\"input\",";
+    os << "\"showOverflow\":" << (payload.showOverflow ? 1 : 0) << ",";
+    os << "\"highlightOverflow\":" << (payload.highlightOverflow ? 1 : 0) << ",";
     os << "\"paramHash\":\"" << payload.paramsHash << "\",";
     os << "\"points\":\"" << jsonEscape(payload.points) << "\"";
     os << "}";
@@ -5042,6 +5114,8 @@ void closeCubeViewerSession() {
     r.display_gamut = getChoice("display_gamut", time, 0);
     r.eotf = getChoice("eotf", time, 2);
     r.cubeViewerPlotInLinear = getBool("cubeViewerPlotInLinear", time, 0);
+    r.cubeViewerShowOverflow = getBool("cubeViewerShowOverflow", time, 0);
+    r.cubeViewerHighlightOverflow = getBool("cubeViewerHighlightOverflow", time, 1);
 
     return r;
   }
@@ -5068,6 +5142,7 @@ void closeCubeViewerSession() {
   bool vis_hc_ = false;
   bool vis_hsRgb_ = false;
   bool vis_hsCmy_ = false;
+  bool vis_cubeViewerShowOverflow_ = false;
   bool menuLabelCacheInit_ = false;
   int menuLabelLookIdx_ = -1;
   int menuLabelToneIdx_ = -1;
@@ -5135,6 +5210,8 @@ static const std::string nameWithVersion = "ME_OpenDRT v1.2.10";
     d.setLabels(nameWithVersion.c_str(), nameWithVersion.c_str(), nameWithVersion.c_str());
     d.setPluginGrouping(kPluginGrouping);
     d.setPluginDescription(std::string(kPluginDescription) + " | " + buildLabelText());
+    d.getPropertySet().propSetString(kOfxPropIcon, "", 0, false);
+    d.getPropertySet().propSetString(kOfxPropIcon, kPluginIdentifier ".png", 1, false);
     d.addSupportedContext(OFX::eContextFilter);
     d.addSupportedBitDepth(OFX::eBitDepthFloat);
     d.setSingleInstance(false);
@@ -5217,10 +5294,13 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     activeUserLookSlot->setParent(*grpBasicRoot);
     activeUserToneSlot->setParent(*grpBasicRoot);
     auto* grpDisplay = d.defineGroupParam("grp_display"); grpDisplay->setLabel("Display Encoding Settings"); grpDisplay->setOpen(false);
+    auto* grpPresetSelection = d.defineGroupParam("grp_preset_selection"); grpPresetSelection->setLabel("DRT Look"); grpPresetSelection->setOpen(true);
     auto* lookPreset = addChoice("lookPreset", "DRT Look Preset", 0, {"Standard","Arriba","Sylvan","Colorful","Aery","Dystopic","Umbra","Base"});
     for (const auto& n : visibleUserLookNames()) lookPreset->appendOption(n);
     auto* tonescalePreset = addChoice("tonescalePreset", "Tonescale Preset", 0, {"USE LOOK PRESET","Low Contrast","Medium Contrast","High Contrast","Arriba Tonescale","Sylvan Tonescale","Colorful Tonescale","Aery Tonescale","Dystopic Tonescale","Umbra Tonescale","ACES-1.x","ACES-2.0","Marvelous Tonescape","DaGrinchi ToneGroan"});
     for (const auto& n : visibleUserTonescaleNames()) tonescalePreset->appendOption(n);
+    lookPreset->setParent(*grpPresetSelection);
+    tonescalePreset->setParent(*grpPresetSelection);
     auto* grpAdvancedRoot = d.defineGroupParam("grp_advanced_root"); grpAdvancedRoot->setLabel("Advanced Look Control"); grpAdvancedRoot->setOpen(false);
     cwpPreset->setParent(*grpAdvancedRoot);
     cwpLm->setParent(*grpAdvancedRoot);
@@ -5418,6 +5498,18 @@ void describeInContext(OFX::ImageEffectDescriptor& d, OFX::ContextEnum) override
     cubeViewerQuality->setDefault(0);
     cubeViewerQuality->setParent(*grpCubeViewer);
     if (const char* hint = tooltipForParam("cubeViewerQuality")) cubeViewerQuality->setHint(hint);
+
+    auto* cubeViewerShowOverflow = d.defineBooleanParam("cubeViewerShowOverflow");
+    cubeViewerShowOverflow->setLabel("Show Overflow");
+    cubeViewerShowOverflow->setDefault(false);
+    cubeViewerShowOverflow->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerShowOverflow")) cubeViewerShowOverflow->setHint(hint);
+
+    auto* cubeViewerHighlightOverflow = d.defineBooleanParam("cubeViewerHighlightOverflow");
+    cubeViewerHighlightOverflow->setLabel("Highlight out of bound");
+    cubeViewerHighlightOverflow->setDefault(true);
+    cubeViewerHighlightOverflow->setParent(*grpCubeViewer);
+    if (const char* hint = tooltipForParam("cubeViewerHighlightOverflow")) cubeViewerHighlightOverflow->setHint(hint);
 
     auto* cubeViewerStatus = d.defineStringParam("cubeViewerStatus");
     cubeViewerStatus->setLabel("Viewer Status");

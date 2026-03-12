@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <csignal>
 #include <cstdint>
 #include <cerrno>
@@ -28,7 +29,20 @@
 #include <unistd.h>
 #endif
 
+#if defined(_WIN32)
+#define GLFW_EXPOSE_NATIVE_WIN32
+#endif
 #include <GLFW/glfw3.h>
+#if defined(_WIN32)
+#include <GLFW/glfw3native.h>
+#endif
+
+#ifndef GL_ARRAY_BUFFER
+#define GL_ARRAY_BUFFER 0x8892
+#endif
+#ifndef GL_STATIC_DRAW
+#define GL_STATIC_DRAW 0x88E4
+#endif
 
 #include "OpenDRTParams.h"
 #include "OpenDRTPresets.h"
@@ -83,6 +97,24 @@ void logViewerEvent(const std::string& msg) {
 }
 
 const char* kViewerVersionString = "v1.2.10";
+
+#if defined(_WIN32)
+void applyWindowsWindowIcon(GLFWwindow* window) {
+  if (!window) return;
+  HWND hwnd = glfwGetWin32Window(window);
+  if (!hwnd) return;
+  HMODULE module = GetModuleHandleW(nullptr);
+  if (!module) return;
+  HICON iconLarge = static_cast<HICON>(LoadImageW(module, L"GLFW_ICON", IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXICON),
+                                                   GetSystemMetrics(SM_CYICON), 0));
+  HICON iconSmall = static_cast<HICON>(LoadImageW(module, L"GLFW_ICON", IMAGE_ICON,
+                                                   GetSystemMetrics(SM_CXSMICON),
+                                                   GetSystemMetrics(SM_CYSMICON), 0));
+  if (iconLarge) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(iconLarge));
+  if (iconSmall) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(iconSmall));
+}
+#endif
 
 #if !defined(_WIN32)
 bool sendAllSocket(int fd, const char* data, size_t size) {
@@ -254,9 +286,15 @@ struct MeshData {
   std::string paramHash;
   bool renderOk = false;
   float maxDelta = 0.0f;
+  uint64_t serial = 0;
   std::vector<float> pointVerts;
   std::vector<float> pointColors;
 };
+
+uint64_t nextMeshSerial() {
+  static std::atomic<uint64_t> serial{1u};
+  return serial.fetch_add(1u, std::memory_order_relaxed);
+}
 
 struct PendingMessage {
   uint64_t seq = 0;
@@ -275,6 +313,92 @@ bool gHasPendingCloudMsg = false;
 
 inline float clamp01(float v) {
   return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+inline bool rgbOutOfBounds(float r, float g, float b) {
+  return r < 0.0f || r > 1.0f || g < 0.0f || g > 1.0f || b < 0.0f || b > 1.0f;
+}
+
+using ViewerGLsizeiptr = std::ptrdiff_t;
+using ViewerGLGenBuffersProc = void (APIENTRY *)(GLsizei, GLuint*);
+using ViewerGLBindBufferProc = void (APIENTRY *)(GLenum, GLuint);
+using ViewerGLBufferDataProc = void (APIENTRY *)(GLenum, ViewerGLsizeiptr, const void*, GLenum);
+using ViewerGLDeleteBuffersProc = void (APIENTRY *)(GLsizei, const GLuint*);
+
+struct ViewerGlBufferApi {
+  bool loaded = false;
+  bool available = false;
+  ViewerGLGenBuffersProc genBuffers = nullptr;
+  ViewerGLBindBufferProc bindBuffer = nullptr;
+  ViewerGLBufferDataProc bufferData = nullptr;
+  ViewerGLDeleteBuffersProc deleteBuffers = nullptr;
+};
+
+const ViewerGlBufferApi& viewerGlBufferApi() {
+  static ViewerGlBufferApi api{};
+  if (!api.loaded) {
+    api.loaded = true;
+    api.genBuffers = reinterpret_cast<ViewerGLGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
+    api.bindBuffer = reinterpret_cast<ViewerGLBindBufferProc>(glfwGetProcAddress("glBindBuffer"));
+    api.bufferData = reinterpret_cast<ViewerGLBufferDataProc>(glfwGetProcAddress("glBufferData"));
+    api.deleteBuffers = reinterpret_cast<ViewerGLDeleteBuffersProc>(glfwGetProcAddress("glDeleteBuffers"));
+    api.available = api.genBuffers && api.bindBuffer && api.bufferData && api.deleteBuffers;
+  }
+  return api;
+}
+
+struct PointBufferCache {
+  GLuint verts = 0;
+  GLuint colors = 0;
+  uint64_t uploadedSerial = 0;
+  GLsizei uploadedPointCount = 0;
+};
+
+void releasePointBufferCache(PointBufferCache* cache) {
+  if (!cache) return;
+  const ViewerGlBufferApi& api = viewerGlBufferApi();
+  if (api.available) {
+    if (cache->verts != 0) api.deleteBuffers(1, &cache->verts);
+    if (cache->colors != 0) api.deleteBuffers(1, &cache->colors);
+    api.bindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  cache->verts = 0;
+  cache->colors = 0;
+  cache->uploadedSerial = 0;
+  cache->uploadedPointCount = 0;
+}
+
+bool ensurePointBufferCacheUploaded(const MeshData& mesh, PointBufferCache* cache) {
+  if (!cache) return false;
+  const ViewerGlBufferApi& api = viewerGlBufferApi();
+  if (!api.available) return false;
+  if (mesh.pointVerts.empty() || mesh.pointColors.empty()) return false;
+  const GLsizei pointCount = static_cast<GLsizei>(mesh.pointVerts.size() / 3u);
+  if (cache->uploadedSerial == mesh.serial && cache->uploadedPointCount == pointCount &&
+      cache->verts != 0 && cache->colors != 0) {
+    return true;
+  }
+  if (cache->verts == 0) api.genBuffers(1, &cache->verts);
+  if (cache->colors == 0) api.genBuffers(1, &cache->colors);
+  if (cache->verts == 0 || cache->colors == 0) return false;
+
+  api.bindBuffer(GL_ARRAY_BUFFER, cache->verts);
+  api.bufferData(
+      GL_ARRAY_BUFFER,
+      static_cast<ViewerGLsizeiptr>(mesh.pointVerts.size() * sizeof(float)),
+      mesh.pointVerts.data(),
+      GL_STATIC_DRAW);
+  api.bindBuffer(GL_ARRAY_BUFFER, cache->colors);
+  api.bufferData(
+      GL_ARRAY_BUFFER,
+      static_cast<ViewerGLsizeiptr>(mesh.pointColors.size() * sizeof(float)),
+      mesh.pointColors.data(),
+      GL_STATIC_DRAW);
+  api.bindBuffer(GL_ARRAY_BUFFER, 0);
+
+  cache->uploadedSerial = mesh.serial;
+  cache->uploadedPointCount = pointCount;
+  return true;
 }
 
 void mapDisplayColor(float inR, float inG, float inB, float* outR, float* outG, float* outB) {
@@ -424,6 +548,8 @@ struct ResolvedPayload {
   int eotf = 2;
   std::string sourceMode = "identity";
   int plotInLinear = 0;
+  int showOverflow = 0;
+  int highlightOverflow = 1;
   int alwaysOnTop = 0;
   std::string quality = "Medium";
   std::string paramHash;
@@ -436,6 +562,8 @@ struct InputCloudPayload {
   std::string senderId;
   int resolution = 33;
   std::string quality = "Medium";
+  int showOverflow = 0;
+  int highlightOverflow = 1;
   std::string paramHash;
   std::string points;
 };
@@ -456,6 +584,8 @@ bool parseParamsMessage(const std::string& msg, ResolvedPayload* out) {
   extractJsonString(msg, "quality", &out->quality);
   extractJsonString(msg, "sourceMode", &out->sourceMode);
   extractJsonInt(msg, "plotInLinear", &out->plotInLinear);
+  extractJsonInt(msg, "showOverflow", &out->showOverflow);
+  extractJsonInt(msg, "highlightOverflow", &out->highlightOverflow);
   extractJsonInt(msg, "alwaysOnTop", &out->alwaysOnTop);
   extractJsonString(msg, "paramHash", &out->paramHash);
   extractJsonInt(msg, "in_gamut", &out->in_gamut);
@@ -490,6 +620,8 @@ bool parseInputCloudMessage(const std::string& msg, InputCloudPayload* out) {
   int resolution = 33;
   if (extractJsonInt(msg, "resolution", &resolution)) out->resolution = resolution;
   extractJsonString(msg, "quality", &out->quality);
+  extractJsonInt(msg, "showOverflow", &out->showOverflow);
+  extractJsonInt(msg, "highlightOverflow", &out->highlightOverflow);
   extractJsonString(msg, "paramHash", &out->paramHash);
   if (!extractJsonString(msg, "points", &out->points)) return false;
   return true;
@@ -643,6 +775,7 @@ void buildCubeData(const ResolvedPayload& payload, MeshData* out) {
     if (db > maxDelta) maxDelta = db;
   }
   mesh.maxDelta = maxDelta;
+  mesh.serial = nextMeshSerial();
   const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
   mesh.pointVerts.reserve((count / static_cast<size_t>(interiorStep * interiorStep * interiorStep) + 1u) * 3u);
   mesh.pointColors.reserve(mesh.pointVerts.capacity());
@@ -658,15 +791,25 @@ void buildCubeData(const ResolvedPayload& payload, MeshData* out) {
         const float rx = dst[si + 0];
         const float ry = dst[si + 1];
         const float rz = dst[si + 2];
-        mesh.pointVerts.push_back(rx * 2.0f - 1.0f);
-        mesh.pointVerts.push_back(ry * 2.0f - 1.0f);
-        mesh.pointVerts.push_back(rz * 2.0f - 1.0f);
+        const bool overflowPoint = rgbOutOfBounds(rx, ry, rz);
+        const float plotX = payload.showOverflow != 0 ? rx : clamp01(rx);
+        const float plotY = payload.showOverflow != 0 ? ry : clamp01(ry);
+        const float plotZ = payload.showOverflow != 0 ? rz : clamp01(rz);
+        mesh.pointVerts.push_back(plotX * 2.0f - 1.0f);
+        mesh.pointVerts.push_back(plotY * 2.0f - 1.0f);
+        mesh.pointVerts.push_back(plotZ * 2.0f - 1.0f);
         // Blend source hue with transformed value to better communicate shape and look intent.
-        const float mixR = src[si + 0] * 0.86f + clamp01(rx) * 0.14f;
-        const float mixG = src[si + 1] * 0.86f + clamp01(ry) * 0.14f;
-        const float mixB = src[si + 2] * 0.86f + clamp01(rz) * 0.14f;
         float cr = 0.0f, cg = 0.0f, cb = 0.0f;
-        mapDisplayColor(mixR, mixG, mixB, &cr, &cg, &cb);
+        if (payload.showOverflow != 0 && payload.highlightOverflow != 0 && overflowPoint) {
+          cr = 1.0f;
+          cg = 0.0f;
+          cb = 0.0f;
+        } else {
+          const float mixR = src[si + 0] * 0.86f + clamp01(rx) * 0.14f;
+          const float mixG = src[si + 1] * 0.86f + clamp01(ry) * 0.14f;
+          const float mixB = src[si + 2] * 0.86f + clamp01(rz) * 0.14f;
+          mapDisplayColor(mixR, mixG, mixB, &cr, &cg, &cb);
+        }
         mesh.pointColors.push_back(cr);
         mesh.pointColors.push_back(cg);
         mesh.pointColors.push_back(cb);
@@ -685,16 +828,24 @@ bool buildInputCloudMesh(const InputCloudPayload& payload, MeshData* out) {
   mesh.paramHash = payload.paramHash;
   mesh.renderOk = true;
   mesh.maxDelta = 0.0f;
+  mesh.serial = nextMeshSerial();
   float sr = 0.0f, sg = 0.0f, sb = 0.0f, dr = 0.0f, dg = 0.0f, db = 0.0f;
   while (is >> sr >> sg >> sb >> dr >> dg >> db) {
-    mesh.pointVerts.push_back(dr * 2.0f - 1.0f);
-    mesh.pointVerts.push_back(dg * 2.0f - 1.0f);
-    mesh.pointVerts.push_back(db * 2.0f - 1.0f);
-    const float mixR = clamp01(sr);
-    const float mixG = clamp01(sg);
-    const float mixB = clamp01(sb);
+    const bool overflowPoint = rgbOutOfBounds(dr, dg, db);
+    const float plotR = payload.showOverflow != 0 ? dr : clamp01(dr);
+    const float plotG = payload.showOverflow != 0 ? dg : clamp01(dg);
+    const float plotB = payload.showOverflow != 0 ? db : clamp01(db);
+    mesh.pointVerts.push_back(plotR * 2.0f - 1.0f);
+    mesh.pointVerts.push_back(plotG * 2.0f - 1.0f);
+    mesh.pointVerts.push_back(plotB * 2.0f - 1.0f);
     float cr = 0.0f, cg = 0.0f, cb = 0.0f;
-    mapDisplayColor(mixR, mixG, mixB, &cr, &cg, &cb);
+    if (payload.showOverflow != 0 && payload.highlightOverflow != 0 && overflowPoint) {
+      cr = 1.0f;
+      cg = 0.0f;
+      cb = 0.0f;
+    } else {
+      mapDisplayColor(clamp01(sr), clamp01(sg), clamp01(sb), &cr, &cg, &cb);
+    }
     mesh.pointColors.push_back(cr);
     mesh.pointColors.push_back(cg);
     mesh.pointColors.push_back(cb);
@@ -1076,6 +1227,9 @@ int runApp() {
   }
   logViewerEvent(std::string("Viewer startup ok ") + kViewerVersionString);
 
+#if defined(_WIN32)
+  applyWindowsWindowIcon(window);
+#endif
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
   if (GLFWmonitor* monitor = glfwGetPrimaryMonitor()) {
@@ -1092,6 +1246,7 @@ int runApp() {
 
   AppState app{};
   resetCamera(&app.cam);
+  PointBufferCache pointBufferCache{};
   glfwSetWindowUserPointer(window, &app);
   glfwSetFramebufferSizeCallback(window, onFramebufferSize);
   glfwSetWindowCloseCallback(window, onWindowClose);
@@ -1284,6 +1439,8 @@ int runApp() {
 
     glEnableClientState(GL_VERTEX_ARRAY);
     glEnableClientState(GL_COLOR_ARRAY);
+    const ViewerGlBufferApi& glBufferApi = viewerGlBufferApi();
+    const bool usePointBuffers = ensurePointBufferCacheUploaded(mesh, &pointBufferCache);
     float clampedDist = app.cam.distance;
     if (clampedDist < 0.6f) clampedDist = 0.6f;
     if (clampedDist > 30.0f) clampedDist = 30.0f;
@@ -1302,8 +1459,15 @@ int runApp() {
     if (pointSize < 1.2f) pointSize = 1.2f;
     if (pointSize > 5.0f) pointSize = 5.0f;
     glPointSize(pointSize);
-    glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data());
-    glColorPointer(3, GL_FLOAT, 0, mesh.pointColors.empty() ? nullptr : mesh.pointColors.data());
+    if (usePointBuffers) {
+      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.verts);
+      glVertexPointer(3, GL_FLOAT, 0, nullptr);
+      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.colors);
+      glColorPointer(3, GL_FLOAT, 0, nullptr);
+    } else {
+      glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data());
+      glColorPointer(3, GL_FLOAT, 0, mesh.pointColors.empty() ? nullptr : mesh.pointColors.data());
+    }
     glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
     if (!mesh.pointVerts.empty()) {
       // Subtle interior fill pass to improve interior visibility for both identity and input cloud modes.
@@ -1311,9 +1475,16 @@ int runApp() {
       glDisableClientState(GL_COLOR_ARRAY);
       glColor4f(0.95f, 0.96f, 1.0f, 0.05f);
       glPointSize(pointSize * 0.55f);
+      if (usePointBuffers) {
+        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.verts);
+        glVertexPointer(3, GL_FLOAT, 0, nullptr);
+      }
       glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
       glEnableClientState(GL_COLOR_ARRAY);
       glEnable(GL_DEPTH_TEST);
+    }
+    if (usePointBuffers) {
+      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
     }
     glDisableClientState(GL_COLOR_ARRAY);
     glDisableClientState(GL_VERTEX_ARRAY);
@@ -1325,6 +1496,7 @@ int runApp() {
   wakeIpcServer();
   if (ipcThread.joinable()) ipcThread.join();
 
+  releasePointBufferCache(&pointBufferCache);
   glfwDestroyWindow(window);
   glfwTerminate();
 
