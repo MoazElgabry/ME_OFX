@@ -1164,36 +1164,6 @@ bool buildInputCloudMeshOnCuda(const InputCloudPayload& payload,
                                MeshData* out);
 #endif
 
-#if defined(__APPLE__)
-bool buildCubeDataOnMetal(const ResolvedPayload& payload,
-                          OpenDRTViewerMetal::MeshCache* cache,
-                          MeshData* out) {
-  if (!out) return false;
-  std::string error;
-  std::string transformBackend;
-  float maxDelta = 0.0f;
-  if (!OpenDRTViewerMetal::buildIdentityMesh(
-          cache,
-          buildResolvedParams(payload),
-          payload.resolution,
-          payload.showOverflow != 0,
-          payload.highlightOverflow != 0,
-          out->serial,
-          &transformBackend,
-          &maxDelta,
-          &error)) {
-    if (!error.empty()) {
-      logViewerEvent(std::string("Metal identity mesh build failed: ") + error);
-    }
-    return false;
-  }
-  out->transformBackendLabel = transformBackend.empty() ? "metal" : transformBackend;
-  out->maxDelta = maxDelta;
-  out->pointCount = static_cast<size_t>(cache ? cache->pointCount : 0);
-  return cache && cache->available;
-}
-#endif
-
 struct PointBufferCache {
   GLuint verts = 0;
   GLuint colors = 0;
@@ -1483,6 +1453,36 @@ struct ResolvedPayload {
   std::string lookPayload;
   std::string tonescalePayload;
 };
+
+#if defined(__APPLE__)
+bool buildCubeDataOnMetal(const ResolvedPayload& payload,
+                          OpenDRTViewerMetal::MeshCache* cache,
+                          MeshData* out) {
+  if (!out) return false;
+  std::string error;
+  std::string transformBackend;
+  float maxDelta = 0.0f;
+  if (!OpenDRTViewerMetal::buildIdentityMesh(
+          cache,
+          buildResolvedParams(payload),
+          payload.resolution,
+          payload.showOverflow != 0,
+          payload.highlightOverflow != 0,
+          out->serial,
+          &transformBackend,
+          &maxDelta,
+          &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("Metal identity mesh build failed: ") + error);
+    }
+    return false;
+  }
+  out->transformBackendLabel = transformBackend.empty() ? "metal" : transformBackend;
+  out->maxDelta = maxDelta;
+  out->pointCount = static_cast<size_t>(cache ? cache->pointCount : 0);
+  return cache && cache->available;
+}
+#endif
 
 struct InputCloudPayload {
   uint64_t seq = 0;
@@ -2648,8 +2648,8 @@ int runApp() {
     return 1;
   }
 #endif
-  const OpenDRTViewerOpenGLPresenter::InitResult glPresenterInit =
 #if !defined(__APPLE__)
+  const OpenDRTViewerOpenGLPresenter::InitResult glPresenterInit =
       OpenDRTViewerOpenGLPresenter::initialize(window);
   gpuCaps.glPresenterReady = glPresenterInit.ready;
   gpuCaps.presenterBackendLabel = glPresenterInit.ready ? "gl-shader" : "gl-legacy";
@@ -2657,7 +2657,6 @@ int runApp() {
     logViewerEvent(std::string("OpenGL presenter init fallback: ") + glPresenterInit.reason);
   }
 #else
-      OpenDRTViewerOpenGLPresenter::InitResult{};
   gpuCaps.glPresenterReady = false;
 #endif
   IdentityComputeCache identityComputeCache{};

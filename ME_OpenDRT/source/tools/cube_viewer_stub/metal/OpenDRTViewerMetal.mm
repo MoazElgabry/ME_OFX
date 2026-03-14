@@ -620,6 +620,8 @@ void releaseCacheImpl(CacheImpl* impl) {
 
 }  // namespace
 
+namespace OpenDRTViewerMetal {
+
 ProbeResult probe() {
   ProbeResult result{};
   @autoreleasepool {
