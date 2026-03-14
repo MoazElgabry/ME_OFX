@@ -1111,6 +1111,7 @@ class OpenDRTProcessor {
   bool debugLogEnabled_ = false;
   bool perfLogEnabled_ = false;
   bool disableDerivedEnabled_ = false;
+  RuntimeBackend lastBackend_ = RuntimeBackend::CPU;
 #if defined(ME_OPENDRT_HAS_CUDA)
   // CUDA feature flags and cached device/runtime state.
   bool cudaLegacySyncEnabled_ = false;
@@ -1122,7 +1123,6 @@ class OpenDRTProcessor {
   // OpenCL feature flags and cached runtime state.
   bool openclForceEnabled_ = false;
   bool openclDisableEnabled_ = false;
-  RuntimeBackend lastBackend_ = RuntimeBackend::CPU;
   bool openclDisable2DCopyEnabled_ = false;
   bool openclExternalKernelFallbackEnabled_ = true;
   bool openclAvailability_ = false;
