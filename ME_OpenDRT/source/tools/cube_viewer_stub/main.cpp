@@ -31,10 +31,23 @@
 
 #if defined(_WIN32)
 #define GLFW_EXPOSE_NATIVE_WIN32
+#elif defined(__APPLE__)
+#define GLFW_EXPOSE_NATIVE_COCOA
 #endif
 #include <GLFW/glfw3.h>
 #if defined(_WIN32)
 #include <GLFW/glfw3native.h>
+#elif defined(__APPLE__)
+#include <GLFW/glfw3native.h>
+#endif
+
+#if !defined(__APPLE__)
+#include "gl/OpenDRTViewerOpenGLPresenter.h"
+#endif
+#if defined(__APPLE__)
+#include "metal/OpenDRTViewerMetal.h"
+#elif defined(OFX_SUPPORTS_CUDARENDER)
+#include "cuda/OpenDRTViewerCuda.h"
 #endif
 
 #ifndef GL_ARRAY_BUFFER
@@ -42,6 +55,33 @@
 #endif
 #ifndef GL_STATIC_DRAW
 #define GL_STATIC_DRAW 0x88E4
+#endif
+#ifndef GL_DYNAMIC_DRAW
+#define GL_DYNAMIC_DRAW 0x88E8
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER
+#define GL_SHADER_STORAGE_BUFFER 0x90D2
+#endif
+#ifndef GL_COMPUTE_SHADER
+#define GL_COMPUTE_SHADER 0x91B9
+#endif
+#ifndef GL_LINK_STATUS
+#define GL_LINK_STATUS 0x8B82
+#endif
+#ifndef GL_COMPILE_STATUS
+#define GL_COMPILE_STATUS 0x8B81
+#endif
+#ifndef GL_INFO_LOG_LENGTH
+#define GL_INFO_LOG_LENGTH 0x8B84
+#endif
+#ifndef GL_SHADER_STORAGE_BARRIER_BIT
+#define GL_SHADER_STORAGE_BARRIER_BIT 0x2000
+#endif
+#ifndef GL_BUFFER_UPDATE_BARRIER_BIT
+#define GL_BUFFER_UPDATE_BARRIER_BIT 0x0200
+#endif
+#ifndef GL_SHADER_STORAGE_BUFFER_BINDING
+#define GL_SHADER_STORAGE_BUFFER_BINDING 0x90D3
 #endif
 
 #include "OpenDRTParams.h"
@@ -72,7 +112,10 @@ std::string pipeName() {
 
 std::string viewerLogPath() {
 #if defined(_WIN32)
-  return std::string();
+  const char* temp = std::getenv("TEMP");
+  if (!temp || temp[0] == '\0') temp = std::getenv("TMP");
+  if (!temp || temp[0] == '\0') return "C:\\Windows\\Temp\\ME_OpenDRT_CubeViewer.log";
+  return std::string(temp) + "\\ME_OpenDRT_CubeViewer.log";
 #elif defined(__APPLE__)
   const char* home = std::getenv("HOME");
   if (!home || home[0] == '\0') return "/tmp/ME_OpenDRT_CubeViewer.log";
@@ -85,18 +128,64 @@ std::string viewerLogPath() {
 }
 
 void logViewerEvent(const std::string& msg) {
-#if !defined(_WIN32)
   const std::string path = viewerLogPath();
+  if (path.empty()) return;
   FILE* f = std::fopen(path.c_str(), "a");
   if (!f) return;
   std::fprintf(f, "[ME_OpenDRT_CubeViewer] %s\n", msg.c_str());
   std::fclose(f);
-#else
-  (void)msg;
-#endif
 }
 
-const char* kViewerVersionString = "v1.2.10";
+bool viewerDiagnosticsEnabled() {
+  const char* env = std::getenv("ME_OPENDRT_VIEWER_DIAGNOSTICS");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+bool viewerInputComputeEnabled() {
+  const char* env = std::getenv("ME_OPENDRT_VIEWER_INPUT_COMPUTE");
+  if (env != nullptr && env[0] != '\0') return env[0] != '0';
+  return true;
+}
+
+bool viewerParityCheckEnabled() {
+  const char* env = std::getenv("ME_OPENDRT_VIEWER_PARITY_CHECK");
+  return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
+
+void logViewerDiagnostic(bool enabled, const std::string& msg) {
+  if (!enabled) return;
+  logViewerEvent(std::string("[diag] ") + msg);
+}
+
+size_t expectedIdentityDisplayPointCount(int res) {
+  const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
+  size_t count = 0;
+  for (int z = 0; z < res; ++z) {
+    for (int y = 0; y < res; ++y) {
+      for (int x = 0; x < res; ++x) {
+        const bool onBoundary = (x == 0 || y == 0 || z == 0 || x == res - 1 || y == res - 1 || z == res - 1);
+        if (!onBoundary && (((x % interiorStep) != 0) || ((y % interiorStep) != 0) || ((z % interiorStep) != 0))) {
+          continue;
+        }
+        ++count;
+      }
+    }
+  }
+  return count;
+}
+
+std::string pointDrawSourceLabel(bool useComputeIdentityBuffers,
+                                 bool useComputeInputBuffers,
+                                 bool usePointBuffers,
+                                 bool hasCpuArrays) {
+  if (useComputeIdentityBuffers) return "identity-compute";
+  if (useComputeInputBuffers) return "input-compute";
+  if (usePointBuffers) return "gl-buffer";
+  if (hasCpuArrays) return "cpu-array";
+  return "none";
+}
+
+const char* kViewerVersionString = "v1.2.11";
 
 #if defined(_WIN32)
 void applyWindowsWindowIcon(GLFWwindow* window) {
@@ -245,6 +334,59 @@ void quatToMatrix(Quat q, float out16[16]) {
   out16[15] = 1.0f;
 }
 
+void makeIdentityMatrix(float out16[16]) {
+  std::memset(out16, 0, sizeof(float) * 16u);
+  out16[0] = 1.0f;
+  out16[5] = 1.0f;
+  out16[10] = 1.0f;
+  out16[15] = 1.0f;
+}
+
+void makeTranslationMatrix(float tx, float ty, float tz, float out16[16]) {
+  makeIdentityMatrix(out16);
+  out16[12] = tx;
+  out16[13] = ty;
+  out16[14] = tz;
+}
+
+void multiplyMatrix4(const float a[16], const float b[16], float out16[16]) {
+  float result[16] = {};
+  for (int col = 0; col < 4; ++col) {
+    for (int row = 0; row < 4; ++row) {
+      result[col * 4 + row] =
+          a[0 * 4 + row] * b[col * 4 + 0] +
+          a[1 * 4 + row] * b[col * 4 + 1] +
+          a[2 * 4 + row] * b[col * 4 + 2] +
+          a[3 * 4 + row] * b[col * 4 + 3];
+    }
+  }
+  std::memcpy(out16, result, sizeof(result));
+}
+
+void buildSceneMvp(int width, int height, const CameraState& cam, float out16[16]) {
+  const double aspect = static_cast<double>(width) / static_cast<double>(height > 0 ? height : 1);
+  const double fovy = 35.0;
+  const double zNear = 0.08;
+  const double zFar = 120.0;
+  const double ymax = zNear * std::tan(fovy * 0.5 * 3.141592653589793 / 180.0);
+  const double xmax = ymax * aspect;
+
+  float projection[16] = {};
+  projection[0] = static_cast<float>((2.0 * zNear) / (2.0 * xmax));
+  projection[5] = static_cast<float>((2.0 * zNear) / (2.0 * ymax));
+  projection[10] = static_cast<float>(-(zFar + zNear) / (zFar - zNear));
+  projection[11] = -1.0f;
+  projection[14] = static_cast<float>(-(2.0 * zFar * zNear) / (zFar - zNear));
+
+  float translation[16];
+  float rotation[16];
+  float modelView[16];
+  makeTranslationMatrix(cam.panX, cam.panY, -cam.distance, translation);
+  quatToMatrix(Quat{cam.qx, cam.qy, cam.qz, cam.qw}, rotation);
+  multiplyMatrix4(translation, rotation, modelView);
+  multiplyMatrix4(projection, modelView, out16);
+}
+
 void resetCamera(CameraState* cam) {
   if (!cam) return;
   cam->distance = 4.35f;
@@ -286,10 +428,117 @@ struct MeshData {
   std::string paramHash;
   bool renderOk = false;
   float maxDelta = 0.0f;
+  float parityMaxDelta = 0.0f;
   uint64_t serial = 0;
+  size_t pointCount = 0;
+  std::string transformBackendLabel = "cpu";
+  std::string packBackendLabel = "cpu-array";
   std::vector<float> pointVerts;
   std::vector<float> pointColors;
 };
+
+enum class ViewerGpuBackend {
+  CpuReference,
+  OpenGlBufferedDraw,
+  OpenGlComputeIdentity,
+  CudaComputeMesh,
+  MetalComputeMesh,
+};
+
+struct ViewerGpuCapabilities {
+  bool glBufferObjects = false;
+  bool glComputeShaders = false;
+  bool inputCloudComputeEnabled = false;
+  bool parityCheckEnabled = false;
+  bool glPresenterReady = false;
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  bool cudaViewerAvailable = false;
+  bool cudaInteropReady = false;
+  bool cudaStartupReady = false;
+  std::string cudaDeviceName;
+  std::string cudaReason;
+#endif
+  bool metalViewerAvailable = false;
+  bool metalQueueReady = false;
+  ViewerGpuBackend activeBackend = ViewerGpuBackend::CpuReference;
+  std::string glVersion;
+  std::string activeBackendLabel = "cpu-ref";
+  std::string roadmapLabel = "cpu-ref";
+  std::string presenterBackendLabel = "cpu";
+  std::string metalDeviceName;
+};
+
+struct ViewerRuntimeState {
+  std::string sessionBackendLabel = "cpu-ref";
+  std::string presenterBackendLabel = "cpu";
+  bool identityGpuDemoted = false;
+  bool inputGpuDemoted = false;
+  int identityParityFailures = 0;
+  std::string identityDemotionReason;
+  std::string inputDemotionReason;
+};
+
+using ViewerGLCreateShaderProc = GLuint(APIENTRY *)(GLenum);
+using ViewerGLShaderSourceProc = void(APIENTRY *)(GLuint, GLsizei, const char* const*, const GLint*);
+using ViewerGLCompileShaderProc = void(APIENTRY *)(GLuint);
+using ViewerGLGetShaderivProc = void(APIENTRY *)(GLuint, GLenum, GLint*);
+using ViewerGLGetShaderInfoLogProc = void(APIENTRY *)(GLuint, GLsizei, GLsizei*, char*);
+using ViewerGLCreateProgramProc = GLuint(APIENTRY *)(void);
+using ViewerGLAttachShaderProc = void(APIENTRY *)(GLuint, GLuint);
+using ViewerGLLinkProgramProc = void(APIENTRY *)(GLuint);
+using ViewerGLGetProgramivProc = void(APIENTRY *)(GLuint, GLenum, GLint*);
+using ViewerGLGetProgramInfoLogProc = void(APIENTRY *)(GLuint, GLsizei, GLsizei*, char*);
+using ViewerGLDeleteShaderProc = void(APIENTRY *)(GLuint);
+using ViewerGLDeleteProgramProc = void(APIENTRY *)(GLuint);
+using ViewerGLUseProgramProc = void(APIENTRY *)(GLuint);
+using ViewerGLGetUniformLocationProc = GLint(APIENTRY *)(GLuint, const char*);
+using ViewerGLUniform1iProc = void(APIENTRY *)(GLint, GLint);
+using ViewerGLBindBufferBaseProc = void(APIENTRY *)(GLenum, GLuint, GLuint);
+using ViewerGLDispatchComputeProc = void(APIENTRY *)(GLuint, GLuint, GLuint);
+using ViewerGLMemoryBarrierProc = void(APIENTRY *)(GLbitfield);
+using ViewerGLBufferSubDataProc = void(APIENTRY *)(GLenum, std::ptrdiff_t, std::ptrdiff_t, const void*);
+using ViewerGLGetBufferSubDataProc = void(APIENTRY *)(GLenum, std::ptrdiff_t, std::ptrdiff_t, void*);
+
+struct IdentityComputeCache {
+  GLuint src = 0;
+  GLuint dst = 0;
+  GLuint verts = 0;
+  GLuint colors = 0;
+  GLuint counter = 0;
+  GLuint program = 0;
+  GLint resLoc = -1;
+  GLint interiorStepLoc = -1;
+  GLint showOverflowLoc = -1;
+  GLint highlightOverflowLoc = -1;
+  uint64_t builtSerial = 0;
+  GLsizei pointCount = 0;
+  bool available = false;
+};
+
+struct InputCloudComputeCache {
+  GLuint input = 0;
+  GLuint verts = 0;
+  GLuint colors = 0;
+  GLuint program = 0;
+  GLint pointCountLoc = -1;
+  GLint showOverflowLoc = -1;
+  GLint highlightOverflowLoc = -1;
+  uint64_t builtSerial = 0;
+  GLsizei pointCount = 0;
+  bool available = false;
+};
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+struct IdentityCudaDrawCache {
+  OpenDRTViewerCuda::IdentityCache cache{};
+  size_t pointCapacity = 0;
+};
+
+struct InputCudaDrawCache {
+  OpenDRTViewerCuda::InputCache cache{};
+  size_t pointCapacity = 0;
+};
+#endif
 
 uint64_t nextMeshSerial() {
   static std::atomic<uint64_t> serial{1u};
@@ -331,6 +580,8 @@ struct ViewerGlBufferApi {
   ViewerGLGenBuffersProc genBuffers = nullptr;
   ViewerGLBindBufferProc bindBuffer = nullptr;
   ViewerGLBufferDataProc bufferData = nullptr;
+  ViewerGLBufferSubDataProc bufferSubData = nullptr;
+  ViewerGLGetBufferSubDataProc getBufferSubData = nullptr;
   ViewerGLDeleteBuffersProc deleteBuffers = nullptr;
 };
 
@@ -341,17 +592,623 @@ const ViewerGlBufferApi& viewerGlBufferApi() {
     api.genBuffers = reinterpret_cast<ViewerGLGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
     api.bindBuffer = reinterpret_cast<ViewerGLBindBufferProc>(glfwGetProcAddress("glBindBuffer"));
     api.bufferData = reinterpret_cast<ViewerGLBufferDataProc>(glfwGetProcAddress("glBufferData"));
+    api.bufferSubData = reinterpret_cast<ViewerGLBufferSubDataProc>(glfwGetProcAddress("glBufferSubData"));
+    api.getBufferSubData = reinterpret_cast<ViewerGLGetBufferSubDataProc>(glfwGetProcAddress("glGetBufferSubData"));
     api.deleteBuffers = reinterpret_cast<ViewerGLDeleteBuffersProc>(glfwGetProcAddress("glDeleteBuffers"));
     api.available = api.genBuffers && api.bindBuffer && api.bufferData && api.deleteBuffers;
   }
   return api;
 }
 
+struct ViewerGlComputeApi {
+  bool loaded = false;
+  bool available = false;
+  ViewerGLCreateShaderProc createShader = nullptr;
+  ViewerGLShaderSourceProc shaderSource = nullptr;
+  ViewerGLCompileShaderProc compileShader = nullptr;
+  ViewerGLGetShaderivProc getShaderiv = nullptr;
+  ViewerGLGetShaderInfoLogProc getShaderInfoLog = nullptr;
+  ViewerGLCreateProgramProc createProgram = nullptr;
+  ViewerGLAttachShaderProc attachShader = nullptr;
+  ViewerGLLinkProgramProc linkProgram = nullptr;
+  ViewerGLGetProgramivProc getProgramiv = nullptr;
+  ViewerGLGetProgramInfoLogProc getProgramInfoLog = nullptr;
+  ViewerGLDeleteShaderProc deleteShader = nullptr;
+  ViewerGLDeleteProgramProc deleteProgram = nullptr;
+  ViewerGLUseProgramProc useProgram = nullptr;
+  ViewerGLGetUniformLocationProc getUniformLocation = nullptr;
+  ViewerGLUniform1iProc uniform1i = nullptr;
+  ViewerGLBindBufferBaseProc bindBufferBase = nullptr;
+  ViewerGLDispatchComputeProc dispatchCompute = nullptr;
+  ViewerGLMemoryBarrierProc memoryBarrier = nullptr;
+};
+
+const ViewerGlComputeApi& viewerGlComputeApi() {
+  static ViewerGlComputeApi api{};
+  if (!api.loaded) {
+    api.loaded = true;
+    api.createShader = reinterpret_cast<ViewerGLCreateShaderProc>(glfwGetProcAddress("glCreateShader"));
+    api.shaderSource = reinterpret_cast<ViewerGLShaderSourceProc>(glfwGetProcAddress("glShaderSource"));
+    api.compileShader = reinterpret_cast<ViewerGLCompileShaderProc>(glfwGetProcAddress("glCompileShader"));
+    api.getShaderiv = reinterpret_cast<ViewerGLGetShaderivProc>(glfwGetProcAddress("glGetShaderiv"));
+    api.getShaderInfoLog = reinterpret_cast<ViewerGLGetShaderInfoLogProc>(glfwGetProcAddress("glGetShaderInfoLog"));
+    api.createProgram = reinterpret_cast<ViewerGLCreateProgramProc>(glfwGetProcAddress("glCreateProgram"));
+    api.attachShader = reinterpret_cast<ViewerGLAttachShaderProc>(glfwGetProcAddress("glAttachShader"));
+    api.linkProgram = reinterpret_cast<ViewerGLLinkProgramProc>(glfwGetProcAddress("glLinkProgram"));
+    api.getProgramiv = reinterpret_cast<ViewerGLGetProgramivProc>(glfwGetProcAddress("glGetProgramiv"));
+    api.getProgramInfoLog = reinterpret_cast<ViewerGLGetProgramInfoLogProc>(glfwGetProcAddress("glGetProgramInfoLog"));
+    api.deleteShader = reinterpret_cast<ViewerGLDeleteShaderProc>(glfwGetProcAddress("glDeleteShader"));
+    api.deleteProgram = reinterpret_cast<ViewerGLDeleteProgramProc>(glfwGetProcAddress("glDeleteProgram"));
+    api.useProgram = reinterpret_cast<ViewerGLUseProgramProc>(glfwGetProcAddress("glUseProgram"));
+    api.getUniformLocation = reinterpret_cast<ViewerGLGetUniformLocationProc>(glfwGetProcAddress("glGetUniformLocation"));
+    api.uniform1i = reinterpret_cast<ViewerGLUniform1iProc>(glfwGetProcAddress("glUniform1i"));
+    api.bindBufferBase = reinterpret_cast<ViewerGLBindBufferBaseProc>(glfwGetProcAddress("glBindBufferBase"));
+    api.dispatchCompute = reinterpret_cast<ViewerGLDispatchComputeProc>(glfwGetProcAddress("glDispatchCompute"));
+    api.memoryBarrier = reinterpret_cast<ViewerGLMemoryBarrierProc>(glfwGetProcAddress("glMemoryBarrier"));
+    api.available = api.createShader && api.shaderSource && api.compileShader && api.getShaderiv &&
+                    api.getShaderInfoLog && api.createProgram && api.attachShader && api.linkProgram &&
+                    api.getProgramiv && api.getProgramInfoLog && api.deleteShader && api.deleteProgram &&
+                    api.useProgram && api.getUniformLocation && api.uniform1i && api.bindBufferBase &&
+                    api.dispatchCompute && api.memoryBarrier;
+  }
+  return api;
+}
+
+std::string currentGlVersionString() {
+#if defined(__APPLE__)
+  return "metal-presenter";
+#else
+  const GLubyte* version = glGetString(GL_VERSION);
+  return version ? reinterpret_cast<const char*>(version) : std::string("unknown");
+#endif
+}
+
+std::string readShaderLog(GLuint handle, bool program, const ViewerGlComputeApi& api) {
+  GLint logLength = 0;
+  if (program) {
+    api.getProgramiv(handle, GL_INFO_LOG_LENGTH, &logLength);
+  } else {
+    api.getShaderiv(handle, GL_INFO_LOG_LENGTH, &logLength);
+  }
+  if (logLength <= 1) return std::string();
+  std::string log(static_cast<size_t>(logLength), '\0');
+  GLsizei written = 0;
+  if (program) {
+    api.getProgramInfoLog(handle, logLength, &written, log.data());
+  } else {
+    api.getShaderInfoLog(handle, logLength, &written, log.data());
+  }
+  if (written > 0 && static_cast<size_t>(written) < log.size()) {
+    log.resize(static_cast<size_t>(written));
+  }
+  return log;
+}
+
+ViewerGpuCapabilities detectViewerGpuCapabilities() {
+  ViewerGpuCapabilities caps{};
+  caps.parityCheckEnabled = viewerParityCheckEnabled();
+#if defined(__APPLE__)
+  caps.glVersion = "metal-presenter";
+  caps.glBufferObjects = false;
+  caps.glComputeShaders = false;
+#else
+  caps.glVersion = currentGlVersionString();
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  caps.glBufferObjects = bufferApi.available;
+  caps.glComputeShaders = glfwGetProcAddress("glDispatchCompute") != nullptr &&
+                          glfwGetProcAddress("glBindBufferBase") != nullptr;
+#endif
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  const OpenDRTViewerCuda::ProbeResult cudaProbe = OpenDRTViewerCuda::probe();
+  caps.cudaViewerAvailable = cudaProbe.available;
+  caps.cudaInteropReady = cudaProbe.interopReady;
+  caps.cudaDeviceName = cudaProbe.deviceName != nullptr ? cudaProbe.deviceName : "";
+  caps.cudaReason = cudaProbe.reason != nullptr ? cudaProbe.reason : "";
+#endif
+
+#if defined(__APPLE__)
+  const OpenDRTViewerMetal::ProbeResult metalProbe = OpenDRTViewerMetal::probe();
+  caps.metalViewerAvailable = metalProbe.available;
+  caps.metalQueueReady = metalProbe.queueReady;
+  caps.metalDeviceName = metalProbe.deviceName != nullptr ? metalProbe.deviceName : "";
+#endif
+
+  if (caps.glComputeShaders) {
+#if !defined(__APPLE__)
+  #if defined(OFX_SUPPORTS_CUDARENDER)
+    if (caps.glBufferObjects && caps.cudaViewerAvailable && caps.cudaInteropReady) {
+      caps.activeBackend = ViewerGpuBackend::CudaComputeMesh;
+      caps.activeBackendLabel = "cuda-compute-mesh";
+      caps.roadmapLabel = "cuda-phase3-mesh";
+    } else {
+      caps.activeBackend = ViewerGpuBackend::OpenGlComputeIdentity;
+      caps.activeBackendLabel = "gl-compute-id";
+      caps.roadmapLabel = "gl-compute-phase2";
+    }
+  #else
+    caps.activeBackend = ViewerGpuBackend::OpenGlComputeIdentity;
+    caps.activeBackendLabel = "gl-compute-id";
+    caps.roadmapLabel = "gl-compute-phase2";
+  #endif
+#endif
+  } else if (caps.glBufferObjects) {
+#if !defined(__APPLE__)
+    caps.activeBackend = ViewerGpuBackend::OpenGlBufferedDraw;
+    caps.activeBackendLabel = "gl-buffer";
+  #if defined(OFX_SUPPORTS_CUDARENDER)
+    if (caps.glBufferObjects && caps.cudaViewerAvailable && caps.cudaInteropReady) {
+      caps.activeBackend = ViewerGpuBackend::CudaComputeMesh;
+      caps.activeBackendLabel = "cuda-compute-mesh";
+      caps.roadmapLabel = "cuda-phase3-buffer-fallback";
+    } else {
+      caps.roadmapLabel = "gl-compute-probe-miss";
+    }
+  #else
+    caps.roadmapLabel = "gl-compute-probe-miss";
+  #endif
+#endif
+  } else {
+#if defined(__APPLE__)
+    if (caps.metalViewerAvailable && caps.metalQueueReady) {
+      caps.activeBackend = ViewerGpuBackend::MetalComputeMesh;
+      caps.activeBackendLabel = "metal-compute-mesh";
+      caps.roadmapLabel = "metal-end-to-end";
+    } else {
+      caps.activeBackend = ViewerGpuBackend::CpuReference;
+      caps.activeBackendLabel = "cpu-ref";
+      caps.roadmapLabel = caps.metalViewerAvailable ? "metal-presenter-missing" : "metal-unavailable";
+    }
+#else
+  #if defined(OFX_SUPPORTS_CUDARENDER)
+    caps.activeBackend = ViewerGpuBackend::CpuReference;
+    caps.activeBackendLabel = "cpu-ref";
+    caps.roadmapLabel = "cpu-ref";
+  #else
+    caps.activeBackend = ViewerGpuBackend::CpuReference;
+    caps.activeBackendLabel = "cpu-ref";
+    caps.roadmapLabel = "cpu-ref";
+  #endif
+#endif
+  }
+
+  return caps;
+}
+
+void releaseIdentityComputeCache(IdentityComputeCache* cache) {
+  if (!cache) return;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (bufferApi.available) {
+    GLuint buffers[5] = {cache->src, cache->dst, cache->verts, cache->colors, cache->counter};
+    GLuint toDelete[5] = {};
+    GLsizei count = 0;
+    for (GLuint id : buffers) {
+      if (id != 0) toDelete[count++] = id;
+    }
+    if (count > 0) bufferApi.deleteBuffers(count, toDelete);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  if (computeApi.available && cache->program != 0) {
+    computeApi.deleteProgram(cache->program);
+  }
+  *cache = IdentityComputeCache{};
+}
+
+void releaseInputCloudComputeCache(InputCloudComputeCache* cache) {
+  if (!cache) return;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (bufferApi.available) {
+    GLuint buffers[3] = {cache->input, cache->verts, cache->colors};
+    GLuint toDelete[3] = {};
+    GLsizei count = 0;
+    for (GLuint id : buffers) {
+      if (id != 0) toDelete[count++] = id;
+    }
+    if (count > 0) bufferApi.deleteBuffers(count, toDelete);
+    bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+  }
+  if (computeApi.available && cache->program != 0) {
+    computeApi.deleteProgram(cache->program);
+  }
+  *cache = InputCloudComputeCache{};
+}
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+bool ensureViewerDrawBuffers(GLuint* verts,
+                             GLuint* colors,
+                             size_t pointCapacity,
+                             GLenum usage = GL_DYNAMIC_DRAW) {
+  if (!verts || !colors) return false;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  if (!bufferApi.available) return false;
+  if (*verts == 0) bufferApi.genBuffers(1, verts);
+  if (*colors == 0) bufferApi.genBuffers(1, colors);
+  if (*verts == 0 || *colors == 0) return false;
+  bufferApi.bindBuffer(GL_ARRAY_BUFFER, *verts);
+  bufferApi.bufferData(GL_ARRAY_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(pointCapacity * 3u * sizeof(float)),
+                       nullptr,
+                       usage);
+  bufferApi.bindBuffer(GL_ARRAY_BUFFER, *colors);
+  bufferApi.bufferData(GL_ARRAY_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(pointCapacity * 3u * sizeof(float)),
+                       nullptr,
+                       usage);
+  bufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+  return true;
+}
+
+bool ensureIdentityCudaBuffers(IdentityCudaDrawCache* cache, int resolution) {
+  if (!cache) return false;
+  const size_t pointCapacity = static_cast<size_t>(resolution) * static_cast<size_t>(resolution) * static_cast<size_t>(resolution);
+  if (cache->pointCapacity >= pointCapacity && cache->cache.verts != 0 && cache->cache.colors != 0) return true;
+  cache->pointCapacity = pointCapacity;
+  return ensureViewerDrawBuffers(&cache->cache.verts, &cache->cache.colors, pointCapacity);
+}
+
+bool ensureInputCudaBuffers(InputCudaDrawCache* cache, size_t pointCapacity) {
+  if (!cache) return false;
+  if (cache->pointCapacity >= pointCapacity && cache->cache.verts != 0 && cache->cache.colors != 0) return true;
+  cache->pointCapacity = pointCapacity;
+  return ensureViewerDrawBuffers(&cache->cache.verts, &cache->cache.colors, pointCapacity);
+}
+
+void releaseIdentityCudaDrawCache(IdentityCudaDrawCache* cache) {
+  if (!cache) return;
+  OpenDRTViewerCuda::releaseIdentityCache(&cache->cache);
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  if (bufferApi.available) {
+    GLuint ids[2] = {cache->cache.verts, cache->cache.colors};
+    GLuint toDelete[2] = {};
+    GLsizei count = 0;
+    for (GLuint id : ids) {
+      if (id != 0) toDelete[count++] = id;
+    }
+    if (count > 0) bufferApi.deleteBuffers(count, toDelete);
+  }
+  cache->cache.verts = 0;
+  cache->cache.colors = 0;
+  cache->pointCapacity = 0;
+}
+
+void releaseInputCudaDrawCache(InputCudaDrawCache* cache) {
+  if (!cache) return;
+  OpenDRTViewerCuda::releaseInputCache(&cache->cache);
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  if (bufferApi.available) {
+    GLuint ids[2] = {cache->cache.verts, cache->cache.colors};
+    GLuint toDelete[2] = {};
+    GLsizei count = 0;
+    for (GLuint id : ids) {
+      if (id != 0) toDelete[count++] = id;
+    }
+    if (count > 0) bufferApi.deleteBuffers(count, toDelete);
+  }
+  cache->cache.verts = 0;
+  cache->cache.colors = 0;
+  cache->pointCapacity = 0;
+}
+#endif
+
+bool ensureIdentityComputeProgram(IdentityComputeCache* cache) {
+  if (!cache) return false;
+  if (cache->program != 0) return true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+  static const char* kShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer SrcBuffer { float srcVals[]; };
+layout(std430, binding = 1) readonly buffer DstBuffer { float dstVals[]; };
+layout(std430, binding = 2) writeonly buffer VertBuffer { float vertVals[]; };
+layout(std430, binding = 3) writeonly buffer ColorBuffer { float colorVals[]; };
+layout(std430, binding = 4) buffer CountBuffer { uint outCount; };
+uniform int uResolution;
+uniform int uInteriorStep;
+uniform int uShowOverflow;
+uniform int uHighlightOverflow;
+
+float clamp01(float v) {
+  return clamp(v, 0.0, 1.0);
+}
+
+bool outOfBounds(float r, float g, float b) {
+  return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
+}
+
+void mapDisplayColor(float inR, float inG, float inB, out float outR, out float outG, out float outB) {
+  float r = pow(clamp01(inR), 0.90);
+  float g = pow(clamp01(inG), 0.90);
+  float b = pow(clamp01(inB), 0.90);
+  float luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  r = clamp01(luma + (r - luma));
+  g = clamp01(luma + (g - luma));
+  b = clamp01(luma + (b - luma));
+  outR = r;
+  outG = g;
+  outB = b;
+}
+
+void main() {
+  uint index = gl_GlobalInvocationID.x;
+  uint res = uint(uResolution);
+  uint count = res * res * res;
+  if (index >= count) return;
+
+  uint plane = res * res;
+  uint z = index / plane;
+  uint rem = index - z * plane;
+  uint y = rem / res;
+  uint x = rem - y * res;
+
+  bool onBoundary = (x == 0u || y == 0u || z == 0u || x == res - 1u || y == res - 1u || z == res - 1u);
+  if (!onBoundary) {
+    uint step = uint(max(uInteriorStep, 1));
+    if ((x % step) != 0u || (y % step) != 0u || (z % step) != 0u) return;
+  }
+
+  uint srcBase = index * 4u;
+  float sr = srcVals[srcBase + 0u];
+  float sg = srcVals[srcBase + 1u];
+  float sb = srcVals[srcBase + 2u];
+  float dr = dstVals[srcBase + 0u];
+  float dg = dstVals[srcBase + 1u];
+  float db = dstVals[srcBase + 2u];
+  bool overflowPoint = outOfBounds(dr, dg, db);
+  float plotR = (uShowOverflow != 0) ? dr : clamp01(dr);
+  float plotG = (uShowOverflow != 0) ? dg : clamp01(dg);
+  float plotB = (uShowOverflow != 0) ? db : clamp01(db);
+
+  float cr;
+  float cg;
+  float cb;
+  if (uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) {
+    cr = 1.0;
+    cg = 0.0;
+    cb = 0.0;
+  } else {
+    mapDisplayColor(sr * 0.86 + clamp01(dr) * 0.14,
+                    sg * 0.86 + clamp01(dg) * 0.14,
+                    sb * 0.86 + clamp01(db) * 0.14,
+                    cr, cg, cb);
+  }
+
+  uint outIndex = atomicAdd(outCount, 1u);
+  uint vertBase = outIndex * 3u;
+  vertVals[vertBase + 0u] = plotR * 2.0 - 1.0;
+  vertVals[vertBase + 1u] = plotG * 2.0 - 1.0;
+  vertVals[vertBase + 2u] = plotB * 2.0 - 1.0;
+  colorVals[vertBase + 0u] = cr;
+  colorVals[vertBase + 1u] = cg;
+  colorVals[vertBase + 2u] = cb;
+}
+)GLSL";
+
+  const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+  if (shader == 0) return false;
+  api.shaderSource(shader, 1, &kShaderSrc, nullptr);
+  api.compileShader(shader);
+  GLint compiled = 0;
+  api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Identity compute shader compile failed: ") + readShaderLog(shader, false, api));
+    api.deleteShader(shader);
+    return false;
+  }
+
+  const GLuint program = api.createProgram();
+  if (program == 0) {
+    api.deleteShader(shader);
+    return false;
+  }
+  api.attachShader(program, shader);
+  api.linkProgram(program);
+  api.deleteShader(shader);
+
+  GLint linked = 0;
+  api.getProgramiv(program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Identity compute program link failed: ") + readShaderLog(program, true, api));
+    api.deleteProgram(program);
+    return false;
+  }
+
+  cache->program = program;
+  cache->resLoc = api.getUniformLocation(program, "uResolution");
+  cache->interiorStepLoc = api.getUniformLocation(program, "uInteriorStep");
+  cache->showOverflowLoc = api.getUniformLocation(program, "uShowOverflow");
+  cache->highlightOverflowLoc = api.getUniformLocation(program, "uHighlightOverflow");
+  cache->available = cache->resLoc >= 0 && cache->interiorStepLoc >= 0 &&
+                     cache->showOverflowLoc >= 0 && cache->highlightOverflowLoc >= 0;
+  if (!cache->available) {
+    logViewerEvent("Identity compute program missing one or more uniforms; falling back to CPU.");
+    releaseIdentityComputeCache(cache);
+    return false;
+  }
+  return true;
+}
+
+bool ensureInputCloudComputeProgram(InputCloudComputeCache* cache) {
+  if (!cache) return false;
+  if (cache->program != 0) return true;
+  const ViewerGlComputeApi& api = viewerGlComputeApi();
+  if (!api.available) return false;
+  static const char* kShaderSrc = R"GLSL(
+#version 430
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer InputBuffer { float inputVals[]; };
+layout(std430, binding = 1) writeonly buffer VertBuffer { float vertVals[]; };
+layout(std430, binding = 2) writeonly buffer ColorBuffer { float colorVals[]; };
+uniform int uPointCount;
+uniform int uShowOverflow;
+uniform int uHighlightOverflow;
+
+float clamp01(float v) {
+  return clamp(v, 0.0, 1.0);
+}
+
+bool outOfBounds(float r, float g, float b) {
+  return r < 0.0 || r > 1.0 || g < 0.0 || g > 1.0 || b < 0.0 || b > 1.0;
+}
+
+void mapDisplayColor(float inR, float inG, float inB, out float outR, out float outG, out float outB) {
+  float r = pow(clamp01(inR), 0.90);
+  float g = pow(clamp01(inG), 0.90);
+  float b = pow(clamp01(inB), 0.90);
+  float luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  outR = clamp01(luma + (r - luma));
+  outG = clamp01(luma + (g - luma));
+  outB = clamp01(luma + (b - luma));
+}
+
+void main() {
+  uint index = gl_GlobalInvocationID.x;
+  if (index >= uint(max(uPointCount, 0))) return;
+  uint inBase = index * 6u;
+  float sr = inputVals[inBase + 0u];
+  float sg = inputVals[inBase + 1u];
+  float sb = inputVals[inBase + 2u];
+  float dr = inputVals[inBase + 3u];
+  float dg = inputVals[inBase + 4u];
+  float db = inputVals[inBase + 5u];
+  bool overflowPoint = outOfBounds(dr, dg, db);
+  float plotR = (uShowOverflow != 0) ? dr : clamp01(dr);
+  float plotG = (uShowOverflow != 0) ? dg : clamp01(dg);
+  float plotB = (uShowOverflow != 0) ? db : clamp01(db);
+
+  uint outBase = index * 3u;
+  vertVals[outBase + 0u] = plotR * 2.0 - 1.0;
+  vertVals[outBase + 1u] = plotG * 2.0 - 1.0;
+  vertVals[outBase + 2u] = plotB * 2.0 - 1.0;
+
+  if (uShowOverflow != 0 && uHighlightOverflow != 0 && overflowPoint) {
+    colorVals[outBase + 0u] = 1.0;
+    colorVals[outBase + 1u] = 0.0;
+    colorVals[outBase + 2u] = 0.0;
+  } else {
+    float cr;
+    float cg;
+    float cb;
+    mapDisplayColor(clamp01(sr), clamp01(sg), clamp01(sb), cr, cg, cb);
+    colorVals[outBase + 0u] = cr;
+    colorVals[outBase + 1u] = cg;
+    colorVals[outBase + 2u] = cb;
+  }
+}
+)GLSL";
+
+  const GLuint shader = api.createShader(GL_COMPUTE_SHADER);
+  if (shader == 0) return false;
+  api.shaderSource(shader, 1, &kShaderSrc, nullptr);
+  api.compileShader(shader);
+  GLint compiled = 0;
+  api.getShaderiv(shader, GL_COMPILE_STATUS, &compiled);
+  if (!compiled) {
+    logViewerEvent(std::string("Input-cloud compute shader compile failed: ") + readShaderLog(shader, false, api));
+    api.deleteShader(shader);
+    return false;
+  }
+
+  const GLuint program = api.createProgram();
+  if (program == 0) {
+    api.deleteShader(shader);
+    return false;
+  }
+  api.attachShader(program, shader);
+  api.linkProgram(program);
+  api.deleteShader(shader);
+
+  GLint linked = 0;
+  api.getProgramiv(program, GL_LINK_STATUS, &linked);
+  if (!linked) {
+    logViewerEvent(std::string("Input-cloud compute program link failed: ") + readShaderLog(program, true, api));
+    api.deleteProgram(program);
+    return false;
+  }
+
+  cache->program = program;
+  cache->pointCountLoc = api.getUniformLocation(program, "uPointCount");
+  cache->showOverflowLoc = api.getUniformLocation(program, "uShowOverflow");
+  cache->highlightOverflowLoc = api.getUniformLocation(program, "uHighlightOverflow");
+  cache->available = cache->pointCountLoc >= 0 &&
+                     cache->showOverflowLoc >= 0 &&
+                     cache->highlightOverflowLoc >= 0;
+  if (!cache->available) {
+    logViewerEvent("Input-cloud compute program missing one or more uniforms; falling back to CPU.");
+    releaseInputCloudComputeCache(cache);
+    return false;
+  }
+  return true;
+}
+
+struct ResolvedPayload;
+struct InputCloudPayload;
+OpenDRTParams buildResolvedParams(const ResolvedPayload& rp);
+
+bool buildCubeDataOnGpu(const ResolvedPayload& payload,
+                        const std::vector<float>& src,
+                        const std::vector<float>& dst,
+                        IdentityComputeCache* cache,
+                        MeshData* out);
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+bool buildCubeDataOnCuda(const ResolvedPayload& payload,
+                         IdentityCudaDrawCache* cache,
+                         MeshData* out);
+
+bool buildInputCloudMeshOnCuda(const InputCloudPayload& payload,
+                               const std::vector<float>& rawPoints,
+                               InputCudaDrawCache* cache,
+                               MeshData* out);
+#endif
+
+#if defined(__APPLE__)
+bool buildCubeDataOnMetal(const ResolvedPayload& payload,
+                          OpenDRTViewerMetal::MeshCache* cache,
+                          MeshData* out) {
+  if (!out) return false;
+  std::string error;
+  std::string transformBackend;
+  float maxDelta = 0.0f;
+  if (!OpenDRTViewerMetal::buildIdentityMesh(
+          cache,
+          buildResolvedParams(payload),
+          payload.resolution,
+          payload.showOverflow != 0,
+          payload.highlightOverflow != 0,
+          out->serial,
+          &transformBackend,
+          &maxDelta,
+          &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("Metal identity mesh build failed: ") + error);
+    }
+    return false;
+  }
+  out->transformBackendLabel = transformBackend.empty() ? "metal" : transformBackend;
+  out->maxDelta = maxDelta;
+  out->pointCount = static_cast<size_t>(cache ? cache->pointCount : 0);
+  return cache && cache->available;
+}
+#endif
+
 struct PointBufferCache {
   GLuint verts = 0;
   GLuint colors = 0;
   uint64_t uploadedSerial = 0;
   GLsizei uploadedPointCount = 0;
+};
+
+struct ResolvedDrawSource {
+  GLuint verts = 0;
+  GLuint colors = 0;
+  const float* cpuVerts = nullptr;
+  const float* cpuColors = nullptr;
+  GLsizei pointCount = 0;
+  bool bufferBacked = false;
+  std::string label = "none";
 };
 
 void releasePointBufferCache(PointBufferCache* cache) {
@@ -399,6 +1256,76 @@ bool ensurePointBufferCacheUploaded(const MeshData& mesh, PointBufferCache* cach
   cache->uploadedSerial = mesh.serial;
   cache->uploadedPointCount = pointCount;
   return true;
+}
+
+ResolvedDrawSource resolveDrawSource(const MeshData& mesh,
+                                     bool useCudaIdentityBuffers,
+                                     GLuint cudaIdentityVerts,
+                                     GLuint cudaIdentityColors,
+                                     GLsizei cudaIdentityPointCount,
+                                     bool useComputeIdentityBuffers,
+                                     GLuint computeIdentityVerts,
+                                     GLuint computeIdentityColors,
+                                     GLsizei computeIdentityPointCount,
+                                     bool useCudaInputBuffers,
+                                     GLuint cudaInputVerts,
+                                     GLuint cudaInputColors,
+                                     GLsizei cudaInputPointCount,
+                                     bool useComputeInputBuffers,
+                                     GLuint computeInputVerts,
+                                     GLuint computeInputColors,
+                                     GLsizei computeInputPointCount,
+                                     bool usePointBuffers,
+                                     GLuint uploadedVerts,
+                                     GLuint uploadedColors) {
+  ResolvedDrawSource source{};
+  if (useCudaIdentityBuffers) {
+    source.bufferBacked = true;
+    source.verts = cudaIdentityVerts;
+    source.colors = cudaIdentityColors;
+    source.pointCount = cudaIdentityPointCount;
+    source.label = "cuda-identity-buffer";
+    return source;
+  }
+  if (useComputeIdentityBuffers) {
+    source.bufferBacked = true;
+    source.verts = computeIdentityVerts;
+    source.colors = computeIdentityColors;
+    source.pointCount = computeIdentityPointCount;
+    source.label = "identity-compute";
+    return source;
+  }
+  if (useCudaInputBuffers) {
+    source.bufferBacked = true;
+    source.verts = cudaInputVerts;
+    source.colors = cudaInputColors;
+    source.pointCount = cudaInputPointCount;
+    source.label = "cuda-input-buffer";
+    return source;
+  }
+  if (useComputeInputBuffers) {
+    source.bufferBacked = true;
+    source.verts = computeInputVerts;
+    source.colors = computeInputColors;
+    source.pointCount = computeInputPointCount;
+    source.label = "input-compute";
+    return source;
+  }
+  if (usePointBuffers) {
+    source.bufferBacked = true;
+    source.verts = uploadedVerts;
+    source.colors = uploadedColors;
+    source.pointCount = static_cast<GLsizei>(mesh.pointVerts.size() / 3u);
+    source.label = mesh.packBackendLabel == "metal-compute-mesh" ? "metal-uploaded-buffer" : "gl-buffer";
+    return source;
+  }
+  if (!mesh.pointVerts.empty() && !mesh.pointColors.empty()) {
+    source.cpuVerts = mesh.pointVerts.data();
+    source.cpuColors = mesh.pointColors.data();
+    source.pointCount = static_cast<GLsizei>(mesh.pointVerts.size() / 3u);
+    source.label = "cpu-array";
+  }
+  return source;
 }
 
 void mapDisplayColor(float inR, float inG, float inB, float* outR, float* outG, float* outB) {
@@ -568,6 +1495,53 @@ struct InputCloudPayload {
   std::string points;
 };
 
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+bool buildCubeDataOnCuda(const ResolvedPayload& payload,
+                         IdentityCudaDrawCache* cache,
+                         MeshData* out) {
+  if (!cache || !out) return false;
+  const int res = (payload.resolution <= 25) ? 25 : (payload.resolution <= 41 ? 41 : 57);
+  if (!ensureIdentityCudaBuffers(cache, res)) return false;
+  OpenDRTViewerCuda::IdentityRequest request{};
+  request.resolution = res;
+  request.showOverflow = payload.showOverflow;
+  request.highlightOverflow = payload.highlightOverflow;
+  request.params = buildResolvedParams(payload);
+  std::string error;
+  if (!OpenDRTViewerCuda::buildIdentityMesh(&cache->cache, request, out->serial, &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("CUDA identity mesh build failed: ") + error);
+    }
+    return false;
+  }
+  out->pointCount = static_cast<size_t>(cache->cache.pointCount);
+  return out->pointCount > 0;
+}
+
+bool buildInputCloudMeshOnCuda(const InputCloudPayload& payload,
+                               const std::vector<float>& rawPoints,
+                               InputCudaDrawCache* cache,
+                               MeshData* out) {
+  if (!cache || !out) return false;
+  const size_t pointCount = rawPoints.size() / 6u;
+  if (pointCount == 0) return false;
+  if (!ensureInputCudaBuffers(cache, pointCount)) return false;
+  OpenDRTViewerCuda::InputRequest request{};
+  request.pointCount = static_cast<int>(pointCount);
+  request.showOverflow = payload.showOverflow;
+  request.highlightOverflow = payload.highlightOverflow;
+  std::string error;
+  if (!OpenDRTViewerCuda::buildInputCloudMesh(&cache->cache, request, rawPoints, out->serial, &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("CUDA input-cloud mesh build failed: ") + error);
+    }
+    return false;
+  }
+  out->pointCount = static_cast<size_t>(cache->cache.pointCount);
+  return out->pointCount > 0;
+}
+#endif
+
 bool parseParamsMessage(const std::string& msg, ResolvedPayload* out) {
   if (!out) return false;
   std::string type;
@@ -730,7 +1704,109 @@ OpenDRTParams buildResolvedParams(const ResolvedPayload& rp) {
   return p;
 }
 
-void buildCubeData(const ResolvedPayload& payload, MeshData* out) {
+bool buildCubeDataOnGpu(const ResolvedPayload& payload,
+                        const std::vector<float>& src,
+                        const std::vector<float>& dst,
+                        IdentityComputeCache* cache,
+                        MeshData* out) {
+  if (!cache || !out) return false;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !computeApi.available || !ensureIdentityComputeProgram(cache)) return false;
+
+  const int res = (payload.resolution <= 25) ? 25 : (payload.resolution <= 41 ? 41 : 57);
+  const size_t count = static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res);
+  const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
+
+  auto ensureBuffer = [&](GLuint* id) {
+    if (*id == 0) bufferApi.genBuffers(1, id);
+    return *id != 0;
+  };
+  if (!ensureBuffer(&cache->src) || !ensureBuffer(&cache->dst) || !ensureBuffer(&cache->verts) ||
+      !ensureBuffer(&cache->colors) || !ensureBuffer(&cache->counter)) {
+    logViewerEvent("Identity compute buffer allocation failed; falling back to CPU.");
+    return false;
+  }
+
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->src);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(src.size() * sizeof(float)),
+                       src.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->dst);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(dst.size() * sizeof(float)),
+                       dst.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->verts);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(count * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->colors);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(count * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  const GLuint zero = 0;
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->counter);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER, sizeof(GLuint), &zero, GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(cache->program);
+  computeApi.uniform1i(cache->resLoc, res);
+  computeApi.uniform1i(cache->interiorStepLoc, interiorStep);
+  computeApi.uniform1i(cache->showOverflowLoc, payload.showOverflow != 0 ? 1 : 0);
+  computeApi.uniform1i(cache->highlightOverflowLoc, payload.highlightOverflow != 0 ? 1 : 0);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->src);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->dst);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->verts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, cache->colors);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, cache->counter);
+  const GLuint groups = static_cast<GLuint>((count + 63u) / 64u);
+  computeApi.dispatchCompute(groups, 1, 1);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+  computeApi.useProgram(0);
+
+  GLuint outCount = 0;
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->counter);
+  if (bufferApi.getBufferSubData) {
+    bufferApi.getBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(GLuint), &outCount);
+  } else {
+    logViewerEvent("Identity compute path missing glGetBufferSubData; falling back to CPU.");
+    bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    return false;
+  }
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+  if (viewerDiagnosticsEnabled()) {
+    const size_t expectedCount = expectedIdentityDisplayPointCount(res);
+    if (static_cast<size_t>(outCount) != expectedCount) {
+      std::ostringstream os;
+      os << "Identity compute parity mismatch: res=" << res
+         << " expectedPoints=" << expectedCount
+         << " gpuPoints=" << outCount
+         << " renderOk=" << (out->renderOk ? "1" : "0");
+      logViewerDiagnostic(true, os.str());
+    }
+  }
+
+  cache->builtSerial = out->serial;
+  cache->pointCount = static_cast<GLsizei>(outCount);
+  out->pointCount = static_cast<size_t>(outCount);
+  return true;
+}
+
+void buildCubeData(const ResolvedPayload& payload,
+                   const ViewerGpuCapabilities& gpuCaps,
+                   ViewerRuntimeState* runtime,
+                   IdentityComputeCache* computeCache,
+#if defined(__APPLE__)
+                   OpenDRTViewerMetal::MeshCache* metalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                   IdentityCudaDrawCache* cudaCache,
+#endif
+                   MeshData* out) {
   if (!out) return;
   const int res = (payload.resolution <= 25) ? 25 : (payload.resolution <= 41 ? 41 : 57);
   const size_t count = static_cast<size_t>(res) * static_cast<size_t>(res) * static_cast<size_t>(res);
@@ -752,30 +1828,152 @@ void buildCubeData(const ResolvedPayload& payload, MeshData* out) {
     }
   }
 
-  std::vector<float> dst(count * 4u, 1.0f);
-  OpenDRTProcessor proc(buildResolvedParams(payload));
-  const bool renderOk = proc.render(src.data(), dst.data(), static_cast<int>(count), 1, true, true);
-  if (!renderOk) {
-    dst = src;
-  }
-
   MeshData mesh{};
   mesh.resolution = res;
   mesh.quality = payload.quality;
   mesh.paramHash = payload.paramHash;
-  mesh.renderOk = renderOk;
-  float maxDelta = 0.0f;
-  for (size_t i = 0; i < count; ++i) {
-    const size_t si = i * 4u;
-    const float dr = std::fabs(dst[si + 0] - src[si + 0]);
-    const float dg = std::fabs(dst[si + 1] - src[si + 1]);
-    const float db = std::fabs(dst[si + 2] - src[si + 2]);
-    if (dr > maxDelta) maxDelta = dr;
-    if (dg > maxDelta) maxDelta = dg;
-    if (db > maxDelta) maxDelta = db;
-  }
-  mesh.maxDelta = maxDelta;
   mesh.serial = nextMeshSerial();
+  mesh.pointCount = 0;
+  mesh.renderOk = true;
+
+  std::vector<float> dst;
+  bool haveDst = false;
+  auto ensureCpuTransformed = [&]() {
+    if (haveDst) return;
+    dst.assign(count * 4u, 1.0f);
+    OpenDRTProcessor proc(buildResolvedParams(payload));
+    mesh.renderOk = proc.render(src.data(), dst.data(), static_cast<int>(count), 1, true, true);
+    if (!mesh.renderOk) {
+      dst = src;
+    }
+    mesh.transformBackendLabel = proc.lastBackendLabel();
+    float maxDelta = 0.0f;
+    for (size_t i = 0; i < count; ++i) {
+      const size_t si = i * 4u;
+      const float dr = std::fabs(dst[si + 0] - src[si + 0]);
+      const float dg = std::fabs(dst[si + 1] - src[si + 1]);
+      const float db = std::fabs(dst[si + 2] - src[si + 2]);
+      if (dr > maxDelta) maxDelta = dr;
+      if (dg > maxDelta) maxDelta = dg;
+      if (db > maxDelta) maxDelta = db;
+    }
+    mesh.maxDelta = maxDelta;
+    haveDst = true;
+  };
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh &&
+      runtime && !runtime->identityGpuDemoted &&
+      buildCubeDataOnCuda(payload, cudaCache, &mesh)) {
+    mesh.transformBackendLabel = "cuda";
+    mesh.packBackendLabel = "cuda-compute-mesh";
+    if (gpuCaps.parityCheckEnabled) {
+      ensureCpuTransformed();
+      std::vector<float> cpuDst(count * 4u, 1.0f);
+      OpenDRTProcessor cpuRefProc(buildResolvedParams(payload));
+      if (cpuRefProc.renderCPUReference(
+              src.data(),
+              cpuDst.data(),
+              static_cast<int>(count),
+              1,
+              count * 4u * sizeof(float),
+              count * 4u * sizeof(float))) {
+        float parityMaxDelta = 0.0f;
+        for (size_t i = 0; i < count * 4u; ++i) {
+          const float delta = std::fabs(dst[i] - cpuDst[i]);
+          if (delta > parityMaxDelta) parityMaxDelta = delta;
+        }
+        mesh.parityMaxDelta = parityMaxDelta;
+        if (parityMaxDelta > 1.0e-4f) {
+          ++runtime->identityParityFailures;
+          std::ostringstream os;
+          os << "Identity transform parity mismatch: backend=cuda"
+             << " res=" << res
+             << " maxDelta=" << parityMaxDelta
+             << " failures=" << runtime->identityParityFailures;
+          logViewerDiagnostic(true, os.str());
+          if (runtime->identityParityFailures >= 2) {
+            runtime->identityGpuDemoted = true;
+            runtime->identityDemotionReason = "identity-parity";
+            logViewerEvent("Identity CUDA path demoted to CPU after sustained parity mismatch.");
+          }
+        } else {
+          runtime->identityParityFailures = 0;
+        }
+      }
+    }
+    if (!(runtime && runtime->identityGpuDemoted)) {
+      *out = std::move(mesh);
+      return;
+    }
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh && runtime && !runtime->identityGpuDemoted) {
+    runtime->identityGpuDemoted = true;
+    runtime->identityDemotionReason = "cuda-runtime-failure";
+    logViewerEvent("Identity CUDA path demoted to CPU after runtime failure.");
+  }
+#endif
+
+#if defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh &&
+      !(runtime && runtime->identityGpuDemoted) &&
+      buildCubeDataOnMetal(payload, metalCache, &mesh)) {
+    mesh.packBackendLabel = "metal-compute-mesh";
+    *out = std::move(mesh);
+    return;
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh && runtime && !runtime->identityGpuDemoted) {
+    runtime->identityGpuDemoted = true;
+    runtime->identityDemotionReason = "metal-runtime-failure";
+    logViewerEvent("Identity Metal path demoted to CPU after runtime failure.");
+  }
+#endif
+
+  ensureCpuTransformed();
+
+  if (gpuCaps.parityCheckEnabled && mesh.renderOk && mesh.transformBackendLabel != "cpu") {
+    std::vector<float> cpuDst(count * 4u, 1.0f);
+    OpenDRTProcessor cpuRefProc(buildResolvedParams(payload));
+    if (cpuRefProc.renderCPUReference(
+            src.data(),
+            cpuDst.data(),
+            static_cast<int>(count),
+            1,
+            count * 4u * sizeof(float),
+            count * 4u * sizeof(float))) {
+      float parityMaxDelta = 0.0f;
+      for (size_t i = 0; i < count * 4u; ++i) {
+        const float delta = std::fabs(dst[i] - cpuDst[i]);
+        if (delta > parityMaxDelta) parityMaxDelta = delta;
+      }
+      mesh.parityMaxDelta = parityMaxDelta;
+      if (parityMaxDelta > 1.0e-4f && runtime) {
+        ++runtime->identityParityFailures;
+        std::ostringstream os;
+        os << "Identity transform parity mismatch: backend=" << mesh.transformBackendLabel
+           << " res=" << res
+           << " maxDelta=" << parityMaxDelta
+           << " failures=" << runtime->identityParityFailures;
+        logViewerDiagnostic(true, os.str());
+        if (runtime->identityParityFailures >= 2) {
+          runtime->identityGpuDemoted = true;
+          runtime->identityDemotionReason = "identity-parity";
+        }
+      } else if (runtime) {
+        runtime->identityParityFailures = 0;
+      }
+    }
+  }
+  if (gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity &&
+      !(runtime && runtime->identityGpuDemoted) &&
+      buildCubeDataOnGpu(payload, src, dst, computeCache, &mesh)) {
+    mesh.packBackendLabel = "gl-compute-mesh";
+    *out = std::move(mesh);
+    return;
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity && runtime && !runtime->identityGpuDemoted) {
+    runtime->identityGpuDemoted = true;
+    runtime->identityDemotionReason = "gl-runtime-failure";
+    logViewerEvent("Identity GL compute path demoted to CPU after runtime failure.");
+  }
+
   const int interiorStep = (res <= 25) ? 2 : (res <= 41 ? 2 : 3);
   mesh.pointVerts.reserve((count / static_cast<size_t>(interiorStep * interiorStep * interiorStep) + 1u) * 3u);
   mesh.pointColors.reserve(mesh.pointVerts.capacity());
@@ -816,10 +2014,102 @@ void buildCubeData(const ResolvedPayload& payload, MeshData* out) {
       }
     }
   }
+  mesh.pointCount = mesh.pointVerts.size() / 3u;
+  mesh.packBackendLabel = "cpu-array";
   *out = std::move(mesh);
 }
 
-bool buildInputCloudMesh(const InputCloudPayload& payload, MeshData* out) {
+bool buildInputCloudMeshOnGpu(const InputCloudPayload& payload,
+                              const std::vector<float>& rawPoints,
+                              InputCloudComputeCache* cache,
+                              MeshData* out) {
+  if (!cache || !out) return false;
+  const ViewerGlBufferApi& bufferApi = viewerGlBufferApi();
+  const ViewerGlComputeApi& computeApi = viewerGlComputeApi();
+  if (!bufferApi.available || !computeApi.available || !ensureInputCloudComputeProgram(cache)) return false;
+  const size_t pointCount = rawPoints.size() / 6u;
+  if (pointCount == 0) return false;
+
+  auto ensureBuffer = [&](GLuint* id) {
+    if (*id == 0) bufferApi.genBuffers(1, id);
+    return *id != 0;
+  };
+  if (!ensureBuffer(&cache->input) || !ensureBuffer(&cache->verts) || !ensureBuffer(&cache->colors)) {
+    logViewerEvent("Input-cloud compute buffer allocation failed; falling back to CPU.");
+    return false;
+  }
+
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->input);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(rawPoints.size() * sizeof(float)),
+                       rawPoints.data(),
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->verts);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(pointCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, cache->colors);
+  bufferApi.bufferData(GL_SHADER_STORAGE_BUFFER,
+                       static_cast<ViewerGLsizeiptr>(pointCount * 3u * sizeof(float)),
+                       nullptr,
+                       GL_DYNAMIC_DRAW);
+
+  computeApi.useProgram(cache->program);
+  computeApi.uniform1i(cache->pointCountLoc, static_cast<GLint>(pointCount));
+  computeApi.uniform1i(cache->showOverflowLoc, payload.showOverflow != 0 ? 1 : 0);
+  computeApi.uniform1i(cache->highlightOverflowLoc, payload.highlightOverflow != 0 ? 1 : 0);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, cache->input);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, cache->verts);
+  computeApi.bindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, cache->colors);
+  const GLuint groups = static_cast<GLuint>((pointCount + 63u) / 64u);
+  computeApi.dispatchCompute(groups, 1, 1);
+  computeApi.memoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
+  computeApi.useProgram(0);
+  bufferApi.bindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+  cache->builtSerial = out->serial;
+  cache->pointCount = static_cast<GLsizei>(pointCount);
+  out->pointCount = pointCount;
+  return true;
+}
+
+#if defined(__APPLE__)
+bool buildInputCloudMeshOnMetal(const InputCloudPayload& payload,
+                                const std::vector<float>& rawPoints,
+                                OpenDRTViewerMetal::MeshCache* cache,
+                                MeshData* out) {
+  if (!out) return false;
+  std::string error;
+  if (!OpenDRTViewerMetal::buildInputCloudMesh(
+          cache,
+          rawPoints.data(),
+          rawPoints.size(),
+          payload.showOverflow != 0,
+          payload.highlightOverflow != 0,
+          out->serial,
+          &error)) {
+    if (!error.empty()) {
+      logViewerEvent(std::string("Metal input-cloud mesh build failed: ") + error);
+    }
+    return false;
+  }
+  out->pointCount = static_cast<size_t>(cache ? cache->pointCount : 0);
+  return cache && cache->available;
+}
+#endif
+
+bool buildInputCloudMesh(const InputCloudPayload& payload,
+                         const ViewerGpuCapabilities& gpuCaps,
+                         ViewerRuntimeState* runtime,
+                         InputCloudComputeCache* computeCache,
+#if defined(__APPLE__)
+                         OpenDRTViewerMetal::MeshCache* metalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                         InputCudaDrawCache* cudaCache,
+#endif
+                         MeshData* out) {
   if (!out) return false;
   std::istringstream is(payload.points);
   MeshData mesh{};
@@ -829,8 +2119,67 @@ bool buildInputCloudMesh(const InputCloudPayload& payload, MeshData* out) {
   mesh.renderOk = true;
   mesh.maxDelta = 0.0f;
   mesh.serial = nextMeshSerial();
+  mesh.transformBackendLabel = "plugin-pretransformed";
+  std::vector<float> rawPoints;
+  rawPoints.reserve(payload.points.size() / 4u);
   float sr = 0.0f, sg = 0.0f, sb = 0.0f, dr = 0.0f, dg = 0.0f, db = 0.0f;
   while (is >> sr >> sg >> sb >> dr >> dg >> db) {
+    rawPoints.push_back(sr);
+    rawPoints.push_back(sg);
+    rawPoints.push_back(sb);
+    rawPoints.push_back(dr);
+    rawPoints.push_back(dg);
+    rawPoints.push_back(db);
+  }
+
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh &&
+      runtime && !runtime->inputGpuDemoted &&
+      buildInputCloudMeshOnCuda(payload, rawPoints, cudaCache, &mesh)) {
+    mesh.packBackendLabel = "cuda-compute-mesh";
+    *out = std::move(mesh);
+    return true;
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh && runtime && !runtime->inputGpuDemoted) {
+    runtime->inputGpuDemoted = true;
+    runtime->inputDemotionReason = "cuda-runtime-failure";
+    logViewerEvent("Input CUDA path demoted to CPU after runtime failure.");
+  }
+#endif
+
+#if defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh &&
+      !(runtime && runtime->inputGpuDemoted) &&
+      buildInputCloudMeshOnMetal(payload, rawPoints, metalCache, &mesh)) {
+    mesh.packBackendLabel = "metal-compute-mesh";
+    *out = std::move(mesh);
+    return true;
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh && runtime && !runtime->inputGpuDemoted) {
+    runtime->inputGpuDemoted = true;
+    runtime->inputDemotionReason = "metal-runtime-failure";
+    logViewerEvent("Input Metal path demoted to CPU after runtime failure.");
+  }
+#endif
+  const bool tryInputCompute =
+      gpuCaps.inputCloudComputeEnabled &&
+      gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity &&
+      !(runtime && runtime->inputGpuDemoted);
+  if (tryInputCompute && buildInputCloudMeshOnGpu(payload, rawPoints, computeCache, &mesh)) {
+    mesh.packBackendLabel = "gl-compute-mesh";
+    *out = std::move(mesh);
+    return true;
+  } else if (tryInputCompute && runtime && !runtime->inputGpuDemoted) {
+    runtime->inputGpuDemoted = true;
+    runtime->inputDemotionReason = "gl-runtime-failure";
+    logViewerEvent("Input GL compute path demoted to CPU after runtime failure.");
+  }
+
+  for (size_t i = 0; i + 5u < rawPoints.size(); i += 6u) {
+    sr = rawPoints[i + 0u];
+    sg = rawPoints[i + 1u];
+    sb = rawPoints[i + 2u];
+    dr = rawPoints[i + 3u];
+    dg = rawPoints[i + 4u];
+    db = rawPoints[i + 5u];
     const bool overflowPoint = rgbOutOfBounds(dr, dg, db);
     const float plotR = payload.showOverflow != 0 ? dr : clamp01(dr);
     const float plotG = payload.showOverflow != 0 ? dg : clamp01(dg);
@@ -851,11 +2200,52 @@ bool buildInputCloudMesh(const InputCloudPayload& payload, MeshData* out) {
     mesh.pointColors.push_back(cb);
   }
   if (mesh.pointVerts.empty()) return false;
+  mesh.pointCount = mesh.pointVerts.size() / 3u;
+  mesh.packBackendLabel = "cpu-array";
   *out = std::move(mesh);
   return true;
 }
 
+#if defined(__APPLE__)
+OpenDRTViewerMetal::DrawSource resolveMetalDrawSource(const MeshData& mesh,
+                                                      const std::string& currentSourceMode,
+                                                      const OpenDRTViewerMetal::MeshCache& identityCache,
+                                                      const OpenDRTViewerMetal::MeshCache& inputCache,
+                                                      std::string* labelOut) {
+  OpenDRTViewerMetal::DrawSource source{};
+  auto tryResolve = [&](const OpenDRTViewerMetal::MeshCache& cache, const char* label) -> bool {
+    if (cache.available && cache.builtSerial == mesh.serial &&
+        OpenDRTViewerMetal::resolveDrawSource(&cache, &source)) {
+      if (labelOut) *labelOut = label;
+      return true;
+    }
+    return false;
+  };
+
+  if (currentSourceMode == "input") {
+    if (tryResolve(inputCache, "input-metal")) return source;
+    if (tryResolve(identityCache, "identity-metal")) return source;
+  } else {
+    if (tryResolve(identityCache, "identity-metal")) return source;
+    if (tryResolve(inputCache, "input-metal")) return source;
+  }
+
+  source.cpuVerts = mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data();
+  source.cpuColors = mesh.pointColors.empty() ? nullptr : mesh.pointColors.data();
+  source.vertsHandle = nullptr;
+  source.colorsHandle = nullptr;
+  source.pointCount = (source.cpuVerts && source.cpuColors) ? static_cast<int>(mesh.pointVerts.size() / 3u) : 0;
+  source.gpuBacked = false;
+  if (labelOut) *labelOut = (source.pointCount > 0) ? "cpu-array" : "none";
+  return source;
+}
+#endif
+
 void updateProjection(int width, int height) {
+#if defined(__APPLE__)
+  (void)width;
+  (void)height;
+#else
   if (width < 1) width = 1;
   if (height < 1) height = 1;
   const double aspect = static_cast<double>(width) / static_cast<double>(height);
@@ -869,9 +2259,12 @@ void updateProjection(int width, int height) {
   glLoadIdentity();
   glFrustum(-xmax, xmax, -ymax, ymax, zNear, zFar);
   glMatrixMode(GL_MODELVIEW);
+#endif
 }
 
+#if !defined(__APPLE__)
 void drawReferenceFrame() {
+  if (OpenDRTViewerOpenGLPresenter::drawReferenceFrame()) return;
   static const float kCubeEdges[] = {
       -1.f,-1.f,-1.f,  1.f,-1.f,-1.f,
        1.f,-1.f,-1.f,  1.f, 1.f,-1.f,
@@ -914,12 +2307,17 @@ void drawReferenceFrame() {
   glDrawArrays(GL_LINES, 0, 2);
   glDisableClientState(GL_VERTEX_ARRAY);
 }
+#endif
 
-void updateTitle(GLFWwindow* window, const MeshData& mesh, const char* state) {
+void updateTitle(GLFWwindow* window, const MeshData& mesh, const char* state, const ViewerGpuCapabilities& gpuCaps) {
   std::ostringstream os;
   os << "ME_OpenDRT Cube Viewer | " << state << " | " << mesh.quality << " " << mesh.resolution << "^3";
-  os << " | math:" << (mesh.renderOk ? "ok" : "fallback");
+  os << " | viewer:" << gpuCaps.activeBackendLabel;
+  os << " | presenter:" << gpuCaps.presenterBackendLabel;
+  os << " | transform:" << mesh.transformBackendLabel;
+  os << " | pack:" << mesh.packBackendLabel;
   os << " | dMax:" << mesh.maxDelta;
+  if (mesh.parityMaxDelta > 0.0f) os << " | pMax:" << mesh.parityMaxDelta;
   if (!mesh.paramHash.empty()) os << " | hash " << mesh.paramHash;
   glfwSetWindowTitle(window, os.str().c_str());
 }
@@ -1068,12 +2466,17 @@ struct AppState {
   bool zoomMode = false;
   bool keepOnTop = false;
   bool appliedTopmost = false;
+  bool diagTransitions = false;
+  bool experimentalInputCompute = false;
   std::string currentSourceMode = "identity";
   std::string currentSenderId;
+  std::string lastDrawSourceLabel;
   double lastX = 0.0;
   double lastY = 0.0;
   double lastClick = -10.0;
   float scrollAccum = 0.0f;
+  ViewerGpuCapabilities gpuCaps;
+  ViewerRuntimeState runtime;
 };
 
 void onFramebufferSize(GLFWwindow*, int w, int h) {
@@ -1199,8 +2602,6 @@ int runApp() {
     if (singleInstanceMutex != nullptr) CloseHandle(singleInstanceMutex);
     return 0;
   }
-  _putenv_s("ME_OPENDRT_DISABLE_OPENCL", "0");
-  _putenv_s("ME_OPENDRT_FORCE_OPENCL", "1");
 #endif
 
   if (!glfwInit()) {
@@ -1212,8 +2613,7 @@ int runApp() {
   }
 
 #if defined(__APPLE__)
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 2);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 1);
+  glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 #endif
 
   GLFWwindow* window = glfwCreateWindow(864, 560, "ME_OpenDRT Cube Viewer", nullptr, nullptr);
@@ -1230,8 +2630,129 @@ int runApp() {
 #if defined(_WIN32)
   applyWindowsWindowIcon(window);
 #endif
+#if !defined(__APPLE__)
   glfwMakeContextCurrent(window);
   glfwSwapInterval(1);
+#endif
+  ViewerGpuCapabilities gpuCaps = detectViewerGpuCapabilities();
+#if defined(__APPLE__)
+  gpuCaps.presenterBackendLabel = "metal";
+  const OpenDRTViewerMetal::PresenterInitResult metalPresenterInit = OpenDRTViewerMetal::initializePresenter(window);
+  if (!metalPresenterInit.ready) {
+    logViewerEvent(std::string("Metal presenter init failed: ") + metalPresenterInit.reason);
+    glfwDestroyWindow(window);
+    glfwTerminate();
+#if defined(_WIN32)
+    if (singleInstanceMutex != nullptr) CloseHandle(singleInstanceMutex);
+#endif
+    return 1;
+  }
+#endif
+  const OpenDRTViewerOpenGLPresenter::InitResult glPresenterInit =
+#if !defined(__APPLE__)
+      OpenDRTViewerOpenGLPresenter::initialize(window);
+  gpuCaps.glPresenterReady = glPresenterInit.ready;
+  gpuCaps.presenterBackendLabel = glPresenterInit.ready ? "gl-shader" : "gl-legacy";
+  if (!glPresenterInit.ready) {
+    logViewerEvent(std::string("OpenGL presenter init fallback: ") + glPresenterInit.reason);
+  }
+#else
+      OpenDRTViewerOpenGLPresenter::InitResult{};
+  gpuCaps.glPresenterReady = false;
+#endif
+  IdentityComputeCache identityComputeCache{};
+  InputCloudComputeCache inputCloudComputeCache{};
+#if defined(__APPLE__)
+  OpenDRTViewerMetal::MeshCache identityMetalCache{};
+  OpenDRTViewerMetal::MeshCache inputMetalCache{};
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  IdentityCudaDrawCache identityCudaCache{};
+  InputCudaDrawCache inputCudaCache{};
+#endif
+  const bool requestedInputCompute = viewerInputComputeEnabled();
+  bool inputComputeReady = requestedInputCompute;
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh) {
+    const OpenDRTViewerCuda::StartupValidationResult cudaValidation = OpenDRTViewerCuda::validateStartup();
+    gpuCaps.cudaStartupReady = cudaValidation.ready;
+    if (!cudaValidation.ready) {
+      gpuCaps.activeBackend = gpuCaps.glComputeShaders ? ViewerGpuBackend::OpenGlComputeIdentity
+                                                       : (gpuCaps.glBufferObjects ? ViewerGpuBackend::OpenGlBufferedDraw
+                                                                                  : ViewerGpuBackend::CpuReference);
+      gpuCaps.activeBackendLabel = gpuCaps.glComputeShaders ? "gl-compute-mesh"
+                                                            : (gpuCaps.glBufferObjects ? "gl-buffer" : "cpu-ref");
+      gpuCaps.roadmapLabel = std::string("cuda-startup-fallback:") + cudaValidation.reason;
+      inputComputeReady = requestedInputCompute && gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity;
+    }
+  }
+#endif
+#if defined(__APPLE__)
+  if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh) {
+    const OpenDRTViewerMetal::StartupValidationResult metalValidation = OpenDRTViewerMetal::validateStartup();
+    if (!metalValidation.ready) {
+      gpuCaps.activeBackend = gpuCaps.glBufferObjects ? ViewerGpuBackend::OpenGlBufferedDraw
+                                                      : ViewerGpuBackend::CpuReference;
+      gpuCaps.activeBackendLabel = gpuCaps.glBufferObjects ? "gl-buffer" : "cpu-ref";
+      gpuCaps.roadmapLabel = std::string("metal-startup-fallback:") + metalValidation.reason;
+      inputComputeReady = false;
+    }
+  }
+#endif
+  if (gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity &&
+      !ensureIdentityComputeProgram(&identityComputeCache)) {
+    gpuCaps.activeBackend = gpuCaps.glBufferObjects ? ViewerGpuBackend::OpenGlBufferedDraw
+                                                    : ViewerGpuBackend::CpuReference;
+    gpuCaps.activeBackendLabel = gpuCaps.glBufferObjects ? "gl-buffer" : "cpu-ref";
+    gpuCaps.roadmapLabel = "gl-compute-init-fallback";
+  }
+  if (inputComputeReady &&
+      gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity &&
+      !ensureInputCloudComputeProgram(&inputCloudComputeCache)) {
+    inputComputeReady = false;
+    logViewerEvent("Input-cloud compute disabled at startup; using CPU input-cloud mesh path.");
+  }
+  if (inputComputeReady &&
+      gpuCaps.activeBackend != ViewerGpuBackend::OpenGlComputeIdentity &&
+      gpuCaps.activeBackend != ViewerGpuBackend::MetalComputeMesh &&
+      gpuCaps.activeBackend != ViewerGpuBackend::CudaComputeMesh) {
+    inputComputeReady = false;
+  }
+  gpuCaps.inputCloudComputeEnabled = inputComputeReady;
+  if (gpuCaps.activeBackend == ViewerGpuBackend::CudaComputeMesh) {
+    gpuCaps.activeBackendLabel = "cuda-compute-mesh";
+    gpuCaps.roadmapLabel = "cuda-phase3-mesh";
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::OpenGlComputeIdentity && inputComputeReady) {
+    gpuCaps.activeBackendLabel = "gl-compute-mesh";
+    gpuCaps.roadmapLabel = "gl-compute-phase2-mesh";
+  } else if (gpuCaps.activeBackend == ViewerGpuBackend::MetalComputeMesh && inputComputeReady) {
+    gpuCaps.activeBackendLabel = "metal-compute-mesh";
+    gpuCaps.roadmapLabel = "metal-phase2-mesh";
+  }
+  {
+    std::ostringstream os;
+    os << "Viewer GPU capabilities: glVersion=" << gpuCaps.glVersion
+       << " buffers=" << (gpuCaps.glBufferObjects ? "1" : "0")
+       << " computeProbe=" << (gpuCaps.glComputeShaders ? "1" : "0")
+       << " active=" << gpuCaps.activeBackendLabel
+       << " roadmap=" << gpuCaps.roadmapLabel
+       << " inputCompute=" << (inputComputeReady ? "1" : "0")
+       << " requestedInputCompute=" << (requestedInputCompute ? "1" : "0")
+       << " parityCheck=" << (gpuCaps.parityCheckEnabled ? "1" : "0");
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+    os << " cudaViewer=" << (gpuCaps.cudaViewerAvailable ? "1" : "0")
+       << " cudaInterop=" << (gpuCaps.cudaInteropReady ? "1" : "0")
+       << " cudaReady=" << (gpuCaps.cudaStartupReady ? "1" : "0");
+    if (!gpuCaps.cudaDeviceName.empty()) os << " cudaDevice=" << gpuCaps.cudaDeviceName;
+    if (!gpuCaps.cudaReason.empty()) os << " cudaReason=" << gpuCaps.cudaReason;
+#endif
+#if defined(__APPLE__)
+    os << " metalViewer=" << (gpuCaps.metalViewerAvailable ? "1" : "0")
+       << " metalQueue=" << (gpuCaps.metalQueueReady ? "1" : "0");
+    if (!gpuCaps.metalDeviceName.empty()) os << " metalDevice=" << gpuCaps.metalDeviceName;
+#endif
+    logViewerEvent(os.str());
+  }
   if (GLFWmonitor* monitor = glfwGetPrimaryMonitor()) {
     if (const GLFWvidmode* mode = glfwGetVideoMode(monitor)) {
       const int winW = 864;
@@ -1246,6 +2767,18 @@ int runApp() {
 
   AppState app{};
   resetCamera(&app.cam);
+  app.gpuCaps = gpuCaps;
+  app.runtime.sessionBackendLabel = gpuCaps.activeBackendLabel;
+  app.runtime.presenterBackendLabel = gpuCaps.presenterBackendLabel;
+  app.diagTransitions = viewerDiagnosticsEnabled();
+  app.experimentalInputCompute = inputComputeReady;
+  if (app.diagTransitions) {
+    std::ostringstream os;
+    os << "Transition diagnostics enabled. log=" << viewerLogPath()
+       << " inputCompute=" << (app.experimentalInputCompute ? "1" : "0")
+       << " requestedInputCompute=" << (requestedInputCompute ? "1" : "0");
+    logViewerDiagnostic(true, os.str());
+  }
   PointBufferCache pointBufferCache{};
   glfwSetWindowUserPointer(window, &app);
   glfwSetFramebufferSizeCallback(window, onFramebufferSize);
@@ -1253,11 +2786,13 @@ int runApp() {
   glfwSetScrollCallback(window, onScroll);
   glfwSetMouseButtonCallback(window, onMouseButton);
 
+#if !defined(__APPLE__)
   glEnable(GL_DEPTH_TEST);
   glEnable(GL_BLEND);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glEnable(GL_POINT_SMOOTH);
   glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
+#endif
 
   int fbW = 0, fbH = 0;
   glfwGetFramebufferSize(window, &fbW, &fbH);
@@ -1327,9 +2862,25 @@ int runApp() {
             const std::string prevSourceMode = app.currentSourceMode;
             app.keepOnTop = (rp.alwaysOnTop != 0);
             app.currentSourceMode = rp.sourceMode;
+            if (app.diagTransitions && prevSourceMode != app.currentSourceMode) {
+              std::ostringstream os;
+              os << "Source mode transition: " << prevSourceMode << " -> " << app.currentSourceMode
+                 << " paramsSeq=" << rp.seq
+                 << " meshSerial=" << mesh.serial
+                 << " meshPoints=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u))
+                 << " deferredCloud=" << (hasDeferredCloud ? "1" : "0");
+              logViewerDiagnostic(true, os.str());
+            }
             if (app.currentSourceMode != "input") {
               MeshData nextMesh{};
-              buildCubeData(rp, &nextMesh);
+              buildCubeData(rp, app.gpuCaps, &app.runtime, &identityComputeCache,
+#if defined(__APPLE__)
+                            &identityMetalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                            &identityCudaCache,
+#endif
+                            &nextMesh);
               mesh = std::move(nextMesh);
             } else {
               // Keep last displayed mesh until an input_cloud payload arrives.
@@ -1348,11 +2899,25 @@ int runApp() {
               if (hasDeferredCloud && deferredCloud.seq >= lastCloudSeq &&
                   senderMatchesCurrent(app.currentSenderId, deferredCloud.senderId)) {
                 MeshData nextMesh{};
-                if (buildInputCloudMesh(deferredCloud, &nextMesh)) {
+                if (buildInputCloudMesh(deferredCloud, app.gpuCaps, &app.runtime, &inputCloudComputeCache,
+#if defined(__APPLE__)
+                                        &inputMetalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                                        &inputCudaCache,
+#endif
+                                        &nextMesh)) {
                   mesh = std::move(nextMesh);
                   lastCloudSeq = deferredCloud.seq;
                   hasDeferredCloud = false;
                   logViewerEvent("Applied deferred input cloud after params switched to input mode.");
+                  if (app.diagTransitions) {
+                    std::ostringstream os;
+                    os << "Deferred cloud became active: seq=" << deferredCloud.seq
+                       << " meshSerial=" << mesh.serial
+                       << " meshPoints=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u));
+                    logViewerDiagnostic(true, os.str());
+                  }
                 }
               }
             }
@@ -1389,14 +2954,29 @@ int runApp() {
             logViewerEvent("Deferred input cloud until params confirm input mode.");
           } else {
             MeshData nextMesh{};
-            if (buildInputCloudMesh(cp, &nextMesh)) {
+            if (buildInputCloudMesh(cp, app.gpuCaps, &app.runtime, &inputCloudComputeCache,
+#if defined(__APPLE__)
+                                    &inputMetalCache,
+#endif
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+                                    &inputCudaCache,
+#endif
+                                    &nextMesh)) {
               mesh = std::move(nextMesh);
               lastCloudSeq = cp.seq;
               hasDeferredCloud = false;
+              if (app.diagTransitions) {
+                std::ostringstream os;
+                os << "Input cloud applied live: seq=" << cp.seq
+                   << " meshSerial=" << mesh.serial
+                   << " meshPoints=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u))
+                   << " paramHash=" << mesh.paramHash;
+                logViewerDiagnostic(true, os.str());
+              }
               {
                 std::ostringstream os;
                 os << "Applied input cloud: seq=" << cp.seq
-                   << " points=" << (mesh.pointVerts.size() / 3u)
+                   << " points=" << (mesh.pointCount > 0 ? mesh.pointCount : (mesh.pointVerts.size() / 3u))
                    << " quality=" << mesh.quality
                    << " hash=" << mesh.paramHash;
                 logViewerEvent(os.str());
@@ -1423,8 +3003,71 @@ int runApp() {
       glfwFocusWindow(window);
     }
 
-    updateTitle(window, mesh, gConnected.load() ? "Connected" : "Disconnected");
+    updateTitle(window, mesh, gConnected.load() ? "Connected" : "Disconnected", app.gpuCaps);
 
+#if defined(__APPLE__)
+    std::string drawSourceLabel = "none";
+    const OpenDRTViewerMetal::DrawSource metalDrawSource =
+        resolveMetalDrawSource(mesh, app.currentSourceMode, identityMetalCache, inputMetalCache, &drawSourceLabel);
+    const size_t pointCount = static_cast<size_t>(std::max(metalDrawSource.pointCount, 0));
+    const bool haveDrawablePointSource =
+        metalDrawSource.pointCount > 0 &&
+        ((metalDrawSource.gpuBacked && metalDrawSource.vertsHandle != nullptr && metalDrawSource.colorsHandle != nullptr) ||
+         (!metalDrawSource.gpuBacked && metalDrawSource.cpuVerts != nullptr && metalDrawSource.cpuColors != nullptr));
+    if (app.diagTransitions && drawSourceLabel != app.lastDrawSourceLabel) {
+      std::ostringstream os;
+      os << "Draw source changed: mode=" << app.currentSourceMode
+         << " meshSerial=" << mesh.serial
+         << " meshPoints=" << pointCount
+         << " source=" << drawSourceLabel;
+      logViewerDiagnostic(true, os.str());
+      app.lastDrawSourceLabel = drawSourceLabel;
+    }
+    if (app.diagTransitions && pointCount > 0 && !haveDrawablePointSource) {
+      std::ostringstream os;
+      os << "Drawable source missing with non-zero point count: mode=" << app.currentSourceMode
+         << " meshSerial=" << mesh.serial
+         << " meshPoints=" << pointCount;
+      logViewerDiagnostic(true, os.str());
+    }
+
+    float clampedDist = app.cam.distance;
+    if (clampedDist < 0.6f) clampedDist = 0.6f;
+    if (clampedDist > 30.0f) clampedDist = 30.0f;
+    float basePointSize = 2.7f;
+    if (mesh.resolution <= 25) basePointSize = 3.3f;
+    else if (mesh.resolution <= 41) basePointSize = 2.9f;
+    else basePointSize = 2.5f;
+    const float distanceFactor = std::pow(clampedDist / 4.2f, -0.68f);
+    float densityFactor = 1.0f;
+    if (pointCount < 8000u) densityFactor = 1.10f;
+    else if (pointCount > 50000u) densityFactor = 0.92f;
+    const float kPointSizeUserScale = 1.28f;
+    float pointSize = basePointSize * distanceFactor * densityFactor * kPointSizeUserScale;
+    if (pointSize < 1.2f) pointSize = 1.2f;
+    if (pointSize > 5.0f) pointSize = 5.0f;
+
+    int fbWidth = 1;
+    int fbHeight = 1;
+    glfwGetFramebufferSize(window, &fbWidth, &fbHeight);
+    float mvp[16];
+    buildSceneMvp(fbWidth, fbHeight, app.cam, mvp);
+    std::string renderError;
+    if (!OpenDRTViewerMetal::renderScene(
+            window,
+            metalDrawSource,
+            mvp,
+            pointSize,
+            pointSize * 0.55f,
+            0.08f,
+            0.08f,
+            0.09f,
+            1.0f,
+            &renderError)) {
+      logViewerEvent(std::string("Metal render failed: ") + renderError);
+      gRun.store(false);
+    }
+#else
     glClearColor(0.08f, 0.08f, 0.09f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -1437,10 +3080,41 @@ int runApp() {
 
     drawReferenceFrame();
 
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glEnableClientState(GL_COLOR_ARRAY);
     const ViewerGlBufferApi& glBufferApi = viewerGlBufferApi();
-    const bool usePointBuffers = ensurePointBufferCacheUploaded(mesh, &pointBufferCache);
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+    const bool useCudaIdentityBuffers =
+        identityCudaCache.cache.available &&
+        identityCudaCache.cache.builtSerial == mesh.serial &&
+        identityCudaCache.cache.verts != 0 &&
+        identityCudaCache.cache.colors != 0 &&
+        identityCudaCache.cache.pointCount > 0;
+    const bool useCudaInputBuffers =
+        inputCudaCache.cache.available &&
+        inputCudaCache.cache.builtSerial == mesh.serial &&
+        inputCudaCache.cache.verts != 0 &&
+        inputCudaCache.cache.colors != 0 &&
+        inputCudaCache.cache.pointCount > 0;
+#else
+    const bool useCudaIdentityBuffers = false;
+    const bool useCudaInputBuffers = false;
+#endif
+    const bool useComputeIdentityBuffers =
+        identityComputeCache.available &&
+        identityComputeCache.builtSerial == mesh.serial &&
+        identityComputeCache.verts != 0 &&
+        identityComputeCache.colors != 0 &&
+        identityComputeCache.pointCount > 0;
+    const bool useComputeInputBuffers =
+        app.experimentalInputCompute &&
+        inputCloudComputeCache.available &&
+        inputCloudComputeCache.builtSerial == mesh.serial &&
+        inputCloudComputeCache.verts != 0 &&
+        inputCloudComputeCache.colors != 0 &&
+        inputCloudComputeCache.pointCount > 0;
+    const bool usePointBuffers = !useCudaIdentityBuffers &&
+                                 !useComputeIdentityBuffers &&
+                                 !useCudaInputBuffers &&
+                                 ensurePointBufferCacheUploaded(mesh, &pointBufferCache);
     float clampedDist = app.cam.distance;
     if (clampedDist < 0.6f) clampedDist = 0.6f;
     if (clampedDist > 30.0f) clampedDist = 30.0f;
@@ -1449,7 +3123,56 @@ int runApp() {
   else if (mesh.resolution <= 41) basePointSize = 2.9f;
   else basePointSize = 2.5f;
     const float distanceFactor = std::pow(clampedDist / 4.2f, -0.68f);
-    const size_t pointCount = mesh.pointVerts.size() / 3u;
+    const ResolvedDrawSource drawSource = resolveDrawSource(
+        mesh,
+        useCudaIdentityBuffers,
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+        identityCudaCache.cache.verts,
+        identityCudaCache.cache.colors,
+        identityCudaCache.cache.pointCount,
+#else
+        0, 0, 0,
+#endif
+        useComputeIdentityBuffers,
+        identityComputeCache.verts,
+        identityComputeCache.colors,
+        identityComputeCache.pointCount,
+        useCudaInputBuffers,
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+        inputCudaCache.cache.verts,
+        inputCudaCache.cache.colors,
+        inputCudaCache.cache.pointCount,
+#else
+        0, 0, 0,
+#endif
+        useComputeInputBuffers,
+        inputCloudComputeCache.verts,
+        inputCloudComputeCache.colors,
+        inputCloudComputeCache.pointCount,
+        usePointBuffers,
+        pointBufferCache.verts,
+        pointBufferCache.colors);
+    const size_t pointCount = static_cast<size_t>(drawSource.pointCount);
+    const bool haveDrawablePointSource =
+        drawSource.pointCount > 0 &&
+        (drawSource.bufferBacked || (drawSource.cpuVerts != nullptr && drawSource.cpuColors != nullptr));
+    const std::string drawSourceLabel = drawSource.label;
+    if (app.diagTransitions && drawSourceLabel != app.lastDrawSourceLabel) {
+      std::ostringstream os;
+      os << "Draw source changed: mode=" << app.currentSourceMode
+         << " meshSerial=" << mesh.serial
+         << " meshPoints=" << pointCount
+         << " source=" << drawSourceLabel;
+      logViewerDiagnostic(true, os.str());
+      app.lastDrawSourceLabel = drawSourceLabel;
+    }
+    if (app.diagTransitions && pointCount > 0 && !haveDrawablePointSource) {
+      std::ostringstream os;
+      os << "Drawable source missing with non-zero point count: mode=" << app.currentSourceMode
+         << " meshSerial=" << mesh.serial
+         << " meshPoints=" << pointCount;
+      logViewerDiagnostic(true, os.str());
+    }
     float densityFactor = 1.0f;
     if (pointCount < 8000u) densityFactor = 1.10f;
     else if (pointCount > 50000u) densityFactor = 0.92f;
@@ -1458,45 +3181,89 @@ int runApp() {
     float pointSize = basePointSize * distanceFactor * densityFactor * kPointSizeUserScale;
     if (pointSize < 1.2f) pointSize = 1.2f;
     if (pointSize > 5.0f) pointSize = 5.0f;
-    glPointSize(pointSize);
-    if (usePointBuffers) {
-      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.verts);
-      glVertexPointer(3, GL_FLOAT, 0, nullptr);
-      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.colors);
-      glColorPointer(3, GL_FLOAT, 0, nullptr);
-    } else {
-      glVertexPointer(3, GL_FLOAT, 0, mesh.pointVerts.empty() ? nullptr : mesh.pointVerts.data());
-      glColorPointer(3, GL_FLOAT, 0, mesh.pointColors.empty() ? nullptr : mesh.pointColors.data());
-    }
-    glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
-    if (!mesh.pointVerts.empty()) {
-      // Subtle interior fill pass to improve interior visibility for both identity and input cloud modes.
-      glDisable(GL_DEPTH_TEST);
-      glDisableClientState(GL_COLOR_ARRAY);
-      glColor4f(0.95f, 0.96f, 1.0f, 0.05f);
-      glPointSize(pointSize * 0.55f);
-      if (usePointBuffers) {
-        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, pointBufferCache.verts);
-        glVertexPointer(3, GL_FLOAT, 0, nullptr);
+    const bool useGlPresenter = app.gpuCaps.glPresenterReady && drawSource.bufferBacked;
+    if (useGlPresenter) {
+      if (pointCount > 0 && haveDrawablePointSource) {
+        (void)OpenDRTViewerOpenGLPresenter::drawPointCloud(
+            drawSource.verts,
+            drawSource.colors,
+            static_cast<int>(pointCount),
+            pointSize,
+            1.0f);
       }
-      glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(mesh.pointVerts.size() / 3u));
+      if (pointCount > 0 && haveDrawablePointSource) {
+        glDisable(GL_DEPTH_TEST);
+        (void)OpenDRTViewerOpenGLPresenter::drawPointCloudSolid(
+            drawSource.verts,
+            static_cast<int>(pointCount),
+            pointSize * 0.55f,
+            0.95f,
+            0.96f,
+            1.0f,
+            0.05f);
+        glEnable(GL_DEPTH_TEST);
+      }
+    } else {
+      glEnableClientState(GL_VERTEX_ARRAY);
       glEnableClientState(GL_COLOR_ARRAY);
-      glEnable(GL_DEPTH_TEST);
+      glPointSize(pointSize);
+      if (drawSource.bufferBacked) {
+        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, drawSource.verts);
+        glVertexPointer(3, GL_FLOAT, 0, nullptr);
+        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, drawSource.colors);
+        glColorPointer(3, GL_FLOAT, 0, nullptr);
+      } else {
+        glVertexPointer(3, GL_FLOAT, 0, drawSource.cpuVerts);
+        glColorPointer(3, GL_FLOAT, 0, drawSource.cpuColors);
+      }
+      if (pointCount > 0 && haveDrawablePointSource) {
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pointCount));
+      }
+      if (pointCount > 0 && haveDrawablePointSource) {
+        glDisable(GL_DEPTH_TEST);
+        glDisableClientState(GL_COLOR_ARRAY);
+        glColor4f(0.95f, 0.96f, 1.0f, 0.05f);
+        glPointSize(pointSize * 0.55f);
+        if (drawSource.bufferBacked) {
+          glBufferApi.bindBuffer(GL_ARRAY_BUFFER, drawSource.verts);
+          glVertexPointer(3, GL_FLOAT, 0, nullptr);
+        } else {
+          glVertexPointer(3, GL_FLOAT, 0, drawSource.cpuVerts);
+        }
+        glDrawArrays(GL_POINTS, 0, static_cast<GLsizei>(pointCount));
+        glEnableClientState(GL_COLOR_ARRAY);
+        glEnable(GL_DEPTH_TEST);
+      }
+      if (drawSource.bufferBacked) {
+        glBufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
+      }
+      glDisableClientState(GL_COLOR_ARRAY);
+      glDisableClientState(GL_VERTEX_ARRAY);
     }
-    if (usePointBuffers) {
-      glBufferApi.bindBuffer(GL_ARRAY_BUFFER, 0);
-    }
-    glDisableClientState(GL_COLOR_ARRAY);
-    glDisableClientState(GL_VERTEX_ARRAY);
 
     glfwSwapBuffers(window);
+#endif
   }
 
   gRun.store(false);
   wakeIpcServer();
   if (ipcThread.joinable()) ipcThread.join();
 
+#if !defined(__APPLE__)
+  OpenDRTViewerOpenGLPresenter::shutdown();
+#endif
+#if defined(__APPLE__)
+  OpenDRTViewerMetal::releaseCache(&identityMetalCache);
+  OpenDRTViewerMetal::releaseCache(&inputMetalCache);
+  OpenDRTViewerMetal::shutdownPresenter();
+#endif
   releasePointBufferCache(&pointBufferCache);
+  releaseIdentityComputeCache(&identityComputeCache);
+  releaseInputCloudComputeCache(&inputCloudComputeCache);
+#if defined(OFX_SUPPORTS_CUDARENDER) && !defined(__APPLE__)
+  releaseIdentityCudaDrawCache(&identityCudaCache);
+  releaseInputCudaDrawCache(&inputCudaCache);
+#endif
   glfwDestroyWindow(window);
   glfwTerminate();
 

@@ -1,8 +1,8 @@
 [Setup]
 AppId={{9F3D3F6D-5D8B-4D16-A9A0-6A8D6F7E7A10}
 AppName=ME_OpenDRT
-AppVersion=1.2.10
-AppVerName=ME_OpenDRT OFX v1.2.10 (OpenDRT 1.1.0)
+AppVersion=1.2.11
+AppVerName=ME_OpenDRT OFX v1.2.11 (OpenDRT 1.1.0)
 AppPublisher=Moaz ELgabry
 AppPublisherURL=https://moazelgabry.com
 AppSupportURL=https://github.com/MoazElgabry/ME_OFX/issues
@@ -13,7 +13,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 OutputDir=.
-OutputBaseFilename=ME_OpenDRT_v1.2.10_Windows_cuda_opencl_Installer
+OutputBaseFilename=ME_OpenDRT_v1.2.11_Windows_cuda_opencl_Installer
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=admin

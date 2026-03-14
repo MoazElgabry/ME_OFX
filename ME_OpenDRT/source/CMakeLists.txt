@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(ME_OpenDRT VERSION 1.2.10 LANGUAGES CXX)
-set(OPENDRT_DISPLAY_VERSION "1.2.10")
+project(ME_OpenDRT VERSION 1.2.11 LANGUAGES CXX)
+set(OPENDRT_DISPLAY_VERSION "1.2.11")
 
 set(PLUGIN_BASENAME "ME_OpenDRT")
 set(PLUGIN_IDENTIFIER "com.moazelgabry.me_opendrt")
@@ -240,7 +240,9 @@ set_target_properties(${PLUGIN_BASENAME} PROPERTIES
 )
 
 if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
-  find_package(OpenGL REQUIRED)
+  if(NOT APPLE)
+    find_package(OpenGL REQUIRED)
+  endif()
   option(ME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW "Use bundled GLFW for Cube Viewer builds" ${APPLE})
   if(NOT ME_OPENDRT_VIEWER_FORCE_BUNDLED_GLFW)
     find_package(glfw3 QUIET)
@@ -269,20 +271,52 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
     FetchContent_MakeAvailable(glfw)
   endif()
 
-  add_executable(ME_OpenDRT_CubeViewer tools/cube_viewer_stub/main.cpp)
+  set(ME_OPENDRT_VIEWER_SOURCES
+    tools/cube_viewer_stub/main.cpp
+  )
+  if(APPLE)
+    list(APPEND ME_OPENDRT_VIEWER_SOURCES
+      src/metal/OpenDRTMetal.mm
+      tools/cube_viewer_stub/metal/OpenDRTViewerMetal.mm
+    )
+  else()
+    list(APPEND ME_OPENDRT_VIEWER_SOURCES
+      tools/cube_viewer_stub/gl/OpenDRTViewerOpenGLPresenter.cpp
+    )
+  endif()
+  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+    list(APPEND ME_OPENDRT_VIEWER_SOURCES
+      src/cuda/OpenDRT.cu
+      tools/cube_viewer_stub/cuda/OpenDRTViewerCuda.cu
+    )
+  endif()
+
+  add_executable(ME_OpenDRT_CubeViewer ${ME_OPENDRT_VIEWER_SOURCES})
   target_compile_features(ME_OpenDRT_CubeViewer PRIVATE cxx_std_17)
-  # Keep companion viewer portable and low-risk: CPU-only processor path,
-  # independent from plugin CUDA/OpenCL/Metal backend toolchains.
-  target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE ME_OPENDRT_VIEWER_CPU_ONLY)
+  target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE
+    OFX_SUPPORTS_OPENCLRENDER
+    _CRT_SECURE_NO_WARNINGS
+  )
   target_include_directories(ME_OpenDRT_CubeViewer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/include
     ${CMAKE_CURRENT_SOURCE_DIR}/ofx-sdk/Support/include
     $<$<BOOL:${OPENCL_KERNEL_HDR_DIR}>:${OPENCL_KERNEL_HDR_DIR}>
   )
+  if(WIN32 OR (UNIX AND NOT APPLE AND ME_OPENDRT_LINUX_CUDA))
+    target_compile_definitions(ME_OpenDRT_CubeViewer PRIVATE OFX_SUPPORTS_CUDARENDER)
+    target_include_directories(ME_OpenDRT_CubeViewer PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    set_target_properties(ME_OpenDRT_CubeViewer PROPERTIES
+      CUDA_STANDARD 17
+      CUDA_STANDARD_REQUIRED ON
+      CUDA_SEPARABLE_COMPILATION ON)
+  endif()
   add_dependencies(${PLUGIN_BASENAME} ME_OpenDRT_CubeViewer)
   if(TARGET OpenDRTOpenCLSourceHeader)
     add_dependencies(ME_OpenDRT_CubeViewer OpenDRTOpenCLSourceHeader)
+  endif()
+  if(APPLE)
+    add_dependencies(ME_OpenDRT_CubeViewer OpenDRTMetalLib)
   endif()
   if(TARGET glfw)
     target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE glfw)
@@ -291,12 +325,28 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
   elseif(TARGET PkgConfig::GLFW3)
     target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE PkgConfig::GLFW3)
   endif()
-  if(TARGET OpenGL::GL)
-    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::GL)
-  elseif(TARGET OpenGL::OpenGL)
-    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::OpenGL)
-  else()
-    message(FATAL_ERROR "No compatible OpenGL CMake target found for ME_OpenDRT_CubeViewer")
+  if(NOT APPLE)
+    if(TARGET OpenGL::GL)
+      target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::GL)
+    elseif(TARGET OpenGL::OpenGL)
+      target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenGL::OpenGL)
+    else()
+      message(FATAL_ERROR "No compatible OpenGL CMake target found for ME_OpenDRT_CubeViewer")
+    endif()
+  endif()
+  if(APPLE)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE
+      "-framework Metal"
+      "-framework QuartzCore"
+      "-framework AppKit"
+      "-framework Cocoa"
+      "-framework Foundation"
+      "-framework CoreFoundation"
+    )
+  elseif(WIN32)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE CUDA::cudart_static "${OPENCL_LIB}")
+  elseif(UNIX)
+    target_link_libraries(ME_OpenDRT_CubeViewer PRIVATE OpenCL::OpenCL)
   endif()
   if(WIN32)
     if(NOT EXISTS "${PLUGIN_ICON_PNG}")
@@ -371,6 +421,7 @@ if(ME_OPENDRT_BUILD_CUBE_VIEWER_STUB)
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:ME_OpenDRT_CubeViewer>" "${VIEWER_APP_BUNDLE_DIR}/Contents/MacOS/ME_OpenDRT_CubeViewer"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_CURRENT_BINARY_DIR}/CubeViewerInfo.plist" "${VIEWER_APP_BUNDLE_DIR}/Contents/Info.plist"
       COMMAND ${CMAKE_COMMAND} -E copy_if_different "${VIEWER_ICON_ICNS}" "${VIEWER_APP_BUNDLE_DIR}/Contents/Resources/OpenDRT_CubeViewer.icns"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different "${METAL_LIB}" "${VIEWER_APP_BUNDLE_DIR}/Contents/Resources/OpenDRT.metallib"
       COMMAND /bin/chmod +x "${VIEWER_APP_BUNDLE_DIR}/Contents/MacOS/ME_OpenDRT_CubeViewer"
       COMMAND /bin/chmod +x "$<TARGET_FILE:ME_OpenDRT_CubeViewer>"
       VERBATIM
